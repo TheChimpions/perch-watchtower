@@ -1,0 +1,89 @@
+[Unit]
+Description=perch Solana validator watchtower
+After=network-online.target
+Wants=network-online.target
+# Never stop retrying. These belong in [Unit] -- systemd silently ignores them
+# in [Service], which would leave the default rate limit in force and let a
+# watchtower give up for good after five quick restarts.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+User=perch
+Group=perch
+ExecStart=/usr/local/bin/perch --config /etc/perch/config.toml
+# Creates and owns /var/lib/perch, where alert state is persisted so a
+# restart does not orphan an open PagerDuty incident. 0750 lets operators in
+# the perch group reach maint/, where `perch maint` writes the silence file;
+# the state file itself stays 0600 (UMask below).
+StateDirectory=perch
+StateDirectoryMode=0750
+# Secrets live here, mode 0600, owned by the service user.
+EnvironmentFile=/etc/perch/env
+Restart=always
+RestartSec=30s
+
+# Perch never executes a process, never opens a keypair, and calls seven
+# read-only RPC methods. The sandbox below is what makes that structural rather
+# than a promise -- a compromised dependency must not be able to do what the
+# source does not.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+# Only the state directory is writable. The config and env file are read, never
+# written -- only an operator edits those.
+ReadWritePaths=/var/lib/perch
+# With [diagnose] enabled, expose the validator's log directory, read-only. A
+# path under /home also needs ProtectHome=tmpfs: `true` leaves /home itself
+# untraversable, so the bind mount beneath it cannot be reached.
+#BindReadOnlyPaths=/home/sol/logs
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# perch contains no code that starts a process; this makes that a kernel rule.
+# Nothing outside these paths can be executed, so a compromised dependency
+# cannot reach for a shell, curl or the validator's own CLI. /usr/lib and /lib
+# are there for a glibc build's loader; the release binaries are static.
+NoExecPaths=/
+ExecPaths=/usr/local/bin/perch /usr/lib /lib
+
+# Other processes are invisible in /proc. A watchtower has no business seeing
+# the validator's PID, let alone signalling it.
+ProtectProc=invisible
+ProcSubset=pid
+
+# Nothing here needs a capability: the metrics port is above 1024.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+UMask=0077
+RemoveIPC=true
+
+# Hard caps. This often runs alongside a validator, where an unbounded monitoring
+# process is a real risk: steady-state usage is a few MB and ~0% CPU, so these
+# limits are orders of magnitude above normal and exist only to contain a bug.
+# A watchtower must never be the reason a validator misses a slot.
+CPUQuota=20%
+MemoryMax=192M
+TasksMax=64
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

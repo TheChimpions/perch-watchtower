@@ -1,0 +1,611 @@
+# perch configuration.
+#
+# Every duration is humantime ("30s", "4m", "2h"). Secrets may be written as
+# "env:VAR_NAME" to keep this file safe to commit.
+
+[watchtower]
+# Prefixed to every notification, so you can tell fleets apart.
+name = "chimps-mainnet"
+# Pin the cluster: "mainnet-beta", "testnet", "devnet", or a raw genesis hash
+# for a private cluster. Every endpoint is checked against it at startup.
+#
+# Endpoints are already cross-checked against each other, which catches a config
+# that *mixes* clusters. This catches the mistake you actually make when you run
+# both: copying a mainnet config, changing the URLs to testnet, and forgetting
+# the validator identities. Unpinned, that surfaces as a 3am page for a
+# "missing" vote account; pinned, it fails at startup with the reason.
+cluster = "mainnet-beta"
+# How often to probe. 60s is plenty -- every condition worth paging for lasts
+# minutes, and a tighter loop mostly buys you rate limiting.
+interval = "60s"
+# Per-endpoint reliability digest to Telegram. Only sent when an endpoint was
+# less than 100% usable or logged errors in the window; a clean window is
+# silent, because silence is the signal that everything is fine.
+endpoint_report_interval = "6h"
+
+
+# --- Endpoints -----------------------------------------------------------------
+#
+# You do NOT need a paid RPC plan. perch issues 4 calls per cycle per
+# endpoint for one validator (getEpochInfo, a filtered getVoteAccounts,
+# getBlockProduction, and one getMultipleAccounts for vote account and
+# identity) --
+# about 5,760/day, 173,000/month. That fits inside every free tier with room
+# to spare, and inside the no-signup public endpoints too.
+#
+# Three independent providers is the recommended minimum: two so a bad one can
+# be outvoted, three so you keep a quorum when one is in maintenance.
+# "Independent" is the operative word -- three URLs behind the same provider
+# fail together and buy you nothing.
+#
+# Option 1 (best, and free): your own validator's RPC.
+#   Unlimited, no rate limits, no third party, and the most direct signal there
+#   is. Bind it to localhost or a private interface and reach it from the
+#   monitoring host over WireGuard/Tailscale -- do not expose 8899 publicly.
+#   The default (non---full-rpc-api) method set already covers everything
+#   perch calls. Never make this your only endpoint: a wedged validator
+#   cannot be trusted to report on itself, which is what max_endpoint_lag_slots
+#   below exists to catch.
+#
+#     [[endpoints]]
+#     name = "chimps-1-local"
+#     url  = "http://10.0.0.5:8899"
+#
+# Option 2 (free tier, requires signup): Helius, QuickNode, Alchemy, Triton.
+#   Dedicated quota and far more reliable than the shared public endpoints.
+#   173k calls/month is a small fraction of every one of their free tiers.
+#
+# Option 3 (no signup at all): the shared public endpoints below. All three
+#   were verified working against the exact calls perch makes. They are
+#   rate limited and will intermittently fail -- which is precisely the case
+#   perch is built to absorb rather than page you for.
+
+[[endpoints]]
+name = "solana-labs"
+url = "https://api.mainnet-beta.solana.com"
+timeout = "20s"
+# Retries within a single cycle. Most transient blips die here and the alerting
+# logic never sees them.
+attempts = 3
+
+[[endpoints]]
+name = "publicnode"
+url = "https://solana-rpc.publicnode.com"
+timeout = "20s"
+attempts = 3
+
+[[endpoints]]
+name = "leorpc"
+url = "https://solana.leorpc.com/?api_key=FREE"
+timeout = "20s"
+attempts = 3
+
+
+# --- Hosts (disk monitoring) ---------------------------------------------------
+#
+# A full disk is one of the most common ways a validator dies, and RPC exposes
+# nothing about the filesystem. perch scrapes node_exporter on each
+# validator instead.
+#
+# Install node_exporter on the validator (Debian/Ubuntu):
+#
+#   sudo apt-get install -y prometheus-node-exporter
+#
+# or from upstream releases:
+#
+#   curl -sL https://github.com/prometheus/node_exporter/releases/download/\
+#     v1.8.2/node_exporter-1.8.2.linux-amd64.tar.gz | tar xz
+#   sudo install -m0755 node_exporter-*/node_exporter /usr/local/bin/
+#
+# Bind it to the PRIVATE interface only -- never 0.0.0.0. node_exporter is
+# unauthenticated and leaks a great deal about the host:
+#
+#   ExecStart=/usr/local/bin/node_exporter \
+#     --web.listen-address=10.0.0.5:9100 \
+#     --collector.filesystem
+#
+# Then reach it from the monitoring host over WireGuard/Tailscale, the same
+# private path you use for the validator's local RPC.
+#
+# Omit this section entirely and the disk checks simply do not run.
+
+[[hosts]]
+name = "chimps-1-box"
+url = "http://10.0.0.5:9100/metrics"
+# Mountpoints to watch. Omit for every real filesystem; pseudo-filesystems
+# (tmpfs, overlay, squashfs, ...) are excluded automatically.
+mountpoints = ["/", "/mnt/ledger", "/mnt/accounts"]
+# The validator running on this host. Setting it lets a full or read-only disk
+# explain the delinquency it causes, so you get one page naming the root cause
+# instead of five describing the same event. Must match a [[validators]] label.
+validator = "chimps-1"
+timeout = "10s"
+attempts = 2
+
+
+# --- Peering (multi-machine) ---------------------------------------------------
+#
+# Run an instance on each validator and one on the failover box, and have them
+# watch each other. This closes the hole where a machine goes hard down and
+# takes the validator *and* the only monitor that could explain why.
+#
+# THIS DRIVES NOTIFICATION ONLY. Never wire it to failover. Moving a Solana
+# identity on a monitor's opinion invites double-voting: a network partition
+# makes each side believe the other is down, both act, and you have two machines
+# voting with one identity. Real failover needs fencing or consensus.
+#
+# Peer liveness rides on the existing [metrics] endpoint -- there is no separate
+# protocol or port. A peer that answers but has stopped cycling counts as down,
+# because a process that is running is not necessarily working.
+
+# The layout this is written for is mutual supervision:
+#
+#   chimps-N-box   role "full", alerting "always"  -> owns validator-N,
+#                                                     reports a dead hub
+#   failover-box   role "full", alerting "peers"   -> reports a dead spoke
+#
+# No instance is a single point of failure for alerting. Duplication is
+# prevented by scope, not arbitration: each spoke lists only its own validator,
+# so it is the only instance that can alert about it. See the README for both
+# complete configs.
+#
+# `role` controls what is OBSERVED; `alerting` controls what is REPORTED. The hub
+# sets role = "full" because deciding that a silent spoke means a dead machine
+# needs independent cluster evidence that its validator stopped voting.
+
+[peering]
+# How peers refer to this instance.
+name = "failover-box"
+# Lower numbers alert first. Only the lowest-numbered LIVE instance notifies.
+# Must be unique across the group.
+priority = 1
+# "full"  -- run every check, always. Use on the failover box.
+# "local" -- run disk and peer checks only, and skip cluster checks while a
+#            higher-priority peer is alerting. If this instance is ever promoted
+#            it escalates to full checks, so a promoted standby is not left
+#            owning alerting with nothing to alert about.
+role = "full"
+# A peer that has not completed a cycle within this long is not live.
+stale_after = "3m"
+# How long a higher-priority peer must be down before taking over. Stops a brief
+# blip from causing a handoff.
+takeover_after = "5m"
+timeout = "10s"
+# "always" -- report everything this instance watches, deferring to nobody.
+#             Use on validator boxes that own their own validator.
+# "peers"  -- report only peer liveness. Use on a supervising hub.
+# "auto"   -- priority-based takeover. Only for mesh layouts where several
+#             instances watch the SAME subjects and one must be chosen.
+# "never"  -- silent data source.
+#
+# "always" and "peers" ignore priority entirely: their scopes are disjoint, so
+# there is nothing to arbitrate.
+alerting = "peers"
+
+# One entry per validator box this hub supervises.
+[[peers]]
+name = "chimps-1-box"
+url = "http://10.0.0.5:9469/metrics"
+priority = 2
+# The validator on THAT peer's machine. Setting it is what lets peer silence be
+# fused with cluster evidence rather than paging on silence alone:
+#   silent + still voting    -> Telegram, lost visibility
+#   silent + stopped voting  -> PagerDuty, the machine is gone
+validator = "chimps-1"
+
+# [[peers]]
+# name = "chimps-2-box"
+# url = "http://10.0.0.6:9469/metrics"
+# priority = 3
+# validator = "chimps-2"
+
+
+# --- Quorum --------------------------------------------------------------------
+
+[quorum]
+# Endpoints that must return a usable answer before the cycle counts as "we
+# could see the network at all". Below this, every check freezes.
+min_definite = 2
+# Endpoints that must independently agree before any check may fire. This is
+# what makes one misbehaving provider unable to page you.
+min_confirmations = 2
+# An endpoint whose own slot is this far behind the best slot seen in the cycle
+# is stale, and everything it said that cycle is discarded.
+#
+# This matters most when mixing endpoints of different quality. A lagging or
+# frozen node still answers: it reports an old lastVote against its own old
+# slot, computes a small lag, and votes Healthy -- outvoting endpoints that can
+# see the real problem. 300 slots is roughly two minutes, well clear of the
+# normal few-slot spread between healthy endpoints.
+max_endpoint_lag_slots = 300
+
+
+# --- Blindness -----------------------------------------------------------------
+#
+# Suppressing RPC noise must not become silently ignoring an outage, so being
+# unable to see the cluster is itself an alert -- on a timescale where ordinary
+# provider flakiness has long since resolved on its own.
+
+[blindness]
+notify_after = "5m"    # Telegram
+page_after   = "20m"   # PagerDuty
+
+
+# --- Validators ----------------------------------------------------------------
+
+[[validators]]
+identity = "YOUR_VALIDATOR_IDENTITY_PUBKEY"
+# Optional, but set it. It lets perch use the cheap filtered
+# getVoteAccounts query (a few hundred bytes) instead of pulling the full
+# multi-megabyte listing every cycle -- the difference between comfortably
+# inside a free tier and getting rate limited.
+vote_account = "YOUR_VOTE_ACCOUNT_PUBKEY"
+label = "chimps-1"
+# Optional. An unexpected commission change is a hijacked-identity signal, so it
+# pages immediately once corroborated. Compared in basis points where the vote
+# account reports them, so 8 means exactly 8.00%. For a fractional commission
+# use expected_commission_bps = 550 (5.5%) instead.
+expected_commission = 8
+# Optional, vote state v4: the block-revenue commission, in basis points.
+# expected_block_revenue_commission_bps = 10000
+
+# [[validators]]
+# identity = "SECOND_VALIDATOR_IDENTITY"
+# label = "chimps-2"
+
+
+# --- Checks --------------------------------------------------------------------
+#
+# `pending_for` is measured in *observed* time: cycles where we could not see
+# anything do not count toward it. Coming back from an RPC outage therefore
+# never pages instantly.
+#
+# `clear_after` is the number of consecutive healthy observations needed to
+# resolve. Greater than 1 damps flapping.
+#
+# severity: "page"   -> PagerDuty and Telegram
+#           "notify" -> Telegram only
+#           "log"    -> logs only
+
+[checks.vote_delinquent]
+enabled = true
+pending_for = "60s"
+clear_after = 2
+severity = "page"
+renotify_after = "30m"
+
+[checks.vote_account_missing]
+enabled = true
+# Longer, because a vote account can legitimately vanish from the listing
+# during deactivation or an identity swap.
+pending_for = "10m"
+clear_after = 2
+severity = "page"
+renotify_after = "30m"
+
+[checks.vote_lag]
+enabled = true
+max_slots = 200
+pending_for = "3m"
+clear_after = 2
+severity = "page"
+renotify_after = "30m"
+
+[checks.root_lag]
+enabled = true
+max_slots = 400
+pending_for = "5m"
+clear_after = 2
+severity = "page"
+renotify_after = "30m"
+
+# Derived liveness: are vote credits actually increasing? Catches a validator
+# that is voting but not landing, which the delinquency flag can miss.
+[checks.vote_stalled]
+enabled = true
+pending_for = "5m"
+clear_after = 2
+severity = "page"
+renotify_after = "30m"
+
+# Two non-overlapping bands, so exactly one fires: Telegram between page_sol and
+# warn_sol, PagerDuty below page_sol.
+# Until Alpenglow, the identity pays for every vote transaction, about 2 SOL per
+# epoch, and an empty one goes delinquent. Under Alpenglow the vote account is
+# the balance that matters instead: see [checks.vote_admission].
+[checks.vote_admission]
+# Alpenglow (SIMD-0357). At the start of every epoch N+1 the runtime decides
+# which vote accounts take part in epoch N+2: each needs a BLS public key and
+# at least rent-exempt plus one epoch's Validator Admission Ticket (VAT), which
+# is then burned. One that fails cannot vote or produce blocks for that epoch.
+#
+#   vote_admission_critical  pages: the next boundary will exclude this
+#                            validator (no BLS key, or balance short)
+#   vote_admission_warn      Telegram: at its net drain (VAT minus the commission
+#                            it earned last epoch) the vote account passes fewer
+#                            than warn_epochs more boundaries; or, before
+#                            Alpenglow is scheduled, one that is not ready for it
+#
+# Once the Alpenglow feature is scheduled, the very next boundary enforces it,
+# so readiness is reported before that rather than discovered at it.
+enabled = true
+pending_for = "10m"
+clear_after = 2
+severity = "page"
+renotify_after = "0s"
+warn_epochs = 3
+
+[checks.identity_balance]
+# Before Alpenglow the identity pays for every vote, so an empty one goes
+# delinquent and the critical band pages. Under Alpenglow votes cost nothing:
+# the critical band stops paging and one Telegram band covers everything below
+# warn_sol. The vote account is the balance that matters then (above).
+enabled = true
+# Telegram once when it crosses this.
+warn_sol = 3.0
+# Pages at this. Roughly a quarter of an epoch of voting left.
+page_sol = 0.5
+# What voting costs per epoch, used to report a balance as remaining epochs.
+sol_per_epoch = 2.0
+pending_for = "15m"
+clear_after = 2
+severity = "page"
+# Zero means say it once and stop. A balance draining over days does not change
+# between one 30-minute message and the next, and repeating it trains you to
+# skim past it. PagerDuty owns escalation once the paging band is crossed.
+renotify_after = "0s"
+
+[checks.sfdp_version]
+enabled = true
+pending_for = "0s"
+clear_after = 1
+severity = "page"
+renotify_after = "6h"
+# Re-fetch this often; once per epoch would notice a mid-epoch announcement up
+# to two days late. Floored at 5m.
+poll_interval = "1h"
+# Telegram note whenever the schedule changes at all. Every box on a cluster
+# sees the same schedule, so enable this on ONE box per cluster.
+announce_changes = false
+
+# Only evaluated for validators with an expected commission set: expected_commission,
+# expected_commission_bps or expected_block_revenue_commission_bps.
+[checks.commission_changed]
+enabled = true
+pending_for = "0s"
+clear_after = 1
+severity = "page"
+renotify_after = "1h"
+
+# Cluster-wide health. Not your problem to fix at 3am, so it does not page.
+#
+# WARNING: this is the one check that forces the full getVoteAccounts listing
+# every cycle (several MB per endpoint per minute). On free or public endpoints,
+# leave it disabled -- it is the single fastest way to get yourself throttled.
+[checks.cluster_stake]
+enabled = false
+min_percent = 80.0
+pending_for = "10m"
+clear_after = 2
+severity = "notify"
+renotify_after = "30m"
+
+[checks.cluster_stalled]
+enabled = true
+pending_for = "3m"
+clear_after = 2
+severity = "notify"
+renotify_after = "30m"
+
+
+# --- Peer checks ---------------------------------------------------------------
+#
+# Non-overlapping, so exactly one is ever active.
+
+# The peer stopped reporting, but the cluster still sees its validator voting
+# (or we have no cluster reading). Lost visibility, not an outage.
+[checks.peer_down]
+enabled = true
+pending_for = "10m"
+clear_after = 2
+severity = "notify"
+renotify_after = "2h"
+
+# The peer is silent AND the cluster reports its validator stopped voting. Two
+# independent sources agreeing is what makes this worth waking someone for.
+[checks.machine_down]
+enabled = true
+pending_for = "3m"
+clear_after = 2
+severity = "page"
+renotify_after = "30m"
+
+
+# --- Disk checks ---------------------------------------------------------------
+#
+# Only run when [[hosts]] are configured.
+
+# Free-space floor, as a backstop. Two non-overlapping bands, as with balances:
+# Telegram between page_free_gb and warn_free_gb, PagerDuty below page_free_gb.
+#
+# Size these to your disks, not to a percentage. 85% of a 4TB disk is 600GB of
+# headroom; 85% of a 500GB disk is 75GB.
+[checks.disk_space]
+enabled = true
+warn_free_gb = 100.0
+page_free_gb = 40.0
+pending_for = "10m"
+clear_after = 2
+severity = "page"
+renotify_after = "30m"
+
+# The signal that actually matters: projected time-to-full at the current fill
+# rate. A disk at 60% filling at 40GB/hour needs attention today; one flat at
+# 88% may need none.
+#
+# Free space on a validator is a sawtooth (snapshots accumulate, then get
+# purged), so the slope is fitted by least squares over `window` rather than
+# taken from the last two samples. Below `min_history` the check reports unknown
+# rather than guessing -- and unknown never pages.
+[checks.disk_fill]
+enabled = true
+warn_within = "24h"      # Telegram
+page_within = "6h"       # PagerDuty
+min_history = "45m"
+min_samples = 4
+window = "6h"
+sample_every = "5m"
+pending_for = "15m"
+clear_after = 2
+severity = "page"
+renotify_after = "30m"
+
+# A filesystem remounted read-only is how a disk usually fails under a
+# validator. Definite, immediate, and nothing recovers on its own.
+[checks.disk_readonly]
+enabled = true
+pending_for = "0s"
+clear_after = 2
+severity = "page"
+renotify_after = "1h"
+
+# A filesystem can exhaust inodes with space to spare.
+[checks.disk_inodes]
+enabled = true
+warn_percent = 85.0
+page_percent = 95.0
+pending_for = "15m"
+clear_after = 2
+severity = "notify"
+renotify_after = "30m"
+
+
+# --- Notifications -------------------------------------------------------------
+
+[notify.pagerduty]
+enabled = true
+# Events API v2 integration key.
+integration_key = "env:PAGERDUTY_INTEGRATION_KEY"
+
+[notify.telegram]
+enabled = true
+bot_token = "env:TELEGRAM_BOT_TOKEN"
+chat_id = "env:TELEGRAM_CHAT_ID"
+
+# Every check above answers "is the validator healthy". This one answers a
+# question no check can answer about itself: if the validator were broken, could
+# anyone actually be told?
+#
+# A revoked routing key, a rotated bot token or a new egress rule leaves every
+# check reporting healthy while nothing can leave the box. Perch would sit there
+# showing zero alerts firing, and you would find out during the outage.
+#
+# So on a schedule perch exercises the real path quietly: a PagerDuty change
+# event (never an incident, never a page) and a Telegram info message. Note
+# PagerDuty accepts any well-formed routing key with 202, revoked or not, so
+# this proves egress and acceptance, not routing. `test-notify` is the loud one.
+#
+# On by default, deliberately. An opt-in guard against invisible failure tends
+# to stay opted out.
+#
+# Watch `perch_notify_self_test_timestamp_seconds` -- if it stops advancing,
+# your alerting path is dead even though every check looks fine.
+
+[notify.self_test]
+enabled = true
+# Clamped to a minimum of 1h: the test opens and closes a real incident, so a
+# typo of "10s" would become an outage of its own.
+interval = "7d"
+
+
+# --- Dead-man's switch ---------------------------------------------------------
+#
+# If perch panics, is OOM-killed, or its host dies, you get silence -- and
+# silence is indistinguishable from "everything is fine". So perch checks
+# in with an external service on every cycle, and that service pages if the
+# check-ins stop. Works with Healthchecks.io, Better Stack, Cronitor, Dead Man's
+# Snitch, or a PagerDuty heartbeat integration.
+#
+# Set the external grace period to roughly 3x your interval, so one slow cycle
+# does not trip it.
+
+# One Telegram message per finished epoch: leader slots, skips, credits, balance,
+# version. Sent by the instance that owns alerting for the validator.
+[digest]
+enabled = true
+
+[heartbeat]
+enabled = true
+url = "env:HEARTBEAT_URL"
+# Optional. Pinged instead of `url` while blind. Healthchecks.io calls this
+# "<url>/fail".
+# fail_url = "env:HEARTBEAT_FAIL_URL"
+# Only check in when checks could actually be evaluated, so the switch reports
+# "working" rather than merely "running".
+require_visibility = true
+
+
+# --- State ---------------------------------------------------------------------
+
+[state]
+# Alert state is persisted here every cycle. Without it, restarting during a
+# live incident loses the PagerDuty dedup key, the resolve is sent under a key
+# PagerDuty has never seen, and that incident stays open forever.
+#
+# Under the bundled systemd unit this is provided by StateDirectory=perch.
+file = "/var/lib/perch/state.json"
+
+
+# --- Metrics -------------------------------------------------------------------
+
+[metrics]
+enabled = true
+# Unauthenticated. Keep it on localhost or a private interface.
+listen = "127.0.0.1:9469"
+
+
+# --- Alert context -------------------------------------------------------------
+
+[context]
+# Answer "is this me, or is this everyone?" inside the alert itself: three
+# delinquent validators means check your box, two hundred means check Discord.
+#
+# This costs one full getVoteAccounts listing per alert burst and nothing at all
+# while things are quiet, so unlike checks.cluster_stake it is safe on free
+# endpoints.
+enabled = true
+cache_for = "5m"
+
+# [diagnose]
+# On the validator's own box only: when one of this validator's checks fires,
+# read the tail of its log and the NIC link counters and add a "Likely causes"
+# section to the alert -- panics, a full disk, no route to peers, the gateway
+# not answering ARP, DNS failures, a link flap, a restart. Matches are counted,
+# never quoted, because validator logs carry credentials.
+#
+# The default unit sets ProtectHome, which hides a log under /home. Switch it to
+# `ProtectHome=tmpfs` and add `BindReadOnlyPaths=/home/sol/logs` to perch.service,
+# or the scan cannot open it.
+# validator = "chimps-1"                         # a [[validators]] label
+# log = "/home/sol/logs/agave-validator.log"     # the validator's --log file
+# lookback = "20m"                               # widened to cover a longer incident
+# max_scan_mb = 512
+# watch_links = true
+# max_findings = 5
+
+
+# --- Maintenance ---------------------------------------------------------------
+
+[silence]
+# While this file exists, paging is suppressed. Write it with `perch maint`,
+# which reads this same setting, rather than by hand:
+#   perch maint restart      until the validator is back (1h deadline)
+#   perch maint 30m          plain timed silence
+#   perch maint off
+# It must live somewhere perch can write: perch deletes it when a window ends,
+# and the shipped unit makes /etc read-only. install.sh creates this directory,
+# group-writable by the perch group, so operators in that group can use maint.
+file = "/var/lib/perch/maint/silence"
+# While silenced, this box's own checks go to the journal only. Set true to
+# get Telegram notes instead (pages are downgraded rather than dropped).
+notify_while_silenced = false

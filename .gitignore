@@ -1,0 +1,42 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Secrets. perch reads PagerDuty routing keys and Telegram bot tokens
+# from an environment file next to the config; never let one reach a commit.
+env
+.env
+*.env
+env.*
+!env.example
+*secret*
+*token*
+*.key
+*.pem
+*password*
+
+# Live config. config.example.toml and examples/*.toml are the templates that
+# ship; a deployed config.toml holds real identities, endpoints and peer URLs.
+config.toml
+/config.local.toml
+
+# Runtime state written by the daemon next to its config
+state.json
+*.state.json
+silence
+maintenance
+*.log
+
+# Local scratch
+/tmp/
+*.bak
+*.orig
+*.patch
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

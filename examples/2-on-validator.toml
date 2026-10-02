@@ -1,0 +1,77 @@
+# A WATCHTOWER ON EACH VALIDATOR
+#
+# One instance per validator box, each owning its own validator. It alerts you
+# directly; there is no central component and nothing to elect.
+#
+# Duplication is prevented by scope: this instance lists ONLY its own validator,
+# so it is the only thing that can alert about it. Give each box its own copy of
+# this file with its own identity and label.
+#
+# Optionally pair with 3-hub-on-failover.toml, which notices if this whole
+# machine dies.
+
+[watchtower]
+name = "chimps-1-box"
+cluster = "mainnet-beta"
+interval = "60s"
+
+# Remote endpoints are required even though this runs on the validator: a
+# wedged node cannot be trusted to report on itself. perch discards any
+# endpoint more than quorum.max_endpoint_lag_slots behind the best one.
+[[endpoints]]
+name = "provider-a"
+url = "https://..."
+[[endpoints]]
+name = "provider-b"
+url = "https://..."
+[[endpoints]]
+name = "provider-c"
+url = "https://..."
+
+[peering]
+name = "chimps-1-box"
+# Report everything this instance watches, deferring to nobody. Correct whether
+# or not you also run the hub.
+alerting = "always"
+priority = 2
+
+# Only if you run the hub. Lets this box tell you when the hub dies.
+# [[peers]]
+# name = "failover-box"
+# url = "http://10.0.0.9:9469/metrics"
+# priority = 1
+
+# Just this box's validator.
+[[validators]]
+identity = "YOUR_IDENTITY_PUBKEY"
+vote_account = "YOUR_VOTE_PUBKEY"
+label = "chimps-1"
+
+# Its own disks, over localhost. Install node_exporter and bind it to the
+# private interface or localhost -- never 0.0.0.0.
+[[hosts]]
+name = "chimps-1-hw"
+url = "http://127.0.0.1:9100/metrics"
+mountpoints = ["/", "/mnt/ledger", "/mnt/accounts"]
+validator = "chimps-1"
+
+[notify.pagerduty]
+integration_key = "env:PAGERDUTY_INTEGRATION_KEY"
+
+[notify.telegram]
+bot_token = "env:TELEGRAM_BOT_TOKEN"
+chat_id = "env:TELEGRAM_CHAT_ID"
+
+[heartbeat]
+url = "env:HEARTBEAT_URL"
+
+[state]
+file = "/var/lib/perch/state.json"
+
+[silence]
+# Written by `perch maint`. See config.example.toml.
+file = "/var/lib/perch/maint/silence"
+
+# The hub polls this. Bind to the private interface if you run one.
+[metrics]
+listen = "127.0.0.1:9469"

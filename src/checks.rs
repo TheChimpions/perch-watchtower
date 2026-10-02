@@ -441,6 +441,7 @@ pub fn evaluate(
 
         if c.vote_admission.base.enabled {
             let warn_epochs = c.vote_admission.warn_epochs;
+            let before_scheduled = c.vote_admission.alert_before_scheduled;
             for (suffix, severity) in [
                 ("critical", c.vote_admission.base.severity),
                 ("warn", Severity::Notify),
@@ -459,7 +460,7 @@ pub fn evaluate(
                     },
                     cfg,
                     per_endpoint(snapshots, &stale, |s| {
-                        admission_verdict(s, &id, &who2, suffix == "critical", warn_epochs, income)
+                        admission_verdict(s, &id, &who2, suffix == "critical", warn_epochs, income, before_scheduled)
                     }),
                     mc,
                 ));
@@ -1321,6 +1322,7 @@ fn admission_verdict(
     critical: bool,
     warn_epochs: u64,
     income: Option<u64>,
+    before_scheduled: bool,
 ) -> Verdict {
     let (Some(cluster), Some(pos)) = (s.alpenglow.as_ref(), position(s)) else {
         return Verdict::unknown("Alpenglow feature state not observed");
@@ -1338,7 +1340,7 @@ fn admission_verdict(
     if critical {
         crate::alpenglow::critical(who, vote, &req)
     } else {
-        crate::alpenglow::warn(who, vote, &req, income, warn_epochs)
+        crate::alpenglow::warn(who, vote, &req, income, warn_epochs, before_scheduled)
     }
 }
 
@@ -2002,10 +2004,15 @@ mod tests {
         }
 
         #[test]
-        fn nothing_pages_before_alpenglow_is_scheduled() {
+        fn nothing_notifies_before_alpenglow_is_scheduled() {
             let c = config("");
             let out = evaluate(&snaps(FeatureState::Absent, Some(vote(0, Bls::Missing)), 0), &c, &mut Progress::default());
             assert_eq!(verdict(&out, "vote_admission_critical:chimps-1"), Verdict::Healthy);
+            assert_eq!(verdict(&out, "vote_admission_warn:chimps-1"), Verdict::Healthy);
+
+            // Readiness notes only when asked for.
+            let c = config("[checks.vote_admission]\nalert_before_scheduled = true\npending_for = \"10m\"\nseverity = \"page\"\n");
+            let out = evaluate(&snaps(FeatureState::Absent, Some(vote(0, Bls::Missing)), 0), &c, &mut Progress::default());
             assert!(matches!(verdict(&out, "vote_admission_warn:chimps-1"), Verdict::Unhealthy(_)));
         }
 

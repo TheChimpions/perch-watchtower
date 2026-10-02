@@ -700,6 +700,13 @@ pub struct VoteAdmissionCheckConfig {
     /// epoch boundaries of VAT with no income.
     #[serde(default = "default_vote_admission_warn_epochs")]
     pub warn_epochs: u64,
+    /// Also notify about readiness before Alpenglow is scheduled on the
+    /// cluster. Off by default: until it is scheduled nothing is enforced, and
+    /// a vote account swept down to rent after a commission withdrawal is
+    /// routine treasury work, not news. Readiness stays visible in `perch
+    /// status` and Grafana either way.
+    #[serde(default)]
+    pub alert_before_scheduled: bool,
 }
 
 fn default_vote_admission_warn_epochs() -> u64 {
@@ -716,6 +723,7 @@ fn default_vote_admission() -> VoteAdmissionCheckConfig {
             ..CheckConfig::new(d(10 * 60), Severity::Page)
         },
         warn_epochs: default_vote_admission_warn_epochs(),
+        alert_before_scheduled: false,
     }
 }
 

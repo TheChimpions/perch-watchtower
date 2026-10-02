@@ -91,9 +91,9 @@ and the next.
 epoch boundary: a BLS key registered, and enough SOL for rent plus the VAT, with
 the deadline and the epoch at stake in the page. It counts the commission each
 vote account earns against the VAT, so you see which accounts drain and how many
-weeks they have. Before Alpenglow is scheduled it tells you which validators are
-not ready; once it is, the identity balance stops paging, because votes no
-longer cost the identity anything.
+weeks they have. Before Alpenglow is scheduled, `perch status` and Grafana show
+which validators are not ready, without notifying; once it is, the identity
+balance stops paging, because votes no longer cost the identity anything.
 
 **Infrastructure.** Disk free space, projected time-to-full, read-only
 remounts and inode exhaustion via node_exporter. Your own RPC node falling
@@ -155,7 +155,7 @@ version, checked against its v4.3.0 source:
 | Watchtower dies | silence | heartbeat, or a standby takes over |
 | Proves its alert path works | no | test-notify and a weekly self-test |
 | Metrics | InfluxDB datapoints | Prometheus and a Grafana dashboard |
-| Alpenglow admission: VAT balance | yes, once active | yes, plus BLS key and readiness before activation |
+| Alpenglow admission: VAT balance | yes, once active | yes, plus BLS key, net runway, and readiness shown before activation |
 | Alert channels | **Slack, Discord, PagerDuty, Telegram, Twilio SMS** | PagerDuty, Telegram |
 | Install | **already there with Agave** | one static binary |
 

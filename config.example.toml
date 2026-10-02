@@ -323,17 +323,21 @@ renotify_after = "30m"
 #                            validator (no BLS key, or balance short)
 #   vote_admission_warn      Telegram: at its net drain (VAT minus the commission
 #                            it earned last epoch) the vote account passes fewer
-#                            than warn_epochs more boundaries; or, before
-#                            Alpenglow is scheduled, one that is not ready for it
+#                            than warn_epochs more boundaries
 #
-# Once the Alpenglow feature is scheduled, the very next boundary enforces it,
-# so readiness is reported before that rather than discovered at it.
+# Before Alpenglow is scheduled nothing is enforced, so nothing notifies: a vote
+# account swept to rent by a commission withdrawal is routine until then.
+# Readiness is still shown in `perch status` and Grafana. Once the feature is
+# scheduled the very next boundary enforces it, possibly within hours, so check
+# readiness there ahead of time, or set alert_before_scheduled = true to get a
+# Telegram note for any vote account that would not pass.
 enabled = true
 pending_for = "10m"
 clear_after = 2
 severity = "page"
 renotify_after = "0s"
 warn_epochs = 3
+alert_before_scheduled = false
 
 [checks.identity_balance]
 # Before Alpenglow the identity pays for every vote, so an empty one goes

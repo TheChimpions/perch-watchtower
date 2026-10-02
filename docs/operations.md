@@ -264,7 +264,7 @@ for that:
 |---|---|---|
 | `vote_admission_critical` | the next boundary will exclude the validator: no BLS key, or less than rent-exempt plus one VAT | PagerDuty and Telegram |
 | `vote_admission_warn` | at its net drain (VAT minus commission income), the vote account passes fewer than `warn_epochs` (3) more boundaries | Telegram |
-| `vote_admission_warn`, before Alpenglow is scheduled | the vote account would not pass if it were: no BLS key, too little SOL, or a drain that would run it out within `warn_epochs` | Telegram |
+| before Alpenglow is scheduled | nothing notifies by default; readiness is in `perch status` and Grafana. With `alert_before_scheduled = true`, `vote_admission_warn` notes a vote account that would not pass | Telegram, opt-in |
 
 **Income counts.** Commission is paid into the vote account at every boundary,
 so a validator whose commission exceeds the VAT never runs short, however low

@@ -137,7 +137,7 @@
         "sort": 1,
         "multi": true,
         "includeAll": true,
-        "allValue": ".*",
+        "allValue": null,
         "current": {
           "selected": true,
           "text": [
@@ -169,7 +169,7 @@
         "sort": 1,
         "multi": true,
         "includeAll": true,
-        "allValue": ".*",
+        "allValue": null,
         "current": {
           "selected": true,
           "text": [
@@ -201,7 +201,7 @@
         "sort": 1,
         "multi": true,
         "includeAll": true,
-        "allValue": ".*",
+        "allValue": null,
         "current": {
           "selected": true,
           "text": [
@@ -758,7 +758,7 @@
           "id": "filterFieldsByName",
           "options": {
             "include": {
-              "pattern": "^(name|solana_cluster|Value #B|Value #C|Value #D|Value #E|Value #F|Value #G|perch_version|validator_version|instance)$"
+              "pattern": "^(name|solana_cluster|Value #B|Value #C|Value #D|Value #E|Value #F|Value #G|perch_version|validator_version)$"
             }
           }
         },
@@ -775,11 +775,10 @@
               "Value #F": 6,
               "Value #G": 7,
               "perch_version": 8,
-              "validator_version": 9,
-              "instance": 10
+              "validator_version": 9
             },
             "renameByName": {
-              "instance": "Scrape target",
+              "instance": "Instance",
               "name": "Name",
               "solana_cluster": "Cluster",
               "Value #B": "Scrape",
@@ -823,6 +822,30 @@
           }
         },
         "overrides": [
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "number"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "string"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
           {
             "matcher": {
               "id": "byName",
@@ -1070,16 +1093,16 @@
     },
     {
       "type": "state-timeline",
-      "title": "Checks not healthy (empty is good)",
-      "description": "Only the periods a check was unhealthy (red) or could not be evaluated (gray). Gray is time you were not actually being monitored for that check: usually an RPC outage, or a check still warming up.",
+      "title": "Check health, per instance",
+      "description": "Each instance's worst check over time: green when every check is healthy, red while any check is unhealthy, gray while any check cannot be evaluated (usually an RPC outage, or a check still warming up). Which checks, and how far along, are in the panels below.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "(perch_check_verdict{job=~\"$job\", instance=~\"$instance\"} < 1) * on (instance) group_left (name) perch_watchtower_info{job=~\"$job\", instance=~\"$instance\"}",
-          "legendFormat": "{{name}} {{check}}",
+          "expr": "min by (name) ((perch_check_verdict{job=~\"$job\", instance=~\"$instance\"}) * on (instance) group_left (name) perch_watchtower_info{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{name}}",
           "refId": "A",
           "editorMode": "code",
           "range": true,
@@ -1092,15 +1115,20 @@
             {
               "type": "value",
               "options": {
-                "0": {
-                  "text": "unhealthy",
-                  "color": "red",
+                "-1": {
+                  "text": "something unknown",
+                  "color": "#808080",
                   "index": 0
                 },
-                "-1": {
-                  "text": "unknown",
-                  "color": "#808080",
+                "0": {
+                  "text": "something unhealthy",
+                  "color": "red",
                   "index": 1
+                },
+                "1": {
+                  "text": "all healthy",
+                  "color": "green",
+                  "index": 2
                 }
               }
             }
@@ -1118,14 +1146,17 @@
               {
                 "color": "red",
                 "value": -0.5
+              },
+              {
+                "color": "green",
+                "value": 0.5
               }
             ]
           },
           "custom": {
             "fillOpacity": 80,
             "lineWidth": 0
-          },
-          "noValue": "Every check healthy"
+          }
         },
         "overrides": []
       },
@@ -1143,10 +1174,171 @@
       },
       "id": 10,
       "gridPos": {
-        "h": 8,
+        "h": 6,
         "w": 24,
         "x": 0,
         "y": 13
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "table",
+      "title": "Not healthy now",
+      "description": "Every check that is unhealthy or cannot be evaluated right now. Unhealthy checks page only once they pass their hold-down (see Hold-down progress); unknown ones never page.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(perch_check_verdict{job=~\"$job\", instance=~\"$instance\"} < 1) * on (instance) group_left (name) perch_watchtower_info{job=~\"$job\", instance=~\"$instance\"}",
+          "legendFormat": "",
+          "refId": "A",
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "check",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "pattern": "^(name|check|Value)$"
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "name": 0,
+              "check": 1,
+              "Value": 2
+            },
+            "renameByName": {
+              "name": "Instance",
+              "check": "Check",
+              "Value": "State"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Instance"
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "Every check healthy"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "number"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "string"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "State"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "unhealthy",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "-1": {
+                        "text": "unknown",
+                        "color": "#808080",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      },
+      "id": 11,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 19
       },
       "datasource": {
         "type": "prometheus",
@@ -1225,12 +1417,12 @@
           "sort": "desc"
         }
       },
-      "id": 11,
+      "id": 12,
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 21
+        "w": 8,
+        "x": 8,
+        "y": 19
       },
       "datasource": {
         "type": "prometheus",
@@ -1310,6 +1502,30 @@
         "overrides": [
           {
             "matcher": {
+              "id": "byType",
+              "options": "number"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "string"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
               "id": "byName",
               "options": "Unhealthy for"
             },
@@ -1333,12 +1549,12 @@
           "show": false
         }
       },
-      "id": 12,
+      "id": 13,
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 21
+        "w": 8,
+        "x": 16,
+        "y": 19
       },
       "datasource": {
         "type": "prometheus",
@@ -1350,12 +1566,12 @@
       "title": "Validators",
       "collapsed": false,
       "panels": [],
-      "id": 13,
+      "id": 14,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 29
+        "y": 27
       }
     },
     {
@@ -1445,12 +1661,12 @@
           "sort": "desc"
         }
       },
-      "id": 14,
+      "id": 15,
       "gridPos": {
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 30
+        "y": 28
       },
       "datasource": {
         "type": "prometheus",
@@ -1529,12 +1745,12 @@
           "mode": "single"
         }
       },
-      "id": 15,
+      "id": 16,
       "gridPos": {
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 30
+        "y": 28
       },
       "datasource": {
         "type": "prometheus",
@@ -1610,12 +1826,12 @@
           "sort": "desc"
         }
       },
-      "id": 16,
+      "id": 17,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 39
+        "y": 37
       },
       "datasource": {
         "type": "prometheus",
@@ -1697,12 +1913,12 @@
           "sort": "desc"
         }
       },
-      "id": 17,
+      "id": 18,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 39
+        "y": 37
       },
       "datasource": {
         "type": "prometheus",
@@ -1784,12 +2000,12 @@
           "sort": "desc"
         }
       },
-      "id": 18,
+      "id": 19,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 39
+        "y": 37
       },
       "datasource": {
         "type": "prometheus",
@@ -1907,6 +2123,30 @@
         "overrides": [
           {
             "matcher": {
+              "id": "byType",
+              "options": "number"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "string"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
               "id": "byName",
               "options": "Leader slots"
             },
@@ -1981,12 +2221,12 @@
           "show": false
         }
       },
-      "id": 19,
+      "id": 20,
       "gridPos": {
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 47
+        "y": 45
       },
       "datasource": {
         "type": "prometheus",
@@ -1998,12 +2238,12 @@
       "title": "Alpenglow",
       "collapsed": false,
       "panels": [],
-      "id": 20,
+      "id": 21,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 53
+        "y": 51
       }
     },
     {
@@ -2086,12 +2326,12 @@
           "values": false
         }
       },
-      "id": 21,
+      "id": 22,
       "gridPos": {
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 54
+        "y": 52
       },
       "datasource": {
         "type": "prometheus",
@@ -2150,12 +2390,12 @@
           "values": false
         }
       },
-      "id": 22,
+      "id": 23,
       "gridPos": {
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 54
+        "y": 52
       },
       "datasource": {
         "type": "prometheus",
@@ -2216,12 +2456,12 @@
           "values": false
         }
       },
-      "id": 23,
+      "id": 24,
       "gridPos": {
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 54
+        "y": 52
       },
       "datasource": {
         "type": "prometheus",
@@ -2282,12 +2522,12 @@
           "values": false
         }
       },
-      "id": 24,
+      "id": 25,
       "gridPos": {
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 54
+        "y": 52
       },
       "datasource": {
         "type": "prometheus",
@@ -2407,12 +2647,12 @@
           "sort": "desc"
         }
       },
-      "id": 25,
+      "id": 26,
       "gridPos": {
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 58
+        "y": 56
       },
       "datasource": {
         "type": "prometheus",
@@ -2558,6 +2798,30 @@
           "noValue": "No vote accounts reported"
         },
         "overrides": [
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "number"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "string"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
           {
             "matcher": {
               "id": "byName",
@@ -2716,12 +2980,12 @@
           "show": false
         }
       },
-      "id": 26,
+      "id": 27,
       "gridPos": {
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 65
+        "y": 63
       },
       "datasource": {
         "type": "prometheus",
@@ -2733,12 +2997,12 @@
       "title": "RPC endpoints",
       "collapsed": false,
       "panels": [],
-      "id": 27,
+      "id": 28,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 72
+        "y": 70
       }
     },
     {
@@ -2813,12 +3077,12 @@
           "mode": "single"
         }
       },
-      "id": 28,
+      "id": 29,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 73
+        "y": 71
       },
       "datasource": {
         "type": "prometheus",
@@ -2906,12 +3170,12 @@
           "sort": "desc"
         }
       },
-      "id": 29,
+      "id": 30,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 73
+        "y": 71
       },
       "datasource": {
         "type": "prometheus",
@@ -2989,12 +3253,12 @@
           "sort": "desc"
         }
       },
-      "id": 30,
+      "id": 31,
       "gridPos": {
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 81
+        "y": 79
       },
       "datasource": {
         "type": "prometheus",
@@ -3006,12 +3270,12 @@
       "title": "Disks",
       "collapsed": false,
       "panels": [],
-      "id": 31,
+      "id": 32,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 88
+        "y": 86
       }
     },
     {
@@ -3090,12 +3354,12 @@
           "sort": "desc"
         }
       },
-      "id": 32,
+      "id": 33,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 89
+        "y": 87
       },
       "datasource": {
         "type": "prometheus",
@@ -3170,12 +3434,12 @@
           "sort": "desc"
         }
       },
-      "id": 33,
+      "id": 34,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 89
+        "y": 87
       },
       "datasource": {
         "type": "prometheus",
@@ -3271,12 +3535,12 @@
           "sort": "desc"
         }
       },
-      "id": 34,
+      "id": 35,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 97
+        "y": 95
       },
       "datasource": {
         "type": "prometheus",
@@ -3284,56 +3548,73 @@
       }
     },
     {
-      "type": "state-timeline",
-      "title": "Read-only and scrape health",
-      "description": "A filesystem remounted read-only is how a disk usually fails under a validator; perch pages immediately. A failed node_exporter scrape freezes the disk checks rather than alerting.",
+      "type": "table",
+      "title": "Read-only filesystems",
+      "description": "Filesystems remounted read-only right now. This is how a disk usually fails under a validator, and perch pages for it immediately.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "perch_filesystem_readonly{job=~\"$job\", instance=~\"$instance\"}",
-          "legendFormat": "{{host}} {{mountpoint}} read-only",
+          "expr": "perch_filesystem_readonly{job=~\"$job\", instance=~\"$instance\"} == 1",
+          "legendFormat": "",
           "refId": "A",
           "editorMode": "code",
-          "range": true,
-          "instant": false
+          "range": false,
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "mountpoint",
+            "mode": "outer"
+          }
         },
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "1 - perch_host_scrape_ok{job=~\"$job\", instance=~\"$instance\"}",
-          "legendFormat": "{{host}} scrape failed",
-          "refId": "B",
-          "editorMode": "code",
-          "range": true,
-          "instant": false
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "pattern": "^(host|mountpoint|device)$"
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "host": 0,
+              "mountpoint": 1,
+              "device": 2
+            },
+            "renameByName": {
+              "host": "Host",
+              "mountpoint": "Mount",
+              "device": "Device"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Host"
+              }
+            ]
+          }
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "0": {
-                  "text": "ok",
-                  "color": "green",
-                  "index": 0
-                },
-                "1": {
-                  "text": "PROBLEM",
-                  "color": "red",
-                  "index": 1
-                }
-              }
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
             }
-          ],
-          "color": {
-            "mode": "thresholds"
           },
           "thresholds": {
             "mode": "absolute",
@@ -3341,39 +3622,210 @@
               {
                 "color": "green",
                 "value": null
-              },
-              {
-                "color": "red",
-                "value": 0.5
               }
             ]
           },
+          "noValue": "No read-only filesystems"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "number"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "string"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      },
+      "id": 36,
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 95
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "table",
+      "title": "node_exporter hosts",
+      "description": "Whether each host's node_exporter answered last cycle. A failed scrape freezes the disk checks rather than alerting.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "perch_host_scrape_ok{job=~\"$job\", instance=~\"$instance\"}",
+          "legendFormat": "",
+          "refId": "A",
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "host",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "pattern": "^(host|Value)$"
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "host": 0,
+              "Value": 1
+            },
+            "renameByName": {
+              "host": "Host",
+              "Value": "Scrape"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Host"
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
           "custom": {
-            "fillOpacity": 80,
-            "lineWidth": 0
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
           },
           "noValue": "No [[hosts]] configured"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "number"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "string"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Scrape"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "ok",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "FAILED",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
       },
       "options": {
-        "showValue": "never",
-        "mergeValues": true,
-        "rowHeight": 0.8,
-        "alignValue": "left",
-        "legend": {
-          "showLegend": false
-        },
-        "tooltip": {
-          "mode": "single"
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
         }
       },
-      "id": 35,
+      "id": 37,
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 97
+        "w": 6,
+        "x": 18,
+        "y": 95
       },
       "datasource": {
         "type": "prometheus",
@@ -3385,12 +3837,12 @@
       "title": "Watchtowers",
       "collapsed": false,
       "panels": [],
-      "id": 36,
+      "id": 38,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 105
+        "y": 103
       }
     },
     {
@@ -3464,12 +3916,12 @@
           "sort": "desc"
         }
       },
-      "id": 37,
+      "id": 39,
       "gridPos": {
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 106
+        "y": 104
       },
       "datasource": {
         "type": "prometheus",
@@ -3543,12 +3995,12 @@
           "sort": "desc"
         }
       },
-      "id": 38,
+      "id": 40,
       "gridPos": {
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 106
+        "y": 104
       },
       "datasource": {
         "type": "prometheus",
@@ -3627,12 +4079,12 @@
           "mode": "single"
         }
       },
-      "id": 39,
+      "id": 41,
       "gridPos": {
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 106
+        "y": 104
       },
       "datasource": {
         "type": "prometheus",
@@ -3640,9 +4092,9 @@
       }
     },
     {
-      "type": "state-timeline",
+      "type": "table",
       "title": "Peers, as each instance sees them",
-      "description": "Whether each instance can reach the peers it watches. A peer that is unreachable while its validator keeps voting is lost visibility, not an outage.",
+      "description": "Whether each instance can reach the peers it watches, and whether they can see their cluster. A peer that is unreachable while its validator keeps voting is lost visibility, not an outage.",
       "targets": [
         {
           "datasource": {
@@ -3650,74 +4102,197 @@
             "uid": "${datasource}"
           },
           "expr": "(perch_peer_reachable{job=~\"$job\", instance=~\"$instance\"}) * on (instance) group_left (name) perch_watchtower_info{job=~\"$job\", instance=~\"$instance\"}",
-          "legendFormat": "{{name}} \u2192 {{peer}}",
+          "legendFormat": "",
           "refId": "A",
           "editorMode": "code",
-          "range": true,
-          "instant": false
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "(perch_peer_visible{job=~\"$job\", instance=~\"$instance\"}) * on (instance) group_left (name) perch_watchtower_info{job=~\"$job\", instance=~\"$instance\"}",
+          "legendFormat": "",
+          "refId": "B",
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "pattern": "^(name|peer|Value #A|Value #B)$"
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "name": 0,
+              "peer": 1,
+              "Value #A": 2,
+              "Value #B": 3
+            },
+            "renameByName": {
+              "name": "Instance",
+              "peer": "Peer",
+              "Value #A": "Reachable",
+              "Value #B": "Visible"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Instance"
+              }
+            ]
+          }
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "1": {
-                  "text": "reachable",
-                  "color": "green",
-                  "index": 0
-                },
-                "0": {
-                  "text": "unreachable",
-                  "color": "red",
-                  "index": 1
-                }
-              }
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
             }
-          ],
-          "color": {
-            "mode": "thresholds"
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "red",
-                "value": null
-              },
-              {
                 "color": "green",
-                "value": 0.5
+                "value": null
               }
             ]
           },
-          "custom": {
-            "fillOpacity": 80,
-            "lineWidth": 0
-          },
           "noValue": "No [[peers]] configured"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "number"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "string"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Reachable"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "yes",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "NO",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Visible"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "yes",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "BLIND",
+                        "color": "orange",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
       },
       "options": {
-        "showValue": "never",
-        "mergeValues": true,
-        "rowHeight": 0.8,
-        "alignValue": "left",
-        "legend": {
-          "showLegend": false
-        },
-        "tooltip": {
-          "mode": "single"
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
         }
       },
-      "id": 40,
+      "id": 42,
       "gridPos": {
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 113
+        "y": 111
       },
       "datasource": {
         "type": "prometheus",
@@ -3792,12 +4367,12 @@
           "sort": "desc"
         }
       },
-      "id": 41,
+      "id": 43,
       "gridPos": {
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 113
+        "y": 111
       },
       "datasource": {
         "type": "prometheus",
@@ -3809,12 +4384,12 @@
       "title": "Notifications",
       "collapsed": false,
       "panels": [],
-      "id": 42,
+      "id": 44,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 120
+        "y": 118
       }
     },
     {
@@ -3912,6 +4487,30 @@
         "overrides": [
           {
             "matcher": {
+              "id": "byType",
+              "options": "number"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "string"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
               "id": "byName",
               "options": "Delivered"
             },
@@ -3966,12 +4565,12 @@
           "show": false
         }
       },
-      "id": 43,
+      "id": 45,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 121
+        "y": 119
       },
       "datasource": {
         "type": "prometheus",
@@ -4075,12 +4674,12 @@
         }
       },
       "interval": "5m",
-      "id": 44,
+      "id": 46,
       "gridPos": {
         "h": 8,
         "w": 16,
         "x": 8,
-        "y": 121
+        "y": 119
       },
       "datasource": {
         "type": "prometheus",
@@ -4159,12 +4758,12 @@
           "sort": "desc"
         }
       },
-      "id": 45,
+      "id": 47,
       "gridPos": {
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 129
+        "y": 127
       },
       "datasource": {
         "type": "prometheus",

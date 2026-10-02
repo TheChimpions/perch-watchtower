@@ -1,6 +1,6 @@
 [package]
 name = "perch"
-version = "1.0.0"
+version = "1.0.2"
 edition = "2021"
 # Validator hosts often run whatever Rust shipped with the distro. Keeping this
 # low, and shipping Cargo.lock, means the build does not demand a fresh toolchain.

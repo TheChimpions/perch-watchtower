@@ -187,7 +187,12 @@ def table(title, desc, targets, join_on, keep, rename, overrides=(), sort=None):
         "transformations": transformations,
         "fieldConfig": {"defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}},
                                      "thresholds": steps((None, GREEN))},
-                        "overrides": list(overrides)},
+                        # A table's noValue is also what an empty *cell* shows, so
+                        # "No [[hosts]] configured" would land in a joined row's
+                        # missing column. Cells get a dash; the panel keeps its text.
+                        "overrides": [{"matcher": {"id": "byType", "options": t},
+                                       "properties": [{"id": "noValue", "value": "—"}]}
+                                      for t in ("number", "string")] + list(overrides)},
         "options": {"showHeader": True, "cellHeight": "sm", "footer": {"show": False}},
     }
 
@@ -258,11 +263,10 @@ L.add(table(
     ],
     join_on="instance",
     keep=["name", "solana_cluster", "Value #B", "Value #C", "Value #D", "Value #E",
-          "Value #F", "Value #G", "perch_version", "validator_version", "instance"],
+          "Value #F", "Value #G", "perch_version", "validator_version"],
     rename={"instance": "Instance", "name": "Name", "solana_cluster": "Cluster", "Value #B": "Scrape",
             "Value #C": "Visible", "Value #D": "Firing", "Value #E": "Cycle age", "Value #F": "Owner",
-            "Value #G": "Silenced", "perch_version": "perch", "validator_version": "Validator",
-            "instance": "Scrape target"},
+            "Value #G": "Silenced", "perch_version": "perch", "validator_version": "Validator"},
     overrides=[
         colored("Scrape", mappings=UPDOWN),
         colored("Visible", mappings=mapping({1: ("yes", GREEN), 0: ("BLIND", ORANGE)})),
@@ -277,12 +281,24 @@ L.add(table(
 # --- Checks ---------------------------------------------------------------------
 L.row("Checks")
 L.add(state_timeline(
-    "Checks not healthy (empty is good)",
-    "Only the periods a check was unhealthy (red) or could not be evaluated (gray). Gray is time you were not "
-    "actually being monitored for that check: usually an RPC outage, or a check still warming up.",
-    [target(f'perch_check_verdict{{{I}}} < 1', "{{instance}} {{check}}")],
-    {0: ("unhealthy", RED), -1: ("unknown", GRAY)},
-), 24, 8, empty="Every check healthy")
+    "Check health, per instance",
+    "Each instance's worst check over time: green when every check is healthy, red while any check is unhealthy, "
+    "gray while any check cannot be evaluated (usually an RPC outage, or a check still warming up). Which checks, "
+    "and how far along, are in the panels below.",
+    [target(f'min by (name) ({named(f"perch_check_verdict{{{I}}}")})', "{{name}}")],
+    {-1: ("something unknown", GRAY), 0: ("something unhealthy", RED), 1: ("all healthy", GREEN)},
+), 24, 6)
+L.add(table(
+    "Not healthy now",
+    "Every check that is unhealthy or cannot be evaluated right now. Unhealthy checks page only once they pass "
+    "their hold-down (see Hold-down progress); unknown ones never page.",
+    [target(named(f'perch_check_verdict{{{I}}} < 1'), ref="A", instant=True, fmt="table")],
+    join_on="check",
+    keep=["name", "check", "Value"],
+    rename={"name": "Instance", "check": "Check", "Value": "State"},
+    overrides=[colored("State", mappings=mapping({0: ("unhealthy", RED), -1: ("unknown", GRAY)}))],
+    sort="Instance",
+), 8, 8, empty="Every check healthy")
 L.add(timeseries(
     "Hold-down progress",
     "How far each unhealthy check is toward firing: 100% is its hold-down (pending_for). A check that climbs "
@@ -290,7 +306,7 @@ L.add(timeseries(
     [target(f'(perch_check_unhealthy_seconds{{{I}}} > 0) / on (instance, check) '
             f'(perch_check_pending_for_seconds{{{I}}} > 0) * 100', "{{instance}} {{check}}")],
     unit="percent", min_=0, thresholds=steps((None, GREEN), (100, RED)), threshold_style="dashed",
-), 12, 8, empty="Nothing unhealthy")
+), 8, 8, empty="Nothing unhealthy")
 L.add(table(
     "Firing now",
     "Every check currently alerting, and how long it has been confirmed unhealthy.",
@@ -300,7 +316,7 @@ L.add(table(
     keep=["name", "check", "Value"],
     rename={"name": "Instance", "check": "Check", "Value": "Unhealthy for"},
     overrides=[plain("Unhealthy for", unit="s", decimals=0)],
-), 12, 8, empty="Nothing firing")
+), 8, 8, empty="Nothing firing")
 
 # --- Validators -----------------------------------------------------------------
 L.row("Validators")
@@ -477,14 +493,27 @@ L.add(timeseries(
     unit="percent", min_=0, max_=100, thresholds=steps((None, GREEN), (INODE_WARN, ORANGE), (INODE_PAGE, RED)),
     threshold_style="dashed",
 ), 12, 8, empty="No [[hosts]] configured")
-L.add(state_timeline(
-    "Read-only and scrape health",
-    "A filesystem remounted read-only is how a disk usually fails under a validator; perch pages immediately. "
-    "A failed node_exporter scrape freezes the disk checks rather than alerting.",
-    [target(f'perch_filesystem_readonly{{{I}}}', "{{host}} {{mountpoint}} read-only", "A"),
-     target(f'1 - perch_host_scrape_ok{{{I}}}', "{{host}} scrape failed", "B")],
-    {0: ("ok", GREEN), 1: ("PROBLEM", RED)},
-), 12, 8, empty="No [[hosts]] configured")
+L.add(table(
+    "Read-only filesystems",
+    "Filesystems remounted read-only right now. This is how a disk usually fails under a validator, and perch "
+    "pages for it immediately.",
+    [target(f'perch_filesystem_readonly{{{I}}} == 1', ref="A", instant=True, fmt="table")],
+    join_on="mountpoint",
+    keep=["host", "mountpoint", "device"],
+    rename={"host": "Host", "mountpoint": "Mount", "device": "Device"},
+    sort="Host",
+), 6, 8, empty="No read-only filesystems")
+L.add(table(
+    "node_exporter hosts",
+    "Whether each host's node_exporter answered last cycle. A failed scrape freezes the disk checks rather than "
+    "alerting.",
+    [target(f'perch_host_scrape_ok{{{I}}}', ref="A", instant=True, fmt="table")],
+    join_on="host",
+    keep=["host", "Value"],
+    rename={"host": "Host", "Value": "Scrape"},
+    overrides=[colored("Scrape", mappings=mapping({1: ("ok", GREEN), 0: ("FAILED", RED)}))],
+    sort="Host",
+), 6, 8, empty="No [[hosts]] configured")
 
 # --- Watchtowers ----------------------------------------------------------------
 L.row("Watchtowers")
@@ -508,12 +537,18 @@ L.add(state_timeline(
     [target(f'perch_alerting_owner{{{I}}}', "{{instance}}")],
     {1: ("owner", GREEN), 0: ("standby", GRAY)},
 ), 8, 7)
-L.add(state_timeline(
+L.add(table(
     "Peers, as each instance sees them",
-    "Whether each instance can reach the peers it watches. A peer that is unreachable while its validator "
-    "keeps voting is lost visibility, not an outage.",
-    [target(f'perch_peer_reachable{{{I}}}', "{{instance}} → {{peer}}")],
-    {1: ("reachable", GREEN), 0: ("unreachable", RED)},
+    "Whether each instance can reach the peers it watches, and whether they can see their cluster. A peer that is "
+    "unreachable while its validator keeps voting is lost visibility, not an outage.",
+    [target(named(f'perch_peer_reachable{{{I}}}'), ref="A", instant=True, fmt="table"),
+     target(named(f'perch_peer_visible{{{I}}}'), ref="B", instant=True, fmt="table")],
+    join_on=None,
+    keep=["name", "peer", "Value #A", "Value #B"],
+    rename={"name": "Instance", "peer": "Peer", "Value #A": "Reachable", "Value #B": "Visible"},
+    overrides=[colored("Reachable", mappings=mapping({1: ("yes", GREEN), 0: ("NO", RED)})),
+               colored("Visible", mappings=mapping({1: ("yes", GREEN), 0: ("BLIND", ORANGE)}))],
+    sort="Instance",
 ), 12, 7, empty="No [[peers]] configured")
 L.add(timeseries(
     "Peer cycle age",
@@ -566,7 +601,11 @@ def query_var(name, label, query, multi=True, include_all=True, desc=""):
         "name": name, "label": label, "type": "query", "datasource": DS, "description": desc,
         "query": {"query": query, "refId": f"{name}-var"}, "definition": query,
         "refresh": 2, "sort": 1, "multi": multi, "includeAll": include_all,
-        "allValue": ".*" if include_all else None,
+        # No custom "All" value: Grafana then expands All to exactly the values
+        # listed. A ".*" here matched every instance in Prometheus, so picking a
+        # cluster narrowed the list but not the panels, and instances running
+        # an older perch (no perch_watchtower_info) leaked into every count.
+        "allValue": None,
         "current": {"selected": True, "text": ["All"], "value": ["$__all"]} if include_all else {},
         "options": [], "hide": 0, "regex": "",
     }

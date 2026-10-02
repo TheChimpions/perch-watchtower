@@ -418,6 +418,20 @@ impl Alerting {
     }
 }
 
+impl Alerting {
+    /// Whether a check is this instance's own, for display and counting.
+    ///
+    /// A `peers` hub evaluates every validator's checks, but only to judge
+    /// whether a silent peer's machine is down; it never reports them. Showing
+    /// them as the hub's own put mind-main's identity warning on the hub, as a
+    /// second copy of an alert only mind-main sends. Every other mode shows all
+    /// it evaluates: a `never` instance is a data source, and showing state is
+    /// its job.
+    pub fn owns_check(&self, check_id: &str) -> bool {
+        !matches!(self, Alerting::Peers) || is_peer_check(check_id)
+    }
+}
+
 /// Peer checks are about a shared subject rather than about the observer, so
 /// several instances can legitimately report the same one.
 pub fn is_peer_check(check_id: &str) -> bool {
@@ -1988,6 +2002,18 @@ identity = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv"
     fn an_unpinned_cluster_is_allowed() {
         let c = Config::parse(MINIMAL).unwrap();
         assert!(c.watchtower.expected_genesis_hash().is_none());
+    }
+
+    /// A `peers` hub shows only peer checks as its own; every other mode
+    /// owns everything it evaluates.
+    #[test]
+    fn only_a_peers_hub_disowns_validator_checks() {
+        assert!(!Alerting::Peers.owns_check("identity_balance_warn:mind-main"));
+        assert!(Alerting::Peers.owns_check("peer_down:mind-main"));
+        assert!(Alerting::Peers.owns_check("machine_down:mind-main"));
+        for mode in [Alerting::Always, Alerting::Auto, Alerting::Never] {
+            assert!(mode.owns_check("identity_balance_warn:mind-main"));
+        }
     }
 
     #[test]

@@ -68,6 +68,10 @@ pub struct PersistedState {
     /// not watch.
     #[serde(default)]
     pub last_digest_epoch: Option<u64>,
+    /// Identity balance history behind the measured runway. Absent in state
+    /// files from before it existed, which simply start measuring afresh.
+    #[serde(default)]
+    pub identity_history: HashMap<String, crate::fillrate::FillHistory>,
 }
 
 fn now_unix() -> u64 {
@@ -133,6 +137,7 @@ pub fn save(
         disk_history: disk.export(),
         last_self_test_unix,
         last_digest_epoch,
+        identity_history: progress.export_identity_history(),
     };
 
     if let Some(parent) = path.parent() {
@@ -227,6 +232,7 @@ pub fn load(
         .collect();
 
     progress.import(parsed.validator_credits, parsed.cluster_slot);
+    progress.import_identity_history(parsed.identity_history);
     disk.import(parsed.disk_history);
     blindness.restore(parsed.blind_incident_key, parsed.blind_announced);
 

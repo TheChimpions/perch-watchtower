@@ -178,7 +178,7 @@ pub async fn run(
     if print_vote_accounts(&s, &snapshots, config) {
         println!();
     }
-    print_checks(&s, &outcomes, &restored.states, &suppressed);
+    print_checks(&s, &outcomes, &restored.states, &suppressed, config.peering.alerting);
     println!();
     print_footer(&s, config, state_path, &restored);
 
@@ -483,6 +483,7 @@ fn print_checks(
     outcomes: &[CheckOutcome],
     states: &HashMap<String, CheckState>,
     suppressed: &HashMap<String, String>,
+    alerting: crate::config::Alerting,
 ) {
     println!("{}", s.bold("CHECKS"));
 
@@ -500,7 +501,18 @@ fn print_checks(
         let firing = st.map(|s| s.is_firing()).unwrap_or(false);
         let banked = st.map(|s| s.unhealthy_for()).unwrap_or(Duration::ZERO);
 
-        let (label, detail) = if let Some(cause) = suppressed.get(&o.id) {
+        let (label, detail) = if !alerting.owns_check(&o.id) {
+            (
+                s.dim("OBSERV"),
+                s.dim(&format!(
+                    "observed only; reported by its own instance ({})",
+                    o.verdict.detail().unwrap_or(match &o.verdict {
+                        Verdict::Healthy => "healthy",
+                        _ => "unknown",
+                    })
+                )),
+            )
+        } else if let Some(cause) = suppressed.get(&o.id) {
             (
                 s.dim("MUTED "),
                 s.dim(&format!("explained by {cause}")),

@@ -1168,7 +1168,7 @@ mod build_identity {
         assert!(out.contains(&expected), "got:\n{out}");
         // COMMIT is a compile-time constant, so asserting it is non-empty is
         // vacuous; what matters is that the rendered line carries it.
-        assert!(crate::BUILD.starts_with("1.0.0 ("), "{}", crate::BUILD);
+        assert!(crate::BUILD.starts_with(concat!(env!("CARGO_PKG_VERSION"), " (")), "{}", crate::BUILD);
     }
 }
 

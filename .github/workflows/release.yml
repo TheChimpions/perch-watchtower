@@ -10,7 +10,21 @@ permissions:
   contents: read
 
 jobs:
+  # A tag that disagrees with Cargo.toml ships a binary that reports the wrong
+  # version in --version, status, and perch_build_info. v1.0.1 did exactly that.
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "v$crate" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
   build:
+    needs: version
     runs-on: ubuntu-latest
     strategy:
       matrix:

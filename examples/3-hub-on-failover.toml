@@ -1,0 +1,77 @@
+# OPTIONAL SUPERVISOR ON THE FAILOVER BOX
+#
+# Pairs with 2-on-validator.toml. The validators alert about themselves; this
+# instance exists for the one thing they cannot do -- report their own machine
+# dying, since the watchtower dies with it.
+#
+# It watches every validator box and pages only when a box goes silent AND the
+# cluster independently reports that validator has stopped voting. Silence on
+# its own is Telegram, because silence could equally be a network blip.
+#
+# ENTIRELY OPTIONAL. Without it, use [heartbeat] on each validator instead.
+
+[watchtower]
+name = "failover-box"
+cluster = "mainnet-beta"
+interval = "60s"
+
+# Required: deciding that a silent box means a dead machine needs independent
+# cluster evidence.
+[[endpoints]]
+name = "provider-a"
+url = "https://..."
+[[endpoints]]
+name = "provider-b"
+url = "https://..."
+[[endpoints]]
+name = "provider-c"
+url = "https://..."
+
+[peering]
+name = "failover-box"
+# Observe everything, report only peer liveness. The validators own their own
+# alerting; this instance must not duplicate it.
+alerting = "peers"
+role = "full"
+priority = 1
+stale_after = "3m"
+
+# One per validator box.
+[[peers]]
+name = "chimps-1-box"
+url = "http://10.0.0.5:9469/metrics"
+priority = 2
+validator = "chimps-1"   # enables the fusion rule
+
+# [[peers]]
+# name = "chimps-2-box"
+# url = "http://10.0.0.6:9469/metrics"
+# priority = 3
+# validator = "chimps-2"
+
+# Every validator, for cluster evidence only. This instance does not alert
+# about them.
+[[validators]]
+identity = "YOUR_IDENTITY_PUBKEY"
+vote_account = "YOUR_VOTE_PUBKEY"
+label = "chimps-1"
+
+[notify.pagerduty]
+integration_key = "env:PAGERDUTY_INTEGRATION_KEY"
+
+[notify.telegram]
+bot_token = "env:TELEGRAM_BOT_TOKEN"
+chat_id = "env:TELEGRAM_CHAT_ID"
+
+[heartbeat]
+url = "env:HEARTBEAT_URL"
+
+[state]
+file = "/var/lib/perch/state.json"
+
+[silence]
+# Written by `perch maint`. See config.example.toml.
+file = "/var/lib/perch/maint/silence"
+
+[metrics]
+listen = "10.0.0.9:9469"

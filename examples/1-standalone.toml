@@ -1,0 +1,57 @@
+# ONE WATCHTOWER, ANYWHERE
+#
+# The simplest complete setup. Runs on your failover box, a VPS, a spare
+# machine -- anywhere that is not itself a validator. Monitors every validator
+# remotely. No peers, no hub, nothing central.
+#
+#   perch --config /etc/perch/config.toml
+
+[watchtower]
+name = "chimps"
+cluster = "mainnet-beta"
+interval = "60s"
+
+# Three independent providers. These are free, need no signup, and are
+# verified against the calls perch makes; they will fail now and then, which
+# is exactly what perch absorbs. Swap in your own RPC or a free-tier key
+# (Helius, QuickNode, Triton) when you have one.
+[[endpoints]]
+name = "solana-labs"
+url = "https://api.mainnet-beta.solana.com"
+[[endpoints]]
+name = "publicnode"
+url = "https://solana-rpc.publicnode.com"
+[[endpoints]]
+name = "leorpc"
+url = "https://solana.leorpc.com/?api_key=FREE"
+
+[[validators]]
+identity = "YOUR_IDENTITY_PUBKEY"
+vote_account = "YOUR_VOTE_PUBKEY"
+label = "chimps-1"
+
+# [[validators]]
+# identity = "..."
+# label = "chimps-2"
+
+[notify.pagerduty]
+integration_key = "env:PAGERDUTY_INTEGRATION_KEY"
+
+[notify.telegram]
+bot_token = "env:TELEGRAM_BOT_TOKEN"
+chat_id = "env:TELEGRAM_CHAT_ID"
+
+# Strongly recommended with no hub: this is what tells you the watchtower
+# itself has died. Set the service's grace period to about 3x your interval.
+[heartbeat]
+url = "env:HEARTBEAT_URL"
+
+[state]
+file = "/var/lib/perch/state.json"
+
+[silence]
+# Written by `perch maint`. See config.example.toml.
+file = "/var/lib/perch/maint/silence"
+
+[metrics]
+listen = "127.0.0.1:9469"

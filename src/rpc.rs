@@ -155,6 +155,11 @@ fn classify_jsonrpc(code: i64, message: &str) -> RpcError {
         -32011 => RpcError::Transient(format!("history unavailable ({code}): {message}")),
         -32019 => RpcError::Transient(format!("epoch rewards period active ({code}): {message}")),
         -32601 => RpcError::Unsupported(format!("method not supported by this endpoint: {message}")),
+        // BlockCleanedUp: the endpoint has pruned the history being asked for.
+        // publicnode keeps hours, not an epoch, so an epoch-boundary lookup is
+        // refused every time. Retrying it three times and logging a warning
+        // describes a fact about the endpoint as if it were a failure.
+        -32001 => RpcError::Unsupported(format!("history not kept by this endpoint ({code}): {message}")),
         -32602 => RpcError::Config(format!("invalid params: {message}")),
         -32600 | -32700 => RpcError::Config(format!("malformed request ({code}): {message}")),
         _ => {
@@ -484,6 +489,13 @@ mod unsupported_methods {
     /// box: a validator without --full-rpc-api refusing getBlockProduction.
     #[test]
     fn method_not_found_is_a_fact_about_the_endpoint_not_a_config_error() {
+        // Measured: publicnode on a previous epoch's reward lookup.
+        let e = classify_jsonrpc(
+            -32001,
+            "Block 452304000 cleaned up, does not exist on node. First available block: 452451166",
+        );
+        assert!(matches!(e, RpcError::Unsupported(_)), "pruned history is not a transient failure: {e}");
+
         let e = classify_jsonrpc(-32601, "Method not found");
         assert!(matches!(e, RpcError::Unsupported(_)), "got {e}");
         assert!(!e.is_transient());

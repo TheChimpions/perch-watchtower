@@ -762,7 +762,11 @@ async fn run_cycle(
         }
     }
 
-    let firing = rt.states.values().filter(|s| s.is_firing()).count();
+    let firing = rt
+        .states
+        .iter()
+        .filter(|(id, s)| s.is_firing() && alerting.owns_check(id))
+        .count();
     let hosts_ok = host_snapshots.iter().filter(|h| h.is_usable()).count();
     let peers_live = peer_statuses
         .iter()
@@ -819,6 +823,8 @@ async fn run_cycle(
         );
     }
 
+    retire_orphans(config, notifier, rt, &outcomes).await;
+
     let validator_labels: HashMap<String, String> = config
         .validators
         .iter()
@@ -834,6 +840,7 @@ async fn run_cycle(
         watchtower_name: &config.watchtower.name,
         solana_cluster: &solana_cluster,
         validator_labels: &validator_labels,
+        alerting,
         snapshots: &snapshots,
         host_snapshots: &host_snapshots,
         peers: &peer_statuses,
@@ -1334,6 +1341,45 @@ async fn dispatch_check(
         Transition::Quiet | Transition::Starved => unreachable!("handled above"),
     }
     let _ = config;
+}
+
+/// Close out states for checks that no longer exist in this version or config.
+///
+/// Without this a removed or disabled check stays "firing" forever, and a
+/// PagerDuty incident it opened is never resolved -- refi-main's sat open for
+/// two weeks after `vote_balance_critical` was removed. The resolve goes out
+/// under the incident's original dedup key, the only one PagerDuty will match.
+async fn retire_orphans(
+    config: &Config,
+    notifier: &Notifier,
+    rt: &mut Runtime,
+    outcomes: &[checks::CheckOutcome],
+) {
+    for id in checks::orphaned(rt.states.keys(), outcomes, config) {
+        let Some(state) = rt.states.remove(&id) else { continue };
+        if rt.announced.remove(&id) {
+            let key = if config::is_peer_check(&id) {
+                id.clone()
+            } else {
+                format!("{id}/{}", state.incident_key())
+            };
+            notifier
+                .dispatch(&Alert {
+                    kind: AlertKind::Resolve,
+                    // Page, so the resolve reaches PagerDuty as well as Telegram:
+                    // the incident may have been opened there.
+                    severity: Severity::Page,
+                    key,
+                    title: format!("Resolved: {id} is no longer monitored"),
+                    body: "This check no longer exists in this version of perch or in this \
+                           instance's configuration, so it cannot be evaluated. Closing the \
+                           incident it opened."
+                        .into(),
+                })
+                .await;
+        }
+        info!(check = %id, "retired: no longer produced by this version or configuration");
+    }
 }
 
 /// Ownership changes are operationally important and easy to miss in logs, so

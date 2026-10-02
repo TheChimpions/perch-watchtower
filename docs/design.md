@@ -256,9 +256,12 @@ Three details decide whether that is right:
 - **Scheduled is enforced immediately.** Feature activation runs before epoch
   stakes are computed, so the boundary that activates Alpenglow already
   applies the check. perch treats a scheduled (pending) feature account as
-  enforced at the next boundary, and before anything is scheduled it reports
-  readiness on Telegram: a vote account with no BLS key, or one too poor to
-  pass, is flagged while there is still time.
+  enforced at the next boundary. Before anything is scheduled nothing is
+  enforced, so nothing notifies by default: readiness (a missing BLS key, a
+  balance too low to pass) is shown in `perch status` and Grafana, and on
+  Telegram only with `alert_before_scheduled = true`. A vote account swept to
+  rent by a commission withdrawal is routine until then. Once it is scheduled,
+  the boundary may be hours away, so check readiness before that happens.
 - **The VAT follows the slot time.** It is 1.6 SOL at 400ms slots and falls
   with each reduction (1.4, 1.2, 1.0, 0.8 SOL at 350, 300, 250 and 200ms). A
   reduction takes effect the epoch after it activates. At the time of writing

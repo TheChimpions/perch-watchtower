@@ -224,6 +224,8 @@ pub struct CycleReport<'a> {
     /// Identity pubkey -> configured label, so graphs say "chimps-1" rather
     /// than a 44-character key.
     pub validator_labels: &'a HashMap<String, String>,
+    /// Which checks are this instance's own to show as firing.
+    pub alerting: crate::config::Alerting,
 }
 
 /// Duplicate a rendered exposition under a second metric prefix.
@@ -524,6 +526,10 @@ pub fn render(r: &CycleReport<'_>) -> String {
     );
 
     for o in r.outcomes {
+        // A `peers` hub's validator checks are observation, not its own.
+        if !r.alerting.owns_check(&o.id) {
+            continue;
+        }
         let labels = [("check", o.id.as_str())];
         let verdict = match &o.verdict {
             Verdict::Healthy => 1.0,
@@ -1010,6 +1016,7 @@ mod notify_metrics {
             watchtower_name: "t",
             solana_cluster: "unpinned",
             validator_labels: &NO_LABELS,
+            alerting: crate::config::Alerting::Always,
         })
     }
 
@@ -1103,6 +1110,7 @@ mod version_metric {
             watchtower_name: "t",
             solana_cluster: "unpinned",
             validator_labels: &NO_LABELS,
+            alerting: crate::config::Alerting::Always,
         })
     }
 
@@ -1150,7 +1158,7 @@ mod build_identity {
             visible: true, silenced: false, cycle_duration: Duration::from_secs(1),
             unix_time: 1_700_000_000, maintenance_until: 0, start_time: 1_699_000_000,
             notify: NotifyCounts::default(), maintenance_streak: 0, maintenance_awaiting_work: false,
-            watchtower_name: "t", solana_cluster: "unpinned", validator_labels: &HashMap::new(),
+            watchtower_name: "t", solana_cluster: "unpinned", validator_labels: &HashMap::new(), alerting: crate::config::Alerting::Always,
         });
         let expected = format!(
             r#"perch_build_info{{version="{}",commit="{}"}} 1"#,
@@ -1198,6 +1206,7 @@ mod alpenglow_metrics {
             watchtower_name: "t",
             solana_cluster: "testnet",
             validator_labels: labels,
+            alerting: crate::config::Alerting::Always,
         })
     }
 

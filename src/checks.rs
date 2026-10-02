@@ -46,7 +46,18 @@ pub struct CheckOutcome {
 pub struct Progress {
     validator_credits: HashMap<String, u64>,
     cluster_slot: Option<u64>,
+    /// Identity balance over time, per identity, so the runway in a low-balance
+    /// alert is measured rather than assumed. Block fees refill an identity
+    /// between votes: mind-main's swung 1.6-2.8 SOL over four days while an
+    /// assumed 2 SOL/epoch cost said "0.9 epochs left".
+    identity_history: HashMap<String, crate::fillrate::FillHistory>,
 }
+
+/// One identity-balance sample per this interval, over this window. A day
+/// covers the fee sawtooth; six hours is the least worth fitting a slope to.
+const IDENTITY_SAMPLE_EVERY: Duration = Duration::from_secs(10 * 60);
+const IDENTITY_WINDOW: Duration = Duration::from_secs(24 * 3600);
+const IDENTITY_MIN_SPAN: Duration = Duration::from_secs(6 * 3600);
 
 impl Progress {
     /// Export the high-water marks for persistence. Losing these across a
@@ -59,6 +70,29 @@ impl Progress {
     pub fn import(&mut self, validator_credits: HashMap<String, u64>, cluster_slot: Option<u64>) {
         self.validator_credits = validator_credits;
         self.cluster_slot = cluster_slot;
+    }
+
+    pub fn export_identity_history(&self) -> HashMap<String, crate::fillrate::FillHistory> {
+        self.identity_history.clone()
+    }
+
+    pub fn import_identity_history(&mut self, h: HashMap<String, crate::fillrate::FillHistory>) {
+        self.identity_history = h;
+    }
+
+    fn record_identity(&mut self, identity: &str, now_unix: u64, lamports: u64) {
+        self.identity_history.entry(identity.to_string()).or_default().record(
+            now_unix,
+            lamports,
+            IDENTITY_SAMPLE_EVERY,
+            IDENTITY_WINDOW,
+        );
+    }
+
+    fn identity_trend(&self, identity: &str) -> Option<crate::fillrate::Projection> {
+        self.identity_history
+            .get(identity)
+            .map(|h| h.project(IDENTITY_MIN_SPAN, 6))
     }
 
     /// Returns the verdict for "did this counter advance", and records the new
@@ -407,6 +441,7 @@ pub fn evaluate(
 
         if c.vote_admission.base.enabled {
             let warn_epochs = c.vote_admission.warn_epochs;
+            let before_scheduled = c.vote_admission.alert_before_scheduled;
             for (suffix, severity) in [
                 ("critical", c.vote_admission.base.severity),
                 ("warn", Severity::Notify),
@@ -425,7 +460,7 @@ pub fn evaluate(
                     },
                     cfg,
                     per_endpoint(snapshots, &stale, |s| {
-                        admission_verdict(s, &id, &who2, suffix == "critical", warn_epochs, income)
+                        admission_verdict(s, &id, &who2, suffix == "critical", warn_epochs, income, before_scheduled)
                     }),
                     mc,
                 ));
@@ -437,6 +472,19 @@ pub fn evaluate(
         // only a genuinely critical balance pages.
         let id = identity.clone();
         let per_epoch = c.identity_balance.sol_per_epoch;
+        // The most advanced non-stale reading, sampled for the measured runway.
+        if let Some(lamports) = snapshots
+            .iter()
+            .filter(|s| !stale.contains_key(&s.endpoint))
+            .find_map(|s| s.identity_balances.get(&identity).copied().flatten())
+        {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            progress.record_identity(&identity, now_unix, lamports);
+        }
+        let trend = progress.identity_trend(&identity);
         for (suffix, floor, ceiling, severity) in [
             (
                 "critical",
@@ -464,6 +512,9 @@ pub fn evaluate(
                 format!("{who} identity balance is low"),
                 cfg,
                 per_endpoint(snapshots, &stale, |s| {
+                    if not_voting(s, &id2) {
+                        return Verdict::Healthy;
+                    }
                     let lamports = s.identity_balances.get(&id2).copied().flatten();
                     // Unobserved (an endpoint that will not serve the feature
                     // accounts) keeps today's behaviour rather than disabling
@@ -474,14 +525,21 @@ pub fn evaluate(
                         // nothing here pages, and one band covers everything
                         // under the warning floor.
                         true if suffix == "critical" => Verdict::Healthy,
-                        true => match balance_verdict(lamports, warn_sol, None, &format!("{who2} identity"), 0.0) {
+                        true => match balance_verdict(lamports, warn_sol, None, &format!("{who2} identity"), 0.0, None) {
                             Verdict::Unhealthy(m) => Verdict::unhealthy(format!(
                                 "{m}. Under Alpenglow the identity no longer pays for votes, so \
                                  this does not affect voting"
                             )),
                             other => other,
                         },
-                        false => balance_verdict(lamports, floor, ceiling, &format!("{who2} identity"), per_epoch),
+                        false => balance_verdict(
+                            lamports,
+                            floor,
+                            ceiling,
+                            &format!("{who2} identity"),
+                            per_epoch,
+                            trend.as_ref(),
+                        ),
                     }
                 }),
                 mc,
@@ -1143,6 +1201,95 @@ where
 
 /// Unhealthy when below `floor`; if `ceiling` is set, only within `[ceiling, floor)`
 /// so the warn and critical bands never overlap.
+/// Whether a saved check state could still be produced by this binary with
+/// this config.
+///
+/// A state nothing produces any more can never resolve: it stays "firing"
+/// forever, and a PagerDuty incident it opened stays open. That happened when
+/// `vote_balance_critical` was removed -- refi-main's incident sat open for two
+/// weeks. Removed check kinds, disabled checks, and validators, peers, hosts or
+/// endpoints taken out of the config all produce such states.
+///
+/// Deliberately not "absent from this cycle": a filesystem missing from one
+/// scrape, or a spoke skipping cluster checks while it is not the owner, is
+/// still configured and must keep its state.
+pub fn still_configured(id: &str, config: &Config) -> bool {
+    let c = &config.checks;
+    let (kind, subject) = match id.split_once(':') {
+        Some((k, s)) => (k, Some(s)),
+        None => (id, None),
+    };
+    let validator = |s: Option<&str>| s.is_some_and(|s| config.validators.iter().any(|v| v.display() == s));
+    let peer = |s: Option<&str>| s.is_some_and(|s| config.peers.iter().any(|p| p.name == s));
+    // Disk subjects are "<host> <mountpoint>".
+    let host = |s: Option<&str>| {
+        s.and_then(|s| s.split_once(' ')).is_some_and(|(h, _)| config.hosts.iter().any(|x| x.name == h))
+    };
+    match kind {
+        "vote_delinquent" => c.vote_delinquent.enabled && validator(subject),
+        "vote_account_missing" => c.vote_account_missing.enabled && validator(subject),
+        "vote_lag" => c.vote_lag.base.enabled && validator(subject),
+        "root_lag" => c.root_lag.base.enabled && validator(subject),
+        "vote_stalled" => c.vote_stalled.enabled && validator(subject),
+        // Only produced for validators with an expected commission set.
+        "commission_changed" => {
+            c.commission_changed.enabled
+                && subject.is_some_and(|s| {
+                    config.validators.iter().any(|v| {
+                        v.display() == s
+                            && (v.expected_commission_bps().is_some()
+                                || v.expected_block_revenue_commission_bps.is_some())
+                    })
+                })
+        }
+        "identity_balance_critical" | "identity_balance_warn" => {
+            c.identity_balance.base.enabled && validator(subject)
+        }
+        "skip_rate_critical" | "skip_rate_warn" => c.skip_rate.base.enabled && validator(subject),
+        "sfdp_version_critical" | "sfdp_version_warn" => c.sfdp_version.base.enabled && validator(subject),
+        "vote_admission_critical" | "vote_admission_warn" => {
+            c.vote_admission.base.enabled && validator(subject)
+        }
+        "cluster_stake" => c.cluster_stake.base.enabled,
+        "cluster_stalled" => c.cluster_stalled.enabled,
+        "disk_space_critical" | "disk_space_warn" => c.disk_space.base.enabled && host(subject),
+        "disk_fill_critical" | "disk_fill_warn" => c.disk_fill.base.enabled && host(subject),
+        "disk_inodes_critical" | "disk_inodes_warn" => c.disk_inodes.base.enabled && host(subject),
+        "disk_readonly" => c.disk_readonly.enabled && host(subject),
+        "node_behind" => {
+            c.node_behind.base.enabled
+                && subject.is_some_and(|s| config.endpoints.iter().any(|e| e.name == s && e.monitor))
+        }
+        "peer_down" => c.peer_down.enabled && peer(subject),
+        "machine_down" => c.machine_down.enabled && peer(subject),
+        // A kind this version does not have at all.
+        _ => false,
+    }
+}
+
+/// Saved states that nothing produced this cycle and nothing ever will again.
+pub fn orphaned<'a>(
+    state_ids: impl Iterator<Item = &'a String>,
+    outcomes: &[CheckOutcome],
+    config: &Config,
+) -> Vec<String> {
+    let produced: std::collections::HashSet<&str> = outcomes.iter().map(|o| o.id.as_str()).collect();
+    let mut out: Vec<String> = state_ids
+        .filter(|id| !produced.contains(id.as_str()) && !still_configured(id, config))
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+/// The cluster lists no vote account for this identity: a spare, a failover
+/// node, or anything else that is not voting. Its balance pays for nothing and
+/// admission does not apply, so neither should warn. A vote account that goes
+/// missing from a voting validator is `vote_account_missing`'s page, not these.
+fn not_voting(s: &Snapshot, identity: &str) -> bool {
+    matches!(s.validators.get(identity), Some(ValidatorObservation::Absent))
+}
+
 pub(crate) fn position(s: &Snapshot) -> Option<crate::alpenglow::EpochPosition> {
     s.epoch_info.as_ref().map(|e| crate::alpenglow::EpochPosition {
         epoch: e.epoch,
@@ -1175,6 +1322,7 @@ fn admission_verdict(
     critical: bool,
     warn_epochs: u64,
     income: Option<u64>,
+    before_scheduled: bool,
 ) -> Verdict {
     let (Some(cluster), Some(pos)) = (s.alpenglow.as_ref(), position(s)) else {
         return Verdict::unknown("Alpenglow feature state not observed");
@@ -1183,13 +1331,16 @@ fn admission_verdict(
         return Verdict::unknown("epoch length not reported");
     }
     let Some(vote) = s.vote_states.get(identity) else {
+        if not_voting(s, identity) {
+            return Verdict::Healthy;
+        }
         return Verdict::unknown("vote account not observed");
     };
     let req = crate::alpenglow::requirement(cluster, &pos);
     if critical {
         crate::alpenglow::critical(who, vote, &req)
     } else {
-        crate::alpenglow::warn(who, vote, &req, income, warn_epochs)
+        crate::alpenglow::warn(who, vote, &req, income, warn_epochs, before_scheduled)
     }
 }
 
@@ -1244,33 +1395,49 @@ fn balance_verdict(
     ceiling_sol: Option<f64>,
     what: &str,
     sol_per_epoch: f64,
+    trend: Option<&crate::fillrate::Projection>,
 ) -> Verdict {
+    use crate::fillrate::Projection;
     let Some(lamports) = lamports else {
         return Verdict::unknown(format!("{what} balance not observed"));
     };
     let sol = lamports_to_sol(lamports);
     let below_floor = sol < floor_sol;
     let above_ceiling = ceiling_sol.map(|c| sol >= c).unwrap_or(true);
-
-    if below_floor && above_ceiling {
-        // Remaining epochs is the actionable number: this account pays for vote
-        // transactions, and when it empties the validator stops voting and goes
-        // delinquent.
-        let runway = if sol_per_epoch > 0.0 {
-            format!(
-                ", about {:.1} more epoch(s) of voting at {sol_per_epoch} SOL/epoch \
-                 -- an empty identity cannot vote and goes delinquent",
-                sol / sol_per_epoch
-            )
-        } else {
-            String::new()
-        };
-        Verdict::unhealthy(format!(
-            "{what} balance is {sol:.3} SOL (floor {floor_sol} SOL){runway}"
-        ))
-    } else {
-        Verdict::Healthy
+    if !(below_floor && above_ceiling) {
+        return Verdict::Healthy;
     }
+    // How long it lasts is the actionable number: this account pays for vote
+    // transactions, and when it empties the validator goes delinquent. Measured
+    // when there is enough history -- block fees refill an identity between
+    // votes, so an assumed cost can be wildly pessimistic -- and assumed, and
+    // labelled as an assumption, until then.
+    let cost = "an empty identity cannot vote and goes delinquent";
+    let runway = match trend {
+        _ if sol_per_epoch <= 0.0 => String::new(),
+        Some(Projection::Filling { time_to_full, bytes_per_sec }) => {
+            let hours = time_to_full.as_secs() as f64 / 3600.0;
+            let left = if hours >= 48.0 {
+                format!("{:.0} days", hours / 24.0)
+            } else {
+                format!("{hours:.0} hours")
+            };
+            format!(
+                ", falling about {:.2} SOL a day over the last day: about {left} to empty -- {cost}",
+                bytes_per_sec * 86_400.0 / 1e9
+            )
+        }
+        Some(Projection::NotFilling) => {
+            ", but it is not falling: over the last day block income has kept pace with vote costs"
+                .to_string()
+        }
+        _ => format!(
+            ", about {:.1} more epoch(s) of voting at an assumed {sol_per_epoch} SOL/epoch (not yet \
+             measured) -- {cost}",
+            sol / sol_per_epoch
+        ),
+    };
+    Verdict::unhealthy(format!("{what} balance is {sol:.3} SOL (floor {floor_sol} SOL){runway}"))
 }
 
 #[cfg(test)]
@@ -1615,20 +1782,20 @@ mod tests {
         let lamports = |sol: f64| Some((sol * 1e9) as u64);
         // 1.0 SOL: inside the warn band [0.5, 2.0), outside critical (< 0.5).
         assert!(matches!(
-            balance_verdict(lamports(1.0), 2.0, Some(0.5), "x", 2.0),
+            balance_verdict(lamports(1.0), 2.0, Some(0.5), "x", 2.0, None),
             Verdict::Unhealthy(_)
         ));
         assert_eq!(
-            balance_verdict(lamports(1.0), 0.5, None, "x", 2.0),
+            balance_verdict(lamports(1.0), 0.5, None, "x", 2.0, None),
             Verdict::Healthy
         );
         // 0.2 SOL: critical fires, warn does not.
         assert!(matches!(
-            balance_verdict(lamports(0.2), 0.5, None, "x", 2.0),
+            balance_verdict(lamports(0.2), 0.5, None, "x", 2.0, None),
             Verdict::Unhealthy(_)
         ));
         assert_eq!(
-            balance_verdict(lamports(0.2), 2.0, Some(0.5), "x", 2.0),
+            balance_verdict(lamports(0.2), 2.0, Some(0.5), "x", 2.0, None),
             Verdict::Healthy
         );
     }
@@ -1637,15 +1804,47 @@ mod tests {
     fn a_low_identity_balance_reports_remaining_epochs() {
         // "0.4 epochs of voting left" is actionable; "0.8 SOL" is not, and the
         // consequence -- delinquency -- is what the operator needs to see.
-        let v = balance_verdict(Some(800_000_000), 1.0, None, "x identity", 2.0);
+        let v = balance_verdict(Some(800_000_000), 1.0, None, "x identity", 2.0, None);
         let d = v.detail().expect("should be unhealthy");
         assert!(d.contains("0.4 more epoch"), "got: {d}");
         assert!(d.contains("goes delinquent"), "got: {d}");
     }
 
+    /// mind-main, measured every 6h over four days: a fee-income sawtooth with
+    /// a slow net decline. The old message said "0.9 epochs left"; the fitted
+    /// trend says weeks.
+    #[test]
+    fn a_measured_trend_replaces_the_assumed_runway() {
+        use crate::fillrate::FillHistory;
+        let sol = [2.193, 2.581, 2.767, 2.545, 2.343, 2.301, 2.549, 2.328, 2.041, 2.465, 2.100, 1.732, 1.559, 1.809];
+        let mut h = FillHistory::default();
+        for (i, v) in sol.iter().enumerate() {
+            h.record(1_790_000_000 + i as u64 * 6 * 3600, (v * 1e9) as u64, Duration::from_secs(600), Duration::from_secs(5 * 86400));
+        }
+        let trend = h.project(Duration::from_secs(6 * 3600), 6);
+        let v = balance_verdict(Some(1_809_000_000), 3.0, Some(0.5), "mind-main identity", 2.0, Some(&trend));
+        let d = v.detail().expect("below the warning floor");
+        // Least squares over the four days: 0.26 SOL a day, about a week.
+        assert!(d.contains("falling about 0.26 SOL a day") && d.contains("about 7 days to empty"), "{d}");
+        assert!(!d.contains("0.9 more epoch"), "the assumption must give way to the measurement: {d}");
+    }
+
+    #[test]
+    fn an_identity_kept_level_by_block_income_says_so() {
+        let v = balance_verdict(Some(1_800_000_000), 3.0, None, "x identity", 2.0, Some(&crate::fillrate::Projection::NotFilling));
+        assert!(v.detail().unwrap().contains("not falling"), "{v:?}");
+    }
+
+    #[test]
+    fn without_enough_history_the_runway_is_labelled_an_assumption() {
+        let insufficient = crate::fillrate::Projection::Insufficient { have: Duration::from_secs(60), need: Duration::from_secs(6 * 3600) };
+        let d = balance_verdict(Some(800_000_000), 1.0, None, "x identity", 2.0, Some(&insufficient)).detail().unwrap().to_string();
+        assert!(d.contains("0.4 more epoch") && d.contains("not yet measured"), "{d}");
+    }
+
     #[test]
     fn a_zero_epoch_cost_omits_the_runway_rather_than_dividing_by_zero() {
-        let v = balance_verdict(Some(800_000_000), 1.0, None, "x identity", 0.0);
+        let v = balance_verdict(Some(800_000_000), 1.0, None, "x identity", 0.0, None);
         let d = v.detail().expect("should be unhealthy");
         assert!(!d.contains("epoch"), "got: {d}");
     }
@@ -1655,9 +1854,91 @@ mod tests {
         // Reading a failed getBalance as 0 lamports would page for an empty
         // identity account every time a provider rate-limited us.
         assert!(matches!(
-            balance_verdict(None, 0.5, None, "x", 2.0),
+            balance_verdict(None, 0.5, None, "x", 2.0, None),
             Verdict::Unknown(_)
         ));
+    }
+
+    mod orphans {
+        use super::*;
+
+        const ID: &str = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv";
+
+        fn config(extra: &str) -> Config {
+            Config::parse(&format!(
+                "[[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+                 [[endpoints]]\nname = \"localhost\"\nurl = \"http://127.0.0.1:8899\"\nmonitor = true\n\
+                 [[validators]]\nidentity = \"{ID}\"\nlabel = \"chimps-1\"\nexpected_commission = 5\n\
+                 [[hosts]]\nname = \"box\"\nurl = \"http://127.0.0.1:9100/metrics\"\nmountpoints = [\"/\"]\n\
+                 [[peers]]\nname = \"hub\"\nurl = \"http://10.0.0.9:9469/metrics\"\npriority = 1\n\
+                 [peering]\npriority = 2\n{extra}"
+            ))
+            .unwrap()
+        }
+
+        /// The safety net for the retirement logic: nothing this version
+        /// produces may ever be classed as orphaned, or a live alert would be
+        /// "resolved" while still broken.
+        #[test]
+        fn every_check_this_version_produces_is_still_configured() {
+            let c = config("");
+            let snaps = vec![bare_snapshot("a", Some(4_320_100)), bare_snapshot("localhost", Some(4_320_100))];
+            let mut out = evaluate(&snaps, &c, &mut Progress::default());
+            out.extend(evaluate_nodes(&snaps, &c));
+            out.extend(evaluate_sfdp(&snaps, &c, None));
+            out.extend(evaluate_peers(&[peer_status("hub", false, None)], &snaps, &c, Duration::from_secs(300), &HashMap::new(), 0));
+            // Exact on purpose: a new check kind changes this count, and whoever
+            // adds it must also teach still_configured about it.
+            assert_eq!(out.len(), 18, "check kinds changed: update still_configured, then this count");
+            for o in &out {
+                assert!(still_configured(&o.id, &c), "{} is produced but would be retired", o.id);
+            }
+            // Disk checks need a scrape to be produced; their ids are "<kind>:<host> <mount>".
+            for kind in ["disk_space_critical", "disk_space_warn", "disk_fill_critical", "disk_fill_warn",
+                         "disk_inodes_critical", "disk_inodes_warn", "disk_readonly"] {
+                assert!(still_configured(&format!("{kind}:box /"), &c), "{kind}");
+            }
+        }
+
+        /// refi-main, exactly: a firing state for a check kind this version
+        /// no longer has.
+        #[test]
+        fn a_removed_check_kind_is_orphaned() {
+            let c = config("");
+            let states = ["vote_balance_critical:chimps-1".to_string(), "vote_delinquent:chimps-1".to_string()];
+            assert_eq!(orphaned(states.iter(), &[], &c), vec!["vote_balance_critical:chimps-1"]);
+        }
+
+        #[test]
+        fn disabled_checks_and_removed_subjects_are_orphaned() {
+            let c = config("[checks.vote_lag]\nenabled = false\npending_for = \"3m\"\nseverity = \"page\"\nmax_slots = 200\n");
+            let states: Vec<String> = [
+                "vote_lag:chimps-1", // disabled
+                "vote_delinquent:chimps-gone", // validator no longer configured
+                "peer_down:old-hub", // peer no longer configured
+                "disk_space_critical:oldbox /", // host no longer configured
+                "node_behind:a", // endpoint not monitored
+                "vote_delinquent:chimps-1", // still configured: kept
+                "disk_readonly:box /mnt/gone", // host configured, mount absent this scrape: kept
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            assert_eq!(
+                orphaned(states.iter(), &[], &c),
+                vec!["disk_space_critical:oldbox /", "node_behind:a", "peer_down:old-hub", "vote_delinquent:chimps-gone", "vote_lag:chimps-1"]
+            );
+        }
+
+        /// Present in this cycle's outcomes means alive, whatever else.
+        #[test]
+        fn anything_produced_this_cycle_is_never_orphaned() {
+            let c = config("");
+            let mut o = outcome("custom:x".into(), "t".into(), c.checks.vote_delinquent.clone(), vec![], 1);
+            o.id = "custom:x".into();
+            let states = ["custom:x".to_string()];
+            assert!(orphaned(states.iter(), &[o], &c).is_empty());
+        }
     }
 
     mod alpenglow_checks {
@@ -1723,10 +2004,15 @@ mod tests {
         }
 
         #[test]
-        fn nothing_pages_before_alpenglow_is_scheduled() {
+        fn nothing_notifies_before_alpenglow_is_scheduled() {
             let c = config("");
             let out = evaluate(&snaps(FeatureState::Absent, Some(vote(0, Bls::Missing)), 0), &c, &mut Progress::default());
             assert_eq!(verdict(&out, "vote_admission_critical:chimps-1"), Verdict::Healthy);
+            assert_eq!(verdict(&out, "vote_admission_warn:chimps-1"), Verdict::Healthy);
+
+            // Readiness notes only when asked for.
+            let c = config("[checks.vote_admission]\nalert_before_scheduled = true\npending_for = \"10m\"\nseverity = \"page\"\n");
+            let out = evaluate(&snaps(FeatureState::Absent, Some(vote(0, Bls::Missing)), 0), &c, &mut Progress::default());
             assert!(matches!(verdict(&out, "vote_admission_warn:chimps-1"), Verdict::Unhealthy(_)));
         }
 
@@ -1773,6 +2059,24 @@ mod tests {
             redirected.block_revenue_commission_bps = Some(0);
             let out = evaluate(&snaps(FeatureState::Absent, Some(redirected), 1), &c, &mut Progress::default());
             assert!(matches!(verdict(&out, "commission_changed:chimps-1"), Verdict::Unhealthy(m) if m.contains("block-revenue")));
+        }
+
+        /// A spare or failover identity: no vote account, a low balance, and
+        /// nothing to warn about.
+        #[test]
+        fn a_non_voting_identity_raises_no_balance_or_admission_warnings() {
+            let c = config("");
+            let mut snaps = snaps(FeatureState::Active(0), None, 10_000_000);
+            for s in &mut snaps {
+                s.validators.insert(ID.into(), ValidatorObservation::Absent);
+            }
+            let out = evaluate(&snaps, &c, &mut Progress::default());
+            for id in ["identity_balance_critical:chimps-1", "identity_balance_warn:chimps-1",
+                       "vote_admission_critical:chimps-1", "vote_admission_warn:chimps-1"] {
+                assert_eq!(verdict(&out, id), Verdict::Healthy, "{id}");
+            }
+            // ...while the missing vote account is still somebody's page.
+            assert!(matches!(verdict(&out, "vote_account_missing:chimps-1"), Verdict::Unhealthy(_)));
         }
 
         #[test]

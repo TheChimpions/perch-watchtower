@@ -425,10 +425,16 @@ pub fn warn(
     req: &Requirement,
     income: Option<u64>,
     warn_boundaries: u64,
+    before_scheduled: bool,
 ) -> Verdict {
     let r = runway(v, req, income);
     let short = r.boundaries.is_some_and(|n| n < warn_boundaries);
     if req.phase == Phase::NotScheduled {
+        // Nothing is enforced yet, so by default nothing notifies; the
+        // readiness picture is in `perch status` and Grafana.
+        if !before_scheduled {
+            return Verdict::Healthy;
+        }
         let mut reasons = Vec::new();
         if v.bls == Bls::Missing {
             reasons.push("no BLS public key is registered on its vote account".to_string());
@@ -674,13 +680,13 @@ mod tests {
         let r = requirement(&c, &p);
         assert_eq!(critical("x", &vote(0, Bls::Missing), &r), Verdict::Healthy);
         // ...but readiness is reported, on Telegram.
-        let w = warn("x", &vote(0, Bls::Missing), &r, None, 3);
+        let w = warn("x", &vote(0, Bls::Missing), &r, None, 3, true);
         assert!(
             matches!(&w, Verdict::Unhealthy(m) if m.contains("not ready for Alpenglow")),
             "{w:?}"
         );
         assert_eq!(
-            warn("x", &vote(6_481_200_000, Bls::Registered), &r, None, 3),
+            warn("x", &vote(6_481_200_000, Bls::Registered), &r, None, 3, true),
             Verdict::Healthy
         );
     }
@@ -708,15 +714,15 @@ mod tests {
         let two = vote(r.rent_lamports + 2 * r.vat_lamports, Bls::Registered);
         assert_eq!(critical("x", &two, &r), Verdict::Healthy);
         assert!(matches!(
-            warn("x", &two, &r, None, 3),
+            warn("x", &two, &r, None, 3, true),
             Verdict::Unhealthy(_)
         ));
         // Failing the next boundary is the critical band's alone.
         let short = vote(r.rent_lamports, Bls::Registered);
-        assert_eq!(warn("x", &short, &r, None, 3), Verdict::Healthy);
+        assert_eq!(warn("x", &short, &r, None, 3, true), Verdict::Healthy);
         // Plenty.
         assert_eq!(
-            warn("x", &vote(56_528 * SOL, Bls::Registered), &r, None, 3),
+            warn("x", &vote(56_528 * SOL, Bls::Registered), &r, None, 3, true),
             Verdict::Healthy
         );
     }
@@ -804,12 +810,12 @@ mod tests {
             r.describe(&req)
         );
         assert_eq!(
-            warn("refi-main", &refi, &req, Some(1_227_000_000), 3),
+            warn("refi-main", &refi, &req, Some(1_227_000_000), 3, true),
             Verdict::Healthy
         );
         // Without the income it would have warned, which is the old behaviour.
         assert!(matches!(
-            warn("refi-main", &refi, &req, None, 3),
+            warn("refi-main", &refi, &req, None, 3, true),
             Verdict::Unhealthy(_)
         ));
     }
@@ -839,11 +845,27 @@ mod tests {
             req.minimum_lamports() + 2 * req.vat_lamports,
             Bls::Registered,
         );
-        let w = warn("x", &v, &req, Some(200_000_000), 4);
+        let w = warn("x", &v, &req, Some(200_000_000), 4, true);
         assert!(
             matches!(&w, Verdict::Unhealthy(m) if m.contains("loses about 0.80 SOL") && m.contains("about 3 epoch(s) left")),
             "{w:?}"
         );
+    }
+
+    /// Before Alpenglow is scheduled nothing notifies unless asked: fox-main's
+    /// vote account was swept to rent by a routine commission withdrawal and
+    /// paged Telegram about a rule not yet in force.
+    #[test]
+    fn readiness_is_silent_before_scheduling_unless_asked() {
+        let (c, p) = mainnet();
+        let req = requirement(&c, &p);
+        let swept = vote(19_761_200, Bls::Registered);
+        assert_eq!(warn("fox-main", &swept, &req, Some(740_000_000), 3, false), Verdict::Healthy);
+        assert!(matches!(warn("fox-main", &swept, &req, Some(740_000_000), 3, true), Verdict::Unhealthy(_)));
+        // Once scheduled, the same account is the critical band's page.
+        let mut scheduled = c.clone();
+        scheduled.alpenglow = FeatureState::Pending;
+        assert!(matches!(critical("fox-main", &swept, &requirement(&scheduled, &p)), Verdict::Unhealthy(_)));
     }
 
     /// Before Alpenglow is scheduled, a short hypothetical runway is reported
@@ -853,7 +875,7 @@ mod tests {
         let (c, p) = mainnet();
         let req = requirement(&c, &p);
         let v = vote(req.minimum_lamports() + req.vat_lamports, Bls::Registered);
-        let w = warn("x", &v, &req, Some(0), 3);
+        let w = warn("x", &v, &req, Some(0), 3, true);
         assert!(
             matches!(&w, Verdict::Unhealthy(m) if m.contains("under Alpenglow it would lose")),
             "{w:?}"
@@ -865,7 +887,8 @@ mod tests {
                 &vote(6_481_200_000, Bls::Registered),
                 &req,
                 Some(637_000_000),
-                3
+                3,
+                true
             ),
             Verdict::Healthy
         );

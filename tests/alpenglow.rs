@@ -96,10 +96,12 @@ fn answer(method: &str, params: &Value, largest: &AtomicUsize) -> (&'static str,
             json!({"absoluteSlot": SLOT, "epoch": 10, "slotIndex": 100, "slotsInEpoch": 432000})
         }
         "getVoteAccounts" => {
-            let wanted = params[0]["votePubkey"].as_str().unwrap_or_default();
+            // Filtered to one vote account when asked; the full listing otherwise,
+            // which is what perch requests before it has learned the vote keys.
+            let wanted = params[0]["votePubkey"].as_str();
             let current: Vec<Value> = VALIDATORS
                 .iter()
-                .filter(|v| v.vote == wanted)
+                .filter(|v| wanted.is_none_or(|w| v.vote == w))
                 .map(|v| json!({"votePubkey": v.vote, "nodePubkey": v.identity, "activatedStake": 5_000_000_000_000u64,
                                 "commission": 5, "lastVote": SLOT - 2, "rootSlot": SLOT - 2,
                                 "epochCredits": [[10, 1000, 0]]}))
@@ -260,6 +262,9 @@ async fn admission_is_judged_by_both_endpoints_despite_the_batch_limit() {
 #[tokio::test]
 async fn identity_balances_come_through_the_same_batched_call() {
     let (out, _) = evaluate().await;
+    // The mock's validators are voting; if they were not, the identity checks
+    // would rightly stay quiet and this test would prove nothing.
+    assert_eq!(find(&out, "vote_delinquent:underfunded").verdict, Verdict::Healthy);
     // 0.1 SOL would page before Alpenglow; under it, only Telegram.
     assert_eq!(
         find(&out, "identity_balance_critical:underfunded").verdict,

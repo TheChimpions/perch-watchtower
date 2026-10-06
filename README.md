@@ -312,6 +312,10 @@ text and `perch status` output if you can.
 - An RPC failure must never become a page. That rule is the point of the
   project.
 - Report security problems privately: see [SECURITY.md](SECURITY.md).
+- To release, bump `version` in `Cargo.toml` (and `Cargo.lock`, which
+  `cargo build` updates) in the PR. Merging it to `main` tests that commit,
+  builds the binaries, and publishes the tag and GitHub release. PRs that leave
+  the version alone release nothing. Do not create the tag or release by hand.
 
 ## Building from source
 

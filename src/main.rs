@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use perch::{
     checks, config, diagnose, digest, enrich, heartbeat, inhibit, metrics, node_exporter, notify, peer, persist,
-    rpc, selfcheck, sfdp, snapshot, state, status, verdict, web,
+    pools, rpc, selfcheck, sfdp, snapshot, state, status, verdict, web,
 };
 use clap::{Parser, Subcommand};
 use config::{Alerting, Config, Role, Severity};
@@ -381,6 +381,7 @@ async fn main() -> Result<()> {
         last_self_test_unix: restored.last_self_test_unix,
         epoch_tails: HashMap::new(),
         last_digest_epoch: restored.last_digest_epoch,
+        bond_ledger: pools::BondLedger::default(),
     };
 
     if args.once {
@@ -478,6 +479,8 @@ struct Runtime {
     /// epoch already summarised.
     epoch_tails: HashMap<String, digest::EpochTail>,
     last_digest_epoch: Option<u64>,
+    /// Last reading of each JPool bond, to notice when one is drawn on.
+    bond_ledger: pools::BondLedger,
 }
 
 /// Confirm the endpoints are pointed at the same cluster before we start
@@ -841,6 +844,7 @@ async fn run_cycle(
         solana_cluster: &solana_cluster,
         validator_labels: &validator_labels,
         alerting,
+        jpool_security_sol_per_1000: config.checks.jpool_bond.security_sol_per_1000,
         snapshots: &snapshots,
         host_snapshots: &host_snapshots,
         peers: &peer_statuses,
@@ -911,6 +915,9 @@ async fn run_cycle(
     // Before persisting, so the epoch it records is in the state file this
     // cycle rather than the next one.
     maybe_epoch_digest(config, notifier, rt, &snapshots, alerting, is_owner).await;
+    if run_cluster {
+        announce_bond_drawdowns(config, notifier, rt, &snapshots, alerting, is_owner).await;
+    }
 
     if rt.persist {
         if let Err(e) = persist::save(
@@ -1575,6 +1582,78 @@ fn report_is_worthwhile(health: &HashMap<String, EndpointHealth>) -> bool {
         .any(|h| h.cycles > 0 && (h.usable < h.cycles || h.transient_errors > 0 || h.config_errors > 0))
 }
 
+/// Say when JPool draws on a validator's bond.
+///
+/// JPool claims from the bond each epoch the validator falls short of its
+/// target APY. The low-bond check says when the balance matters; this says
+/// each time it moves, which is how a slow drain gets noticed before it does.
+/// Same speaker rule as the epoch digest: one note per validator per fleet.
+async fn announce_bond_drawdowns(
+    config: &Config,
+    notifier: &Notifier,
+    rt: &mut Runtime,
+    snapshots: &[Snapshot],
+    alerting: Alerting,
+    is_owner: bool,
+) {
+    let jc = &config.checks.jpool_bond;
+    if !jc.base.enabled {
+        return;
+    }
+    let speaks = match alerting {
+        Alerting::Always => true,
+        Alerting::Auto => is_owner,
+        Alerting::Peers | Alerting::Never => false,
+    };
+    for v in &config.validators {
+        let mut bonds: Vec<pools::Bond> = snapshots
+            .iter()
+            .filter_map(|s| s.jpool.get(&v.identity))
+            .filter_map(|r| r.as_ref().ok())
+            .flat_map(|p| p.bonds.iter())
+            .cloned()
+            .collect();
+        // Oldest first, so endpoints that disagree this cycle are replayed in
+        // the order the chain moved.
+        bonds.sort_by_key(|b| b.slot);
+        let drawdowns = rt.bond_ledger.observe(&bonds);
+        let Some(latest) = drawdowns.last() else {
+            continue;
+        };
+        let who = v.display();
+        let lines: Vec<String> = drawdowns
+            .iter()
+            .map(|d| {
+                format!(
+                    "{:.6} SOL out of the {} bond, which now holds {:.4} SOL (was {:.4}). \
+                     https://solscan.io/account/{}",
+                    snapshot::lamports_to_sol(d.before.saturating_sub(d.after)),
+                    d.name,
+                    snapshot::lamports_to_sol(d.after),
+                    snapshot::lamports_to_sol(d.before),
+                    d.address
+                )
+            })
+            .collect();
+        info!("{who} JPool bond went down: {}", lines.join("; "));
+        if jc.announce_drawdowns && speaks {
+            notifier
+                .dispatch(&Alert {
+                    kind: AlertKind::Info,
+                    severity: Severity::Notify,
+                    key: format!("jpool_drawdown:{who}:{}:{}", latest.address, latest.after),
+                    title: format!("JPool drew on {who}'s bond"),
+                    body: format!(
+                        "{}\nJPool claims from the bond to cover an APY shortfall; a withdrawal \
+                         by the bond authority reads the same.",
+                        lines.join("\n")
+                    ),
+                })
+                .await;
+        }
+    }
+}
+
 /// Keep the SFDP schedule fresh, and say so when it changes.
 ///
 /// Polled rather than fetched once an epoch: the foundation can publish a new
@@ -1710,6 +1789,8 @@ mod tests {
             alpenglow: None,
             vote_states: HashMap::new(),
             vote_income: HashMap::new(),
+            vault_invoices: HashMap::new(),
+            jpool: HashMap::new(),
             block_production: HashMap::new(),
             cluster_stake: None,
             transient_errors: vec![],

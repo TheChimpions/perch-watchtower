@@ -226,6 +226,8 @@ pub struct CycleReport<'a> {
     pub validator_labels: &'a HashMap<String, String>,
     /// Which checks are this instance's own to show as firing.
     pub alerting: crate::config::Alerting,
+    /// `checks.jpool_bond.security_sol_per_1000`, to export the requirement.
+    pub jpool_security_sol_per_1000: f64,
 }
 
 /// Duplicate a rendered exposition under a second metric prefix.
@@ -670,6 +672,32 @@ pub fn render(r: &CycleReport<'_>) -> String {
         "gauge",
     );
 
+    e.metric(
+        "perch_validator_vault_unpaid_invoices",
+        "Unpaid Vault invoices in the vault where the validator is furthest behind; absent when no endpoint was asked",
+        "gauge",
+    );
+    e.metric(
+        "perch_validator_vault_owed_vsol",
+        "vSOL owed on those unpaid Vault invoices",
+        "gauge",
+    );
+    e.metric(
+        "perch_validator_jpool_stake_sol",
+        "Stake the JPool pool delegates to the validator, direct stake included; absent when not in JPool",
+        "gauge",
+    );
+    e.metric(
+        "perch_validator_jpool_security_requirement_sol",
+        "Security part of JPool's bond requirement, 0.5 SOL per 1,000 SOL of JPool stake by default; JPool's off-chain APY-shortfall part comes on top",
+        "gauge",
+    );
+    e.metric(
+        "perch_validator_jpool_bond_sol",
+        "JPool bond per bond product, SOL-equivalent (JSOL at the pool rate); absent when the validator has none",
+        "gauge",
+    );
+
     let mut identities: Vec<&String> = r
         .snapshots
         .iter()
@@ -775,6 +803,48 @@ pub fn render(r: &CycleReport<'_>) -> String {
                 ],
                 lamports_to_sol(lamports),
             );
+        }
+
+        // Pool readings are cached per endpoint and differ only in age; any
+        // one that answered is as good as another.
+        if let Some(invoices) = r
+            .snapshots
+            .iter()
+            .find_map(|s| s.vault_invoices.get(identity).and_then(|v| v.as_ref().ok()))
+        {
+            let a = crate::pools::arrears(invoices);
+            e.value(
+                "perch_validator_vault_unpaid_invoices",
+                &labels,
+                a.as_ref().map_or(0.0, |a| a.unpaid as f64),
+            );
+            e.value(
+                "perch_validator_vault_owed_vsol",
+                &labels,
+                a.as_ref().map_or(0.0, |a| lamports_to_sol(a.owed)),
+            );
+        }
+        if let Some(pos) = r
+            .snapshots
+            .iter()
+            .filter_map(|s| s.jpool.get(identity).and_then(|v| v.as_ref().ok()))
+            .max_by_key(|p| p.bonds.iter().map(|x| x.slot).max().unwrap_or(0))
+        {
+            for b in &pos.bonds {
+                e.value(
+                    "perch_validator_jpool_bond_sol",
+                    &[("identity", identity.as_str()), ("validator", label), ("bond", b.name.as_str())],
+                    lamports_to_sol(b.lamports),
+                );
+            }
+            if !pos.is_empty() {
+                e.value("perch_validator_jpool_stake_sol", &labels, lamports_to_sol(pos.pool_stake));
+                e.value(
+                    "perch_validator_jpool_security_requirement_sol",
+                    &labels,
+                    lamports_to_sol(pos.security_requirement(r.jpool_security_sol_per_1000)),
+                );
+            }
         }
 
     }
@@ -1017,6 +1087,7 @@ mod notify_metrics {
             solana_cluster: "unpinned",
             validator_labels: &NO_LABELS,
             alerting: crate::config::Alerting::Always,
+            jpool_security_sol_per_1000: 0.5,
         })
     }
 
@@ -1111,6 +1182,7 @@ mod version_metric {
             solana_cluster: "unpinned",
             validator_labels: &NO_LABELS,
             alerting: crate::config::Alerting::Always,
+            jpool_security_sol_per_1000: 0.5,
         })
     }
 
@@ -1159,6 +1231,7 @@ mod build_identity {
             unix_time: 1_700_000_000, maintenance_until: 0, start_time: 1_699_000_000,
             notify: NotifyCounts::default(), maintenance_streak: 0, maintenance_awaiting_work: false,
             watchtower_name: "t", solana_cluster: "unpinned", validator_labels: &HashMap::new(), alerting: crate::config::Alerting::Always,
+            jpool_security_sol_per_1000: 0.5,
         });
         let expected = format!(
             r#"perch_build_info{{version="{}",commit="{}"}} 1"#,
@@ -1207,6 +1280,7 @@ mod alpenglow_metrics {
             solana_cluster: "testnet",
             validator_labels: labels,
             alerting: crate::config::Alerting::Always,
+            jpool_security_sol_per_1000: 0.5,
         })
     }
 
@@ -1277,5 +1351,41 @@ mod alpenglow_metrics {
         assert!(!out.contains("perch_validator_bls_registered{"), "got:\n{out}");
         let out = render_with(&[snap(Bls::Missing)], &HashMap::new());
         assert!(out.contains(r#"perch_validator_bls_registered{identity="ID",validator="ID"} 0"#), "got:\n{out}");
+    }
+    #[test]
+    fn pool_obligations_are_exported() {
+        use crate::pools::{Asset, Bond, Invoice, JpoolPosition};
+        let mut s = snap(Bls::Registered);
+        let inv = |epoch, outstanding| Invoice { vault: "V".into(), epoch, amount: 27_000_000, outstanding };
+        s.vault_invoices.insert("ID".into(), Ok(vec![inv(1048, 0), inv(1049, 27_000_000), inv(1050, 27_000_000)]));
+        s.jpool.insert(
+            "ID".into(),
+            Ok(JpoolPosition {
+                bonds: vec![Bond { address: "B".into(), name: "performance".into(), asset: Asset::Sol, lamports: 504_393_361, slot: 1 }],
+                pool_stake: 28_416_459_181,
+            }),
+        );
+        let labels = HashMap::from([("ID".to_string(), "chimps-1".to_string())]);
+        let out = render_with(&[s], &labels);
+        for line in [
+            r#"perch_validator_vault_unpaid_invoices{identity="ID",validator="chimps-1"} 2"#,
+            r#"perch_validator_vault_owed_vsol{identity="ID",validator="chimps-1"} 0.054"#,
+            r#"perch_validator_jpool_bond_sol{identity="ID",validator="chimps-1",bond="performance"} 0.504393361"#,
+            r#"perch_validator_jpool_stake_sol{identity="ID",validator="chimps-1"} 28.416459181"#,
+            r#"perch_validator_jpool_security_requirement_sol{identity="ID",validator="chimps-1"} 0.014208229"#,
+        ] {
+            assert!(out.contains(line), "missing {line:?} in:\n{out}");
+        }
+    }
+
+    /// Never asked, or the endpoint failed: absent, not a reassuring zero.
+    #[test]
+    fn unread_pool_obligations_emit_no_series() {
+        let mut s = snap(Bls::Registered);
+        s.vault_invoices.insert("ID".into(), Err("transient: 429".into()));
+        let out = render_with(&[s], &HashMap::new());
+        assert!(!out.contains("perch_validator_vault_unpaid_invoices{"), "got:\n{out}");
+        assert!(!out.contains("perch_validator_jpool_bond_sol{"), "got:\n{out}");
+        assert!(!out.contains("perch_validator_jpool_stake_sol{"), "got:\n{out}");
     }
 }

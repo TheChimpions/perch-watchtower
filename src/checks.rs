@@ -548,6 +548,8 @@ pub fn evaluate(
 
     }
 
+    out.extend(evaluate_pools(snapshots, config, &stale));
+
     if c.cluster_stake.base.enabled {
         let min_percent = c.cluster_stake.min_percent;
         out.push(outcome(
@@ -586,6 +588,196 @@ pub fn evaluate(
     }
 
     out
+}
+
+/// What each validator owes the stake pools delegating to it.
+///
+/// Only produced where some endpoint may be asked: local nodes never scan the
+/// programs, and a check no endpoint can answer would only ever report itself
+/// starved. Quorum is capped at the endpoints that can answer, so adding a
+/// local node to a two-provider config does not make these unconfirmable.
+fn evaluate_pools(snapshots: &[Snapshot], config: &Config, stale: &HashMap<String, u64>) -> Vec<CheckOutcome> {
+    let remote = config.pool_endpoints();
+    let mut out = Vec::new();
+    if remote == 0 {
+        return out;
+    }
+    let mc = config.quorum.min_confirmations.min(remote).max(1);
+    let c = &config.checks;
+
+    for v in &config.validators {
+        let who = v.display().to_string();
+        let id = v.identity.clone();
+
+        if c.vault_invoices.base.enabled {
+            let vc = &c.vault_invoices;
+            for (suffix, severity) in [("critical", vc.base.severity), ("warn", Severity::Notify)] {
+                let mut cfg = vc.base.clone();
+                cfg.severity = severity;
+                out.push(outcome(
+                    format!("vault_invoices_{suffix}:{who}"),
+                    format!("{who} has unpaid Vault invoices"),
+                    cfg,
+                    per_endpoint(snapshots, stale, |s| match s.vault_invoices.get(&id) {
+                        Some(Ok(invoices)) => vault_verdict(invoices, &who, suffix == "critical", vc),
+                        Some(Err(e)) => Verdict::unknown(e.clone()),
+                        // Not billed without a vote account, so a spare is fine.
+                        None if not_voting(s, &id) => Verdict::Healthy,
+                        None => Verdict::unknown("Vault invoices not read from this endpoint"),
+                    }),
+                    mc,
+                ));
+            }
+        }
+
+        if c.jpool_bond.base.enabled {
+            let jc = &c.jpool_bond;
+            for (suffix, severity) in [("critical", jc.base.severity), ("warn", Severity::Notify)] {
+                let mut cfg = jc.base.clone();
+                cfg.severity = severity;
+                out.push(outcome(
+                    format!("jpool_bond_{suffix}:{who}"),
+                    format!("{who} JPool bond is low"),
+                    cfg,
+                    per_endpoint(snapshots, stale, |s| match s.jpool.get(&id) {
+                        Some(Ok(pos)) => jpool_verdict(pos, &who, suffix == "critical", jc),
+                        Some(Err(e)) => Verdict::unknown(e.clone()),
+                        None => Verdict::unknown("JPool bonds not read from this endpoint"),
+                    }),
+                    mc,
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Two non-overlapping bands on the count of unpaid invoices, in the vault
+/// where the validator is furthest behind.
+fn vault_verdict(
+    invoices: &[crate::pools::Invoice],
+    who: &str,
+    critical: bool,
+    c: &crate::config::VaultInvoiceCheckConfig,
+) -> Verdict {
+    let Some(a) = crate::pools::arrears(invoices) else {
+        return Verdict::Healthy;
+    };
+    let n = a.unpaid as u32;
+    let fires = if critical {
+        n >= c.page_unpaid
+    } else {
+        n >= c.warn_unpaid && n < c.page_unpaid
+    };
+    if !fires {
+        return Verdict::Healthy;
+    }
+    let epochs = if a.oldest_epoch == a.newest_epoch {
+        format!("epoch {}", a.oldest_epoch)
+    } else {
+        format!("epochs {}-{}", a.oldest_epoch, a.newest_epoch)
+    };
+    let removal = c.removal_at;
+    let margin = if n >= removal {
+        format!("that is at or past the {removal} at which the Vault removes a validator")
+    } else {
+        let left = removal - n;
+        format!(
+            "the Vault removes a validator at {removal}, {left} more invoice{} (about {} days) away",
+            if left == 1 { "" } else { "s" },
+            left * 2
+        )
+    };
+    Verdict::unhealthy(format!(
+        "{who} has {n} unpaid Vault invoice{} ({epochs}, {:.4} vSOL owed to vault {}); {margin}.",
+        if n == 1 { "" } else { "s" },
+        lamports_to_sol(a.owed),
+        a.vault
+    ))
+}
+
+/// The validator's JPool bonds, summed as JPool does (SOL plus JSOL at the
+/// pool's rate), against the security part of JPool's requirement.
+///
+/// Two non-overlapping bands. Critical: below the security requirement, which
+/// is a floor under JPool's real requirement, so health is certainly below
+/// 100% and the delegation is being cut. Warn: under JPool's minimum, or too
+/// little headroom above the security requirement for the performance claims
+/// that draw on it every epoch. Not in JPool at all is fine.
+fn jpool_verdict(
+    pos: &crate::pools::JpoolPosition,
+    who: &str,
+    critical: bool,
+    c: &crate::config::JpoolBondCheckConfig,
+) -> Verdict {
+    use crate::pools::Asset;
+    if pos.is_empty() {
+        return Verdict::Healthy;
+    }
+    let bond = pos.bond_lamports();
+    let required = pos.security_requirement(c.security_sol_per_1000);
+    let (bond_sol, req_sol, stake_sol) =
+        (lamports_to_sol(bond), lamports_to_sol(required), lamports_to_sol(pos.pool_stake));
+    let short = pos.pool_stake > 0 && bond < required;
+    let requirement = format!(
+        "the {req_sol:.4} SOL security requirement ({} SOL per 1,000 SOL of the {stake_sol:.2} SOL \
+         JPool delegates to it)",
+        c.security_sol_per_1000
+    );
+
+    if critical {
+        if !short {
+            return Verdict::Healthy;
+        }
+        if pos.bonds.is_empty() {
+            return Verdict::unhealthy(format!(
+                "{who} has {stake_sol:.2} SOL of JPool stake but no bond posted, against {requirement}. \
+                 JPool flags a validator with no bond for removal. Post one with `jbond topup`."
+            ));
+        }
+        let health = bond as f64 / required as f64 * 100.0;
+        return Verdict::unhealthy(format!(
+            "{who} JPool bond is {bond_sol:.4} SOL, below {requirement}, so bond health is at most \
+             {health:.0}%. JPool starts a grace period below 100%, halves the delegation below 80% \
+             and suspends it below 50%. Top up with `jbond topup`."
+        ));
+    }
+
+    if short {
+        return Verdict::Healthy;
+    }
+    let mut reasons = Vec::new();
+    if bond_sol < c.warn_sol {
+        reasons.push(format!("below JPool's {} SOL minimum bond", c.warn_sol));
+    }
+    if pos.pool_stake > 0 && (bond as f64) < required as f64 * c.warn_coverage {
+        reasons.push(format!(
+            "only {:.2}x {requirement}; performance claims draw on it every epoch, and the \
+             delegation is cut once it falls below",
+            bond as f64 / required as f64
+        ));
+    }
+    if reasons.is_empty() {
+        return Verdict::Healthy;
+    }
+    let parts: Vec<String> = pos
+        .bonds
+        .iter()
+        .map(|b| match b.asset {
+            Asset::Sol => format!("{} {:.4} SOL", b.name, lamports_to_sol(b.lamports)),
+            Asset::Jsol { tokens } => format!(
+                "{} {:.4} JSOL = {:.4} SOL",
+                b.name,
+                lamports_to_sol(tokens),
+                lamports_to_sol(b.lamports)
+            ),
+        })
+        .collect();
+    Verdict::unhealthy(format!(
+        "{who} JPool bond is {bond_sol:.4} SOL ({}): {}. Top up with `jbond topup`.",
+        if parts.is_empty() { "no bond posted".to_string() } else { parts.join(", ") },
+        reasons.join("; ")
+    ))
 }
 
 /// Free-space history per filesystem, keyed `"<host>\u{1f}<mountpoint>"`.
@@ -1247,6 +1439,12 @@ pub fn still_configured(id: &str, config: &Config) -> bool {
         }
         "skip_rate_critical" | "skip_rate_warn" => c.skip_rate.base.enabled && validator(subject),
         "sfdp_version_critical" | "sfdp_version_warn" => c.sfdp_version.base.enabled && validator(subject),
+        "vault_invoices_critical" | "vault_invoices_warn" => {
+            c.vault_invoices.base.enabled && config.pool_endpoints() > 0 && validator(subject)
+        }
+        "jpool_bond_critical" | "jpool_bond_warn" => {
+            c.jpool_bond.base.enabled && config.pool_endpoints() > 0 && validator(subject)
+        }
         "vote_admission_critical" | "vote_admission_warn" => {
             c.vote_admission.base.enabled && validator(subject)
         }
@@ -1473,6 +1671,8 @@ mod tests {
             alpenglow: None,
             vote_states: HashMap::new(),
             vote_income: HashMap::new(),
+            vault_invoices: HashMap::new(),
+            jpool: HashMap::new(),
             block_production: HashMap::new(),
             cluster_stake: None,
             transient_errors: vec![],
@@ -1518,6 +1718,8 @@ mod tests {
             alpenglow: None,
             vote_states: HashMap::new(),
             vote_income: HashMap::new(),
+            vault_invoices: HashMap::new(),
+            jpool: HashMap::new(),
             block_production: HashMap::new(),
             cluster_stake: None,
             transient_errors: vec![],
@@ -1889,7 +2091,7 @@ mod tests {
             out.extend(evaluate_peers(&[peer_status("hub", false, None)], &snaps, &c, Duration::from_secs(300), &HashMap::new(), 0));
             // Exact on purpose: a new check kind changes this count, and whoever
             // adds it must also teach still_configured about it.
-            assert_eq!(out.len(), 18, "check kinds changed: update still_configured, then this count");
+            assert_eq!(out.len(), 22, "check kinds changed: update still_configured, then this count");
             for o in &out {
                 assert!(still_configured(&o.id, &c), "{} is produced but would be retired", o.id);
             }
@@ -2117,6 +2319,277 @@ mod tests {
         assert!(matches!(v, Verdict::Unhealthy(_)));
         assert_eq!(updated, Some(500));
     }
+
+    mod pool_checks {
+        use super::*;
+        use crate::pools::{Asset, Bond, Invoice, JpoolPosition};
+
+        const ID: &str = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv";
+        const VAULT: &str = "Fn5FbRbJzohohUBnwcAYHuQyAz89Q4VBHwsR5hZSGkDa";
+
+        fn config(endpoints: &str, extra: &str) -> Config {
+            Config::parse(&format!(
+                "{endpoints}[[validators]]\nidentity = \"{ID}\"\nlabel = \"chimps-1\"\n{extra}"
+            ))
+            .unwrap()
+        }
+
+        fn two_providers() -> &'static str {
+            "[[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+             [[endpoints]]\nname = \"b\"\nurl = \"https://b.example\"\n"
+        }
+
+        /// `unpaid` invoices owed, after two that were paid.
+        fn invoices(unpaid: u64) -> Vec<Invoice> {
+            (0..unpaid + 2)
+                .map(|i| Invoice {
+                    vault: VAULT.into(),
+                    epoch: 1040 + i,
+                    amount: 27_000_000,
+                    outstanding: if i < 2 { 0 } else { 27_000_000 },
+                })
+                .collect()
+        }
+
+        fn sol_bond(lamports: u64) -> Bond {
+            Bond {
+                address: "DFYKzrEKHaGgRQXi5otCDByHZJZTSM69r7LicSrmiwGd".into(),
+                name: "performance".into(),
+                asset: Asset::Sol,
+                lamports,
+                slot: 1,
+            }
+        }
+
+        fn snaps(
+            names: &[&str],
+            invoices: Option<Vec<Invoice>>,
+            jpool: Option<JpoolPosition>,
+        ) -> Vec<Snapshot> {
+            names
+                .iter()
+                .map(|n| {
+                    let mut s = bare_snapshot(n, Some(4_320_100));
+                    s.validators.insert(ID.into(), ValidatorObservation::Voting(vai(ID, 4_320_090, 4_320_058, 5, 5)));
+                    if let Some(i) = &invoices {
+                        s.vault_invoices.insert(ID.into(), Ok(i.clone()));
+                    }
+                    if let Some(p) = &jpool {
+                        s.jpool.insert(ID.into(), Ok(p.clone()));
+                    }
+                    s
+                })
+                .collect()
+        }
+
+        fn verdict(out: &[CheckOutcome], id: &str) -> Verdict {
+            out.iter().find(|o| o.id == id).unwrap_or_else(|| panic!("no {id}")).verdict.clone()
+        }
+
+        #[test]
+        fn a_validator_the_vault_never_billed_is_healthy() {
+            let c = config(two_providers(), "");
+            let out = evaluate(&snaps(&["a", "b"], Some(vec![]), Some(JpoolPosition::default())), &c, &mut Progress::default());
+            for id in ["vault_invoices_critical:chimps-1", "vault_invoices_warn:chimps-1",
+                       "jpool_bond_critical:chimps-1", "jpool_bond_warn:chimps-1"] {
+                assert_eq!(verdict(&out, id), Verdict::Healthy, "{id}");
+            }
+        }
+
+        #[test]
+        fn paid_up_is_healthy() {
+            let c = config(two_providers(), "");
+            let out = evaluate(&snaps(&["a", "b"], Some(invoices(0)), None), &c, &mut Progress::default());
+            assert_eq!(verdict(&out, "vault_invoices_warn:chimps-1"), Verdict::Healthy);
+            assert_eq!(verdict(&out, "vault_invoices_critical:chimps-1"), Verdict::Healthy);
+        }
+
+        #[test]
+        fn falling_behind_warns_and_says_how_far_removal_is() {
+            let c = config(two_providers(), "");
+            let out = evaluate(&snaps(&["a", "b"], Some(invoices(6)), None), &c, &mut Progress::default());
+            assert_eq!(verdict(&out, "vault_invoices_critical:chimps-1"), Verdict::Healthy);
+            let w = verdict(&out, "vault_invoices_warn:chimps-1");
+            assert!(
+                matches!(&w, Verdict::Unhealthy(m) if m.contains("6 unpaid") && m.contains("epochs 1042-1047")
+                    && m.contains("0.1620 vSOL") && m.contains("4 more invoices")),
+                "{w:?}"
+            );
+        }
+
+        #[test]
+        fn close_to_removal_pages_and_only_pages() {
+            let c = config(two_providers(), "");
+            let out = evaluate(&snaps(&["a", "b"], Some(invoices(8)), None), &c, &mut Progress::default());
+            assert_eq!(verdict(&out, "vault_invoices_warn:chimps-1"), Verdict::Healthy, "bands do not overlap");
+            assert!(matches!(verdict(&out, "vault_invoices_critical:chimps-1"), Verdict::Unhealthy(m) if m.contains("2 more invoices")));
+
+            let out = evaluate(&snaps(&["a", "b"], Some(invoices(10)), None), &c, &mut Progress::default());
+            assert!(matches!(verdict(&out, "vault_invoices_critical:chimps-1"), Verdict::Unhealthy(m) if m.contains("at or past the 10")));
+        }
+
+        /// One provider failing the scan while the other reports arrears is not
+        /// corroboration.
+        #[test]
+        fn one_endpoint_alone_cannot_fire() {
+            let c = config(two_providers(), "");
+            let mut s = snaps(&["a", "b"], Some(invoices(9)), None);
+            s[1].vault_invoices.insert(ID.into(), Err("transient: 429".into()));
+            let out = evaluate(&s, &c, &mut Progress::default());
+            assert!(matches!(verdict(&out, "vault_invoices_critical:chimps-1"), Verdict::Unknown(_)));
+        }
+
+        /// A local node is never asked, so a validator box with one provider
+        /// still reaches quorum on what the provider says.
+        #[test]
+        fn quorum_counts_only_endpoints_that_can_be_asked() {
+            let c = config(
+                "[[endpoints]]\nname = \"localhost\"\nurl = \"http://127.0.0.1:8899\"\n\
+                 [[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n",
+                "",
+            );
+            let mut s = snaps(&["localhost", "a"], Some(invoices(9)), None);
+            s[0].vault_invoices.clear();
+            let out = evaluate(&s, &c, &mut Progress::default());
+            assert!(matches!(verdict(&out, "vault_invoices_critical:chimps-1"), Verdict::Unhealthy(_)));
+        }
+
+        /// Nothing can answer, so nothing is produced: a check that can only
+        /// ever be Unknown would just report itself starved.
+        #[test]
+        fn a_config_with_only_local_endpoints_has_no_pool_checks() {
+            let c = config(
+                "[[endpoints]]\nname = \"localhost\"\nurl = \"http://127.0.0.1:8899\"\n",
+                "[quorum]\nmin_definite = 1\nmin_confirmations = 1\n",
+            );
+            let out = evaluate(&snaps(&["localhost"], None, None), &c, &mut Progress::default());
+            assert!(!out.iter().any(|o| o.id.starts_with("vault_") || o.id.starts_with("jpool_")));
+            assert!(!still_configured("vault_invoices_warn:chimps-1", &c));
+        }
+
+        #[test]
+        fn testnet_has_no_pool_checks() {
+            let c = config(two_providers(), "[watchtower]\ncluster = \"testnet\"\n");
+            let out = evaluate(&snaps(&["a", "b"], None, None), &c, &mut Progress::default());
+            assert!(!out.iter().any(|o| o.id.starts_with("vault_") || o.id.starts_with("jpool_")));
+
+            let c = config(two_providers(), "[watchtower]\ncluster = \"mainnet-beta\"\n");
+            let out = evaluate(&snaps(&["a", "b"], Some(vec![]), Some(JpoolPosition::default())), &c, &mut Progress::default());
+            assert!(out.iter().any(|o| o.id == "jpool_bond_warn:chimps-1"));
+            assert!(still_configured("jpool_bond_warn:chimps-1", &c));
+        }
+
+        /// A spare has no vote account, so there is nothing to bill.
+        #[test]
+        fn a_spare_without_a_vote_account_is_not_unknown() {
+            let c = config(two_providers(), "");
+            let mut s = snaps(&["a", "b"], None, Some(JpoolPosition::default()));
+            for x in &mut s {
+                x.validators.insert(ID.into(), ValidatorObservation::Absent);
+            }
+            let out = evaluate(&s, &c, &mut Progress::default());
+            assert_eq!(verdict(&out, "vault_invoices_critical:chimps-1"), Verdict::Healthy);
+        }
+
+        fn position(bonds: Vec<Bond>, stake_sol: u64) -> Option<JpoolPosition> {
+            Some(JpoolPosition { bonds, pool_stake: stake_sol * 1_000_000_000 })
+        }
+
+        fn jpool(pos: Option<JpoolPosition>) -> Vec<CheckOutcome> {
+            evaluate(&snaps(&["a", "b"], None, pos), &config(two_providers(), ""), &mut Progress::default())
+        }
+
+        /// chimps after the epoch-1050 claim: 0.5044 SOL against 28.4 SOL of
+        /// JPool stake is 35x the security requirement, but under JPool's
+        /// 1 SOL minimum. A Telegram, not a page.
+        #[test]
+        fn a_bond_under_the_minimum_warns() {
+            let out = jpool(Some(JpoolPosition { bonds: vec![sol_bond(504_393_361)], pool_stake: 28_416_459_181 }));
+            assert_eq!(verdict(&out, "jpool_bond_critical:chimps-1"), Verdict::Healthy);
+            let w = verdict(&out, "jpool_bond_warn:chimps-1");
+            assert!(
+                matches!(&w, Verdict::Unhealthy(m) if m.contains("0.5044 SOL") && m.contains("performance")
+                    && m.contains("1 SOL minimum") && !m.contains("only")),
+                "{w:?}"
+            );
+        }
+
+        /// 2,000 SOL of JPool stake needs a 1 SOL security bond. 0.8 SOL means
+        /// health is at most 80%, whatever the off-chain performance part is.
+        #[test]
+        fn a_bond_below_the_security_requirement_pages() {
+            let out = jpool(position(vec![sol_bond(800_000_000)], 2_000));
+            let v = verdict(&out, "jpool_bond_critical:chimps-1");
+            assert!(
+                matches!(&v, Verdict::Unhealthy(m) if m.contains("1.0000 SOL security requirement")
+                    && m.contains("2000.00 SOL") && m.contains("at most 80%")),
+                "{v:?}"
+            );
+            assert_eq!(verdict(&out, "jpool_bond_warn:chimps-1"), Verdict::Healthy, "bands do not overlap");
+        }
+
+        #[test]
+        fn pool_stake_with_no_bond_pages() {
+            let out = jpool(position(vec![], 1_000));
+            let v = verdict(&out, "jpool_bond_critical:chimps-1");
+            assert!(matches!(&v, Verdict::Unhealthy(m) if m.contains("no bond posted")), "{v:?}");
+        }
+
+        /// Above the requirement, but one bad epoch of claims from below it.
+        #[test]
+        fn thin_headroom_over_the_requirement_warns() {
+            let out = jpool(position(vec![sol_bond(1_200_000_000)], 2_000));
+            assert_eq!(verdict(&out, "jpool_bond_critical:chimps-1"), Verdict::Healthy);
+            let w = verdict(&out, "jpool_bond_warn:chimps-1");
+            assert!(
+                matches!(&w, Verdict::Unhealthy(m) if m.contains("only 1.20x") && !m.contains("minimum")),
+                "{w:?}"
+            );
+        }
+
+        #[test]
+        fn a_well_covered_bond_is_quiet() {
+            let out = jpool(position(vec![sol_bond(3_000_000_000)], 2_000));
+            assert_eq!(verdict(&out, "jpool_bond_critical:chimps-1"), Verdict::Healthy);
+            assert_eq!(verdict(&out, "jpool_bond_warn:chimps-1"), Verdict::Healthy);
+        }
+
+        /// A bond with no pool stake yet has no requirement to fall below, so
+        /// it never pages; under the minimum it still warns.
+        #[test]
+        fn a_bond_without_pool_stake_never_pages() {
+            let out = jpool(position(vec![sol_bond(0)], 0));
+            assert_eq!(verdict(&out, "jpool_bond_critical:chimps-1"), Verdict::Healthy);
+            assert!(matches!(verdict(&out, "jpool_bond_warn:chimps-1"), Verdict::Unhealthy(_)));
+        }
+
+        /// SOL and JSOL bonds count together, as JPool counts them.
+        #[test]
+        fn bonds_are_summed_across_products() {
+            let jsol = Bond {
+                address: "x".into(),
+                name: "perf".into(),
+                asset: Asset::Jsol { tokens: 400_000_000 },
+                lamports: 551_882_341,
+                slot: 1,
+            };
+            let out = jpool(position(vec![sol_bond(504_393_361), jsol], 28));
+            assert_eq!(verdict(&out, "jpool_bond_warn:chimps-1"), Verdict::Healthy);
+        }
+
+        #[test]
+        fn thresholds_out_of_order_are_a_config_error() {
+            assert!(Config::parse(&format!(
+                "{}[checks.vault_invoices]\npending_for = \"0s\"\nseverity = \"page\"\nwarn_unpaid = 9\npage_unpaid = 8\n",
+                two_providers()
+            )).is_err());
+            assert!(Config::parse(&format!(
+                "{}[checks.jpool_bond]\npending_for = \"0s\"\nseverity = \"page\"\nwarn_coverage = 0.5\n",
+                two_providers()
+            )).is_err());
+        }
+    }
+
 }
 
 #[cfg(test)]

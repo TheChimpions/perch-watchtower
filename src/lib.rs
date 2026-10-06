@@ -16,6 +16,7 @@ pub mod node_exporter;
 pub mod notify;
 pub mod peer;
 pub mod persist;
+pub mod pools;
 pub mod rpc;
 pub mod selfcheck;
 pub mod sfdp;

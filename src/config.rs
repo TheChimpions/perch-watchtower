@@ -247,6 +247,17 @@ const KNOWN_CLUSTERS: &[(&str, &str)] = &[
     ("devnet", "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"),
 ];
 
+/// Whether an endpoint points at a node on this machine.
+///
+/// Matched on the URL rather than the endpoint's name so a config that calls its
+/// local node something other than "localhost" still works.
+pub fn is_local_url(url: &str) -> bool {
+    let u = url.to_ascii_lowercase();
+    ["127.0.0.1", "localhost", "[::1]", "0.0.0.0"]
+        .iter()
+        .any(|h| u.contains(h))
+}
+
 /// Resolve a cluster name to its genesis hash, or pass through a literal hash
 /// so private clusters and local test validators can be pinned too.
 pub fn resolve_cluster(value: &str) -> Result<String> {
@@ -274,6 +285,14 @@ impl Watchtower {
             "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY" => Some("testnet"),
             _ => None,
         }
+    }
+
+    /// Whether the stake-pool programs can apply. The Vault and JPool live on
+    /// mainnet only; asking a testnet endpoint for them would be wasted calls
+    /// that always answer "nothing owed". Unpinned is given the benefit of the
+    /// doubt.
+    pub fn may_be_mainnet(&self) -> bool {
+        self.cluster.is_none() || self.sfdp_cluster() == Some("mainnet-beta")
     }
 
     /// The genesis hash every endpoint must report, if pinned.
@@ -882,6 +901,13 @@ pub struct Checks {
     /// a Telegram note with roughly an epoch left to act.
     #[serde(default = "default_sfdp_version")]
     pub sfdp_version: SfdpCheckConfig,
+    /// Unpaid invoices from The Vault, found from the validator's vote account.
+    /// The Vault removes a validator at ten unpaid.
+    #[serde(default = "default_vault_invoices")]
+    pub vault_invoices: VaultInvoiceCheckConfig,
+    /// JPool's bond against the validator, found from its identity.
+    #[serde(default = "default_jpool_bond")]
+    pub jpool_bond: JpoolBondCheckConfig,
     #[serde(default = "default_cluster_stake")]
     pub cluster_stake: StakeCheckConfig,
     #[serde(default = "default_cluster_stalled")]
@@ -1075,6 +1101,115 @@ fn default_sfdp_version() -> SfdpCheckConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct VaultInvoiceCheckConfig {
+    /// `severity` here is the paging band. The warning band is always `notify`.
+    #[serde(flatten)]
+    pub base: CheckConfig,
+    /// Telegram once this many invoices are unpaid...
+    #[serde(default = "default_vault_warn_unpaid")]
+    pub warn_unpaid: u32,
+    /// ...page at this many.
+    #[serde(default = "default_vault_page_unpaid")]
+    pub page_unpaid: u32,
+    /// Where the Vault removes the validator. Only used to say how close it is.
+    #[serde(default = "default_vault_removal_at")]
+    pub removal_at: u32,
+    /// How often each endpoint is asked. Invoices arrive once an epoch.
+    /// Floored at 1m.
+    #[serde(with = "humantime_serde", default = "default_pool_poll")]
+    pub poll_interval: Duration,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct JpoolBondCheckConfig {
+    /// `severity` here is the paging band. The warning band is always `notify`.
+    #[serde(flatten)]
+    pub base: CheckConfig,
+    /// Pages when the bond is below the security requirement: this many SOL
+    /// per 1,000 SOL the pool delegates to the validator. JPool's requirement
+    /// adds an off-chain APY-shortfall part on top, so a bond below this is
+    /// certainly below 100% health.
+    #[serde(default = "default_jpool_security_sol_per_1000")]
+    pub security_sol_per_1000: f64,
+    /// Telegram when the bond covers the security requirement by less than
+    /// this multiple: performance claims draw it down each epoch.
+    #[serde(default = "default_jpool_warn_coverage")]
+    pub warn_coverage: f64,
+    /// Telegram below this many SOL-equivalent across the validator's bonds,
+    /// whatever the requirement.
+    #[serde(default = "default_jpool_warn_sol")]
+    pub warn_sol: f64,
+    /// Telegram note each time JPool draws on the bond (or it is withdrawn from).
+    #[serde(default = "yes")]
+    pub announce_drawdowns: bool,
+    /// How often each endpoint is asked. Claims land once an epoch. Floored at 1m.
+    #[serde(with = "humantime_serde", default = "default_pool_poll")]
+    pub poll_interval: Duration,
+}
+
+fn default_vault_warn_unpaid() -> u32 {
+    // Paying a few epochs at once is normal; five is ten days behind.
+    5
+}
+fn default_vault_page_unpaid() -> u32 {
+    // Two invoices, roughly four days, before removal.
+    8
+}
+fn default_vault_removal_at() -> u32 {
+    10
+}
+fn default_jpool_warn_sol() -> f64 {
+    // JPool's documented minimum bond to be in the pool at all.
+    1.0
+}
+fn default_jpool_security_sol_per_1000() -> f64 {
+    // "0.5 SOL per 1,000 SOL of your total validator JPool stake".
+    0.5
+}
+fn default_jpool_warn_coverage() -> f64 {
+    1.5
+}
+fn default_pool_poll() -> Duration {
+    d(10 * 60)
+}
+
+fn pool_check_base() -> CheckConfig {
+    CheckConfig {
+        enabled: true,
+        // Confirmed by quorum against on-chain state that changes once an
+        // epoch; the hold-down only rides out one endpoint's stale cache.
+        pending_for: d(15 * 60),
+        clear_after: 1,
+        severity: Severity::Page,
+        // Moves on the scale of days. Said when it crosses, repeated twice a day.
+        renotify_after: d(12 * 60 * 60),
+    }
+}
+
+fn default_vault_invoices() -> VaultInvoiceCheckConfig {
+    VaultInvoiceCheckConfig {
+        base: pool_check_base(),
+        warn_unpaid: default_vault_warn_unpaid(),
+        page_unpaid: default_vault_page_unpaid(),
+        removal_at: default_vault_removal_at(),
+        poll_interval: default_pool_poll(),
+    }
+}
+
+fn default_jpool_bond() -> JpoolBondCheckConfig {
+    JpoolBondCheckConfig {
+        base: pool_check_base(),
+        security_sol_per_1000: default_jpool_security_sol_per_1000(),
+        warn_coverage: default_jpool_warn_coverage(),
+        warn_sol: default_jpool_warn_sol(),
+        announce_drawdowns: true,
+        poll_interval: default_pool_poll(),
+    }
+}
+
 fn default_commission() -> CheckConfig {
     CheckConfig {
         // Confirmed by quorum, so it is safe to fire on the first cycle.
@@ -1113,6 +1248,8 @@ impl Default for Checks {
             identity_balance: default_identity_balance(),
             commission_changed: default_commission(),
             sfdp_version: default_sfdp_version(),
+            vault_invoices: default_vault_invoices(),
+            jpool_bond: default_jpool_bond(),
             cluster_stake: default_cluster_stake(),
             cluster_stalled: default_cluster_stalled(),
             disk_space: default_disk_space(),
@@ -1259,6 +1396,15 @@ fn resolve_secret(field: &str, raw: &str) -> Result<String> {
 }
 
 impl Config {
+    /// Endpoints that may be asked to scan the stake-pool programs: never a
+    /// local node, which would walk its own accounts database to answer.
+    pub fn pool_endpoints(&self) -> usize {
+        if !self.watchtower.may_be_mainnet() {
+            return 0;
+        }
+        self.endpoints.iter().filter(|e| !is_local_url(&e.url)).count()
+    }
+
     /// How long a check may sit inconclusive before it is reported as unable to
     /// evaluate.
     ///
@@ -1415,6 +1561,16 @@ impl Config {
         let b = &self.checks.identity_balance;
         if b.page_sol > b.warn_sol {
             bail!("checks.identity_balance.page_sol must be <= warn_sol");
+        }
+        let v = &self.checks.vault_invoices;
+        if v.warn_unpaid == 0 || v.warn_unpaid > v.page_unpaid {
+            bail!("checks.vault_invoices needs 1 <= warn_unpaid <= page_unpaid");
+        }
+        let j = &self.checks.jpool_bond;
+        if j.security_sol_per_1000 < 0.0 || j.warn_sol < 0.0 || j.warn_coverage < 1.0 {
+            bail!(
+                "checks.jpool_bond needs security_sol_per_1000 >= 0, warn_sol >= 0 and warn_coverage >= 1"
+            );
         }
 
         let mut host_names = HashMap::new();

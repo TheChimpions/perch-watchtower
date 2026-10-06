@@ -1,30 +1,93 @@
 name: release
 
-# Push a tag like v1.0.0 to publish static Linux binaries, SHA256SUMS, a build
-# provenance attestation for each, and install.sh.
+# Releasing is bumping the version. A push to main that changes the version in
+# Cargo.toml publishes it: this workflow tests that commit, builds static Linux
+# binaries, SHA256SUMS, a build provenance attestation for each and install.sh,
+# then creates the tag and the GitHub release together. PRs that leave the
+# version alone release nothing.
+#
+# Pushing a tag like v1.0.3 by hand still works, for a release cut from a
+# commit other than main's head. Either way, do not create the GitHub release
+# yourself: this workflow must, or it fails at publish (as v1.0.1 did).
 on:
   push:
+    branches: [main]
+    # Branch pushes only; GitHub does not apply path filters to tag pushes.
+    paths: [Cargo.toml]
     tags: ["v*"]
 
 permissions:
   contents: read
 
+# Two merges in quick succession must not race to create the same release.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  # A tag that disagrees with Cargo.toml ships a binary that reports the wrong
-  # version in --version, status, and perch_build_info. v1.0.1 did exactly that.
+  # Decides whether there is anything to release, and refuses a tag that
+  # disagrees with Cargo.toml: that ships a binary reporting the wrong version
+  # in --version, status, and perch_build_info. v1.0.1 did exactly that.
   version:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      release: ${{ steps.v.outputs.release }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: |
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          if [ "v$crate" != "$GITHUB_REF_NAME" ]; then
+          tag="v$crate"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
             exit 1
           fi
 
-  build:
+          # Cargo.toml changed for some other reason (a dependency, a feature):
+          # the version is already out, so there is nothing to do.
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::$tag is already released; nothing to publish"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$GITHUB_REF_TYPE" = branch ]; then
+            # A tag with no release would be built from whatever commit it
+            # points at, not this one. Make it a decision, not a surprise.
+            if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+              echo "::error::tag $tag exists but has no release; delete the tag, or push it again to release that commit"
+              exit 1
+            fi
+            # Versions only go up. A typo that lowers one must not publish.
+            latest=$(git ls-remote --tags --refs origin 'v*' | sed 's|.*refs/tags/v||' | sort -V | tail -1)
+            if [ -n "$latest" ] && [ "$(printf '%s\n%s\n' "$latest" "$crate" | sort -V | tail -1)" != "$crate" ]; then
+              echo "::error::Cargo.toml version $crate is lower than the latest release v$latest"
+              exit 1
+            fi
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+
+  # The exact commit being released passes its tests, on the toolchain the
+  # binaries are built with. --locked also catches a version bump that did not
+  # update Cargo.lock, which would otherwise fail the build below.
+  test:
     needs: version
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: "1.85"
+      - run: cargo test --locked
+
+  build:
+    needs: [version, test]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -53,7 +116,7 @@ jobs:
           path: perch-${{ matrix.target }}.tar.gz
 
   publish:
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the release
@@ -75,6 +138,15 @@ jobs:
           subject-path: |
             perch-*.tar.gz
             install.sh
+      # From a version bump, this creates the tag on the commit just tested and
+      # built. A tag created with this workflow's token does not trigger the
+      # workflow again, so there is no second run.
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" perch-*.tar.gz install.sh SHA256SUMS --generate-notes --verify-tag
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            gh release create "$TAG" perch-*.tar.gz install.sh SHA256SUMS --generate-notes --verify-tag
+          else
+            gh release create "$TAG" perch-*.tar.gz install.sh SHA256SUMS --generate-notes --target "$GITHUB_SHA"
+          fi

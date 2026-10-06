@@ -334,6 +334,64 @@ what a hand-rolled string comparison gets wrong. The check reads Unknown, never
 unhealthy, when the foundation API is unreachable, the cluster is not covered,
 or the local node's identity cannot be determined.
 
+### Stake pool obligations
+
+Some stake comes with conditions that lapse while the validator itself looks
+perfectly healthy. Perch reads two of them straight from the pools' programs:
+
+- **The Vault** bills each validator in vSOL, one `Invoice` account per epoch
+  (program `EpoivtVh9dgWFxE6MYgF3YnobYWtZr2VfCuP7iT3N927`). Paying one zeroes
+  its outstanding amount; ten unpaid and the Vault removes the validator.
+  `vault_invoices_warn` notifies at 5 unpaid, `vault_invoices_critical` pages
+  at 8, counted in the vault where the validator is furthest behind.
+- **JPool** holds a bond against each validator (program
+  `BondQ7KqZreTcW2UbeTNDcLCJQ3aXAtLn2Fm6ftaJDU`): the legacy SOL bond, the JSOL
+  bond, or both, summed in SOL with JSOL at the pool's exchange rate. JPool
+  claims from it each epoch the validator falls short of its target APY.
+  `jpool_bond_critical` pages when the bond is below the security requirement,
+  0.5 SOL per 1,000 SOL of JPool stake. `jpool_bond_warn` notifies below JPool's
+  documented 1 SOL minimum, or when the bond covers the security requirement
+  by less than 1.5x. Each time the bond goes down perch sends a Telegram note
+  with the amount.
+
+```
+chimpions has 8 unpaid Vault invoices (epochs 1042-1049, 0.2160 vSOL owed to
+vault Fn5F...); the Vault removes a validator at 10, 2 more invoices (about 4
+days) away.
+```
+
+Neither needs configuring. Invoices are found from the vote account the cluster
+reports for the identity, and bonds from the identity itself, so a validator
+that joins either pool is covered from the next cycle, and one in neither has
+nothing owed and reads healthy.
+
+JPool's bond *health* is the bond over a requirement with two parts: security,
+0.5 SOL per 1,000 SOL of the validator's JPool stake, and the APY shortfall,
+which JPool computes off-chain. The stake is on-chain: the pool's validator
+list holds what it delegates to each vote account, and direct stake goes
+through the pool, so it is included. Perch therefore computes the security
+part exactly and treats it as a floor. The full requirement is never lower, so
+a bond below it is certainly under 100% health, with no false positive possible
+from the part perch cannot see. The cost is the other direction: a bond above
+the security requirement can still be under 100% if the shortfall part is
+large, which the drawdown notes and the 1.5x headroom warning are there to
+catch early.
+
+```
+chimpions JPool bond is 0.8000 SOL, below the 1.0000 SOL security requirement
+(0.5 SOL per 1,000 SOL of the 2000.00 SOL JPool delegates to it), so bond
+health is at most 80%. JPool starts a grace period below 100%, halves the
+delegation below 80% and suspends it below 50%.
+```
+
+These are program scans (`getProgramAccounts`), so they are never sent to a
+local node: without an account index, a validator would walk its whole accounts
+database to answer. They are cached per endpoint for `poll_interval` (10m), run
+only on mainnet or an unpinned cluster, and confirmed by
+`min(min_confirmations, non-local endpoints)` endpoints. A config with only a
+local endpoint has no pool checks at all rather than checks that can only ever
+starve.
+
 ## What is actually hard about this
 
 The plumbing — tri-state verdicts, corroboration, hold-downs, inhibition — is the

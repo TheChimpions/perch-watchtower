@@ -372,6 +372,51 @@ poll_interval = "1h"
 # sees the same schedule, so enable this on ONE box per cluster.
 announce_changes = false
 
+# The Vault bills each validator in vSOL, one on-chain invoice per epoch, and
+# removes it at ten unpaid. Invoices are found from the vote account the cluster
+# reports for the identity, so joining the Vault needs no configuration; a
+# validator it has never billed reads healthy. Read only from non-local
+# endpoints (a local node would scan its whole accounts database to answer) and
+# only on mainnet or an unpinned cluster.
+[checks.vault_invoices]
+enabled = true
+# Telegram at this many unpaid. Paying a few epochs at once is normal.
+warn_unpaid = 5
+# Pages at this many: about two epochs before removal.
+page_unpaid = 8
+# Where the Vault removes a validator; only used to say how close it is.
+removal_at = 10
+# How often each endpoint is asked. Floored at 1m.
+poll_interval = "10m"
+pending_for = "15m"
+clear_after = 1
+severity = "page"
+renotify_after = "12h"
+
+# JPool's bond, found from the validator identity: the legacy SOL bond and the
+# JSOL bond, summed in SOL with JSOL at the pool's rate, against the stake the
+# pool delegates to the vote account (direct stake included). JPool's
+# requirement is a security part, below, plus an APY-shortfall part it computes
+# off-chain; JPool draws on the bond each epoch to cover that shortfall. Not in
+# JPool at all reads healthy.
+[checks.jpool_bond]
+enabled = true
+# Pages below this many SOL per 1,000 SOL of JPool stake. The real requirement
+# is never lower, so a bond below it is certainly under 100% health: JPool's
+# grace period has started and the delegation is being cut.
+security_sol_per_1000 = 0.5
+# Telegram when the bond covers the security requirement by less than this.
+warn_coverage = 1.5
+# Telegram below this whatever the stake. JPool's documented minimum is 1 SOL.
+warn_sol = 1.0
+# Telegram note each time the bond goes down (a claim, or a withdrawal).
+announce_drawdowns = true
+poll_interval = "10m"
+pending_for = "15m"
+clear_after = 1
+severity = "page"
+renotify_after = "12h"
+
 # Only evaluated for validators with an expected commission set: expected_commission,
 # expected_commission_bps or expected_block_revenue_commission_bps.
 [checks.commission_changed]

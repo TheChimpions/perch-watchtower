@@ -60,6 +60,7 @@ thresholds: Telegram at 5 minutes, a page at 20.
 | Identity balance under Alpenglow | still alerts below 10 SOL | stops paging: votes no longer cost the identity anything |
 | Commission changed | no | yes, pages immediately; compared in basis points, inflation and block revenue |
 | Delegation program minimum version | no | yes, for the current and next epoch |
+| Stake pool obligations (Vault invoices, JPool bond) | no | yes, found on-chain from the identity |
 | Cluster making progress | yes: transaction count and blockhash ([L404–423](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L404-L423)) | yes: slot progress |
 | Cluster active stake | yes, opt-in ([L160–176](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L160-L176)) | yes, opt-in, Telegram by default |
 | Your own RPC node lagging | no | yes (`node_behind`) |

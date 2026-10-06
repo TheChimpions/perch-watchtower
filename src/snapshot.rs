@@ -208,6 +208,11 @@ pub struct Snapshot {
     /// completed epoch, in lamports. Only from endpoints that keep that much
     /// history; most public ones do not.
     pub vote_income: HashMap<String, u64>,
+    /// Identity pubkey -> every invoice The Vault has issued its vote account.
+    /// Absent when this endpoint was not asked: local nodes never are.
+    pub vault_invoices: HashMap<String, Result<Vec<crate::pools::Invoice>, String>>,
+    /// Identity pubkey -> its JPool bonds and the pool's stake on it.
+    pub jpool: HashMap<String, Result<crate::pools::JpoolPosition, String>>,
     /// Transport-level trouble seen while building this snapshot. Reported in
     /// the endpoint-health digest; never alerted on directly.
     pub transient_errors: Vec<String>,
@@ -233,6 +238,8 @@ impl Snapshot {
             alpenglow: None,
             vote_states: HashMap::new(),
             vote_income: HashMap::new(),
+            vault_invoices: HashMap::new(),
+            jpool: HashMap::new(),
             transient_errors: Vec::new(),
             config_errors: Vec::new(),
         }
@@ -271,15 +278,8 @@ fn needs_full_listing(config: &Config, known_vote_accounts: &HashMap<String, Str
             .any(|v| !known_vote_accounts.contains_key(&v.identity))
 }
 
-/// Whether an endpoint points at a node on this machine.
-///
-/// Matched on the URL rather than the endpoint's name so a config that calls its
-/// local node something other than "localhost" still works.
 fn is_local(url: &str) -> bool {
-    let u = url.to_ascii_lowercase();
-    ["127.0.0.1", "localhost", "[::1]", "0.0.0.0"]
-        .iter()
-        .any(|h| u.contains(h))
+    crate::config::is_local_url(url)
 }
 
 pub async fn probe(
@@ -373,6 +373,13 @@ pub async fn probe(
     }
 
     fetch_accounts(endpoint, config, known_vote_accounts, &mut snap).await;
+
+    // Program scans are cheap on an RPC provider's indexed node and expensive
+    // on a validator: without an account index, getProgramAccounts walks the
+    // whole accounts database of the machine that is supposed to be voting.
+    if !is_local(&endpoint.url) {
+        fetch_pools(endpoint, config, known_vote_accounts, &mut snap).await;
+    }
 
     if config.checks.skip_rate.base.enabled {
         for v in &config.validators {
@@ -549,6 +556,50 @@ async fn fetch_accounts(
         }
         (None, _) => snap.record(RpcError::Transient("unparseable feature account".into())),
         (_, Err(e)) => snap.record(e),
+    }
+}
+
+/// Vault invoices and JPool bonds, each cached per endpoint for the check's
+/// poll interval: both change once an epoch, and these are program scans.
+async fn fetch_pools(
+    endpoint: &Endpoint,
+    config: &Config,
+    known_vote_accounts: &HashMap<String, String>,
+    snap: &mut Snapshot,
+) {
+    use crate::pools::{fetch_invoices, fetch_jpool, FetchError};
+    if !config.watchtower.may_be_mainnet() {
+        return;
+    }
+    let floor = std::time::Duration::from_secs(60);
+    let vault = &config.checks.vault_invoices;
+    let jpool = &config.checks.jpool_bond;
+    for v in &config.validators {
+        // The vote account the cluster reports is the authority, as for the
+        // vote account fetch; no vote account at all means nothing to bill.
+        let vote = snap
+            .validators
+            .get(&v.identity)
+            .and_then(|o| o.info())
+            .map(|i| i.vote_pubkey.clone())
+            .or_else(|| v.vote_account.clone())
+            .or_else(|| known_vote_accounts.get(&v.identity).cloned());
+        if vault.base.enabled {
+            if let Some(vote) = &vote {
+                let r = fetch_invoices(endpoint, vote, vault.poll_interval.max(floor)).await;
+                if let Err(FetchError::Rpc(e)) = &r {
+                    snap.record(e.clone());
+                }
+                snap.vault_invoices.insert(v.identity.clone(), r.map_err(|e| e.to_string()));
+            }
+        }
+        if jpool.base.enabled {
+            let r = fetch_jpool(endpoint, &v.identity, vote.as_deref(), jpool.poll_interval.max(floor)).await;
+            if let Err(FetchError::Rpc(e)) = &r {
+                snap.record(e.clone());
+            }
+            snap.jpool.insert(v.identity.clone(), r.map_err(|e| e.to_string()));
+        }
     }
 }
 

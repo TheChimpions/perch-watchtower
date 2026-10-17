@@ -265,16 +265,13 @@ async fn identity_balances_come_through_the_same_batched_call() {
     // The mock's validators are voting; if they were not, the identity checks
     // would rightly stay quiet and this test would prove nothing.
     assert_eq!(find(&out, "vote_delinquent:underfunded").verdict, Verdict::Healthy);
-    // 0.1 SOL would page before Alpenglow; under it, only Telegram.
+    // 0.1 SOL would page before Alpenglow; under it, neither band alerts.
     assert_eq!(
         find(&out, "identity_balance_critical:underfunded").verdict,
         Verdict::Healthy
     );
     let warn = find(&out, "identity_balance_warn:underfunded");
-    assert!(
-        matches!(&warn.verdict, Verdict::Unhealthy(m) if m.contains("0.100 SOL")),
-        "{:?}",
-        warn.verdict
-    );
-    assert_eq!(warn.tally.unhealthy, 2);
+    assert_eq!(warn.verdict, Verdict::Healthy);
+    // Both endpoints answered: quiet because of Alpenglow, not for want of data.
+    assert_eq!(warn.tally.healthy, 2);
 }

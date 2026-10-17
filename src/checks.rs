@@ -72,6 +72,15 @@ impl Progress {
         self.cluster_slot = cluster_slot;
     }
 
+    /// Forget the slot and vote-credit high-water marks. A cluster restart
+    /// resumes from an earlier slot than the highest one seen before the halt,
+    /// and credits roll back with it; holding the old marks would report a
+    /// stall until the new chain overtook the abandoned fork.
+    pub fn rebaseline_after_cluster_restart(&mut self) {
+        self.cluster_slot = None;
+        self.validator_credits.clear();
+    }
+
     pub fn export_identity_history(&self) -> HashMap<String, crate::fillrate::FillHistory> {
         self.identity_history.clone()
     }
@@ -506,7 +515,6 @@ pub fn evaluate(
             cfg.severity = severity;
             let who2 = who.clone();
             let id2 = id.clone();
-            let warn_sol = c.identity_balance.warn_sol;
             out.push(outcome(
                 format!("identity_balance_{suffix}:{who}"),
                 format!("{who} identity balance is low"),
@@ -521,17 +529,11 @@ pub fn evaluate(
                     // a check that works without them.
                     match alpenglow_in_force(s).unwrap_or(false) {
                         // Votes no longer cost the identity anything, so an
-                        // empty one cannot take the validator delinquent:
-                        // nothing here pages, and one band covers everything
-                        // under the warning floor.
-                        true if suffix == "critical" => Verdict::Healthy,
-                        true => match balance_verdict(lamports, warn_sol, None, &format!("{who2} identity"), 0.0, None) {
-                            Verdict::Unhealthy(m) => Verdict::unhealthy(format!(
-                                "{m}. Under Alpenglow the identity no longer pays for votes, so \
-                                 this does not affect voting"
-                            )),
-                            other => other,
-                        },
+                        // empty one cannot take the validator delinquent and
+                        // neither band says anything. The vote account is the
+                        // balance that matters then (`vote_admission`); the
+                        // identity balance stays in metrics and `perch status`.
+                        true => Verdict::Healthy,
                         false => balance_verdict(
                             lamports,
                             floor,
@@ -2219,15 +2221,13 @@ mod tests {
         }
 
         /// Under Alpenglow votes cost the identity nothing, so an empty one
-        /// must not page "cannot vote and goes delinquent" -- and the warning
-        /// band covers everything below warn_sol, including what used to page.
+        /// cannot take the validator delinquent: neither band alerts.
         #[test]
-        fn an_empty_identity_does_not_page_under_alpenglow() {
+        fn an_empty_identity_does_not_alert_under_alpenglow() {
             let c = config("");
             let out = evaluate(&snaps(FeatureState::Active(0), Some(vote(10_000_000_000, Bls::Registered)), 100_000_000), &c, &mut Progress::default());
             assert_eq!(verdict(&out, "identity_balance_critical:chimps-1"), Verdict::Healthy);
-            let w = verdict(&out, "identity_balance_warn:chimps-1");
-            assert!(matches!(&w, Verdict::Unhealthy(m) if m.contains("no longer pays for votes") && !m.contains("delinquent")), "{w:?}");
+            assert_eq!(verdict(&out, "identity_balance_warn:chimps-1"), Verdict::Healthy);
 
             // Before Alpenglow the same balance still pages, as it always has.
             let out = evaluate(&snaps(FeatureState::Absent, Some(vote(10_000_000_000, Bls::Registered)), 100_000_000), &c, &mut Progress::default());

@@ -221,8 +221,8 @@ when rewards were last withdrawn: across one real fleet it read anything from
 identity stops paying for them. On five testnet validators the identity fell
 about 1.9 SOL a day until the switch to Alpenglow, and has risen slowly since,
 on block fees alone. An empty identity no longer stops a validator voting, so
-`identity_balance` stops paging once Alpenglow governs the current epoch and
-drops to a single Telegram band.
+`identity_balance` stops alerting altogether once Alpenglow governs the current
+epoch. The balance stays in metrics and `perch status`.
 
 The vote account takes over (SIMD-0357). At the first slot of every epoch N+1
 the runtime decides which vote accounts take part in epoch N+2, and admits only
@@ -374,8 +374,8 @@ part exactly and treats it as a floor. The full requirement is never lower, so
 a bond below it is certainly under 100% health, with no false positive possible
 from the part perch cannot see. The cost is the other direction: a bond above
 the security requirement can still be under 100% if the shortfall part is
-large, which the drawdown notes and the 1.5x headroom warning are there to
-catch early.
+large, which the 1.5x headroom warning is there to catch early. Per-claim
+drawdown notes are available with `announce_drawdowns = true`, off by default.
 
 ```
 chimpions JPool bond is 0.8000 SOL, below the 1.0000 SOL security requirement

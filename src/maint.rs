@@ -5,7 +5,7 @@
 //! writing to a file the watchtower never read. The path now comes from the same
 //! config the daemon loads, so the two cannot disagree.
 
-use crate::state::{read_silence, Silence};
+use crate::state::{read_silence, ClusterPhase, Silence};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -18,9 +18,16 @@ pub enum Action {
     Restart(Duration),
     /// Plain timed silence.
     For(Duration),
+    /// Hold everything through a coordinated cluster restart, until the
+    /// cluster produces blocks again and the validator recovers, or the
+    /// deadline.
+    ClusterRestart(Duration),
 }
 
 const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(3600);
+/// Cluster restarts wait on a supermajority of stake coming back, which on
+/// testnet has taken most of a day.
+const DEFAULT_CLUSTER_RESTART_WINDOW: Duration = Duration::from_secs(12 * 3600);
 
 pub fn parse(args: &[String]) -> Result<Action> {
     let dur = |s: &str| {
@@ -37,8 +44,10 @@ pub fn parse(args: &[String]) -> Result<Action> {
         ["off" | "clear" | "end"] => Ok(Action::Off),
         ["restart" | "auto"] => Ok(Action::Restart(DEFAULT_RESTART_WINDOW)),
         ["restart" | "auto", d] => Ok(Action::Restart(dur(d)?)),
+        ["cluster-restart" | "cluster"] => Ok(Action::ClusterRestart(DEFAULT_CLUSTER_RESTART_WINDOW)),
+        ["cluster-restart" | "cluster", d] => Ok(Action::ClusterRestart(dur(d)?)),
         [d] => Ok(Action::For(dur(d)?)),
-        _ => bail!("usage: perch maint [restart [DURATION] | DURATION | off]"),
+        _ => bail!("usage: perch maint [restart [DURATION] | cluster-restart [DURATION] | DURATION | off]"),
     }
 }
 
@@ -52,6 +61,7 @@ pub fn contents(action: &Action, now: DateTime<Utc>) -> Option<String> {
     match action {
         Action::Restart(d) => Some(format!("auto {}\n", until(d))),
         Action::For(d) => Some(format!("{}\n", until(d))),
+        Action::ClusterRestart(d) => Some(format!("cluster {}\n", until(d))),
         Action::Show | Action::Off => None,
     }
 }
@@ -79,6 +89,15 @@ pub fn describe(silence: &Silence) -> String {
             "MAINTENANCE: waiting for the validator to recover (deadline {})",
             deadline.format("%Y-%m-%dT%H:%M:%SZ")
         ),
+        Silence::ClusterRestart { deadline, phase } => format!(
+            "CLUSTER RESTART: {} (deadline {})",
+            match phase {
+                ClusterPhase::Running => "waiting for the cluster to halt",
+                ClusterPhase::Halted => "cluster halted, waiting for it to produce blocks again",
+                ClusterPhase::Restarted => "cluster producing again, waiting for the validator to recover",
+            },
+            deadline.format("%Y-%m-%dT%H:%M:%SZ")
+        ),
     }
 }
 
@@ -99,7 +118,7 @@ pub fn run(silence_file: Option<&str>, args: &[String]) -> Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("removing {path}")),
         },
-        Action::Restart(_) | Action::For(_) => {
+        Action::Restart(_) | Action::For(_) | Action::ClusterRestart(_) => {
             let body = contents(&action, now).unwrap_or_default();
             std::fs::write(path, body)
                 .with_context(|| format!("writing {path} (is this user in the perch group?)"))?;
@@ -114,6 +133,14 @@ pub fn run(silence_file: Option<&str>, args: &[String]) -> Result<()> {
         println!(
             "Paging is suppressed. Monitoring resumes by itself once the validator is \
              voting and healthy again, or at the deadline; Telegram tells you either way."
+        );
+    }
+    if matches!(action, Action::ClusterRestart(_)) {
+        println!(
+            "Every alert is held. Telegram says when the cluster halts, when the validator \
+             waits for and reaches supermajority, and when it produces blocks again. \
+             Monitoring resumes once this validator is voting and healthy, or at the \
+             deadline, which is extended while the validator waits if [diagnose] log is set."
         );
     }
     Ok(())
@@ -142,6 +169,14 @@ mod tests {
         assert_eq!(
             parse(&args(&["30m"])).unwrap(),
             Action::For(Duration::from_secs(1800))
+        );
+        assert_eq!(
+            parse(&args(&["cluster-restart"])).unwrap(),
+            Action::ClusterRestart(Duration::from_secs(12 * 3600))
+        );
+        assert_eq!(
+            parse(&args(&["cluster-restart", "8h"])).unwrap(),
+            Action::ClusterRestart(Duration::from_secs(8 * 3600))
         );
         assert!(parse(&args(&["restart", "soon"])).is_err());
         assert!(parse(&args(&["a", "b", "c"])).is_err());
@@ -184,6 +219,21 @@ mod tests {
                     .unwrap()
                     .with_timezone(&Utc)
             )
+        );
+
+        std::fs::write(
+            p,
+            contents(&Action::ClusterRestart(Duration::from_secs(8 * 3600)), now).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_silence(Some(p), now),
+            Silence::ClusterRestart {
+                deadline: DateTime::parse_from_rfc3339("2026-10-02T20:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                phase: ClusterPhase::Running,
+            }
         );
         std::fs::remove_file(p).unwrap();
     }

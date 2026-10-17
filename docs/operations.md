@@ -55,6 +55,98 @@ version waited for *no* check to be inconclusive, which could never happen on a
 freshly restarted watchtower — `disk_fill` is Unknown by design for its first 45
 minutes, so maintenance would have hung in exactly the situation it exists for.
 
+### Cluster restarts
+
+A coordinated cluster restart is different from restarting one validator: the
+whole cluster halts, operators bring their validators back on a new snapshot,
+and blocks resume only once a supermajority of stake is back. That can take
+hours, and nothing on the box is healthy until it is done. Arm a window on each
+box on that cluster before the restart begins:
+
+```sh
+perch maint cluster-restart        # or: perch maint cluster-restart 8h (default 12h)
+```
+
+```
+CLUSTER RESTART: waiting for the cluster to halt (deadline 2026-10-21T04:00:00Z)
+Every alert is held. Telegram says when the cluster halts and when it produces
+blocks again; monitoring resumes once it has and this validator is voting and
+healthy, or at the deadline.
+```
+
+Every alert from the box is held for the whole window, and Telegram gets the
+restart as it happens:
+
+```
+Cluster halted: testnet-1: no endpoint's slot has moved for 5 minutes; the
+cluster stopped near slot 451203317. Alerts stay held until it produces blocks
+again and this validator recovers (deadline 2026-10-21 04:00 UTC, extended for
+as long as the validator waits for supermajority).
+
+Waiting for supermajority: testnet-1: the validator is waiting for
+supermajority at slot 451203317; 61.2% of stake is visible in gossip, and 80%
+is needed. Alerts stay held, and the window will not expire while it waits.
+
+Supermajority reached: testnet-1: the validator reached supermajority with 81%
+of stake in gossip and is starting up. Alerts resume once it is voting and
+every check is healthy.
+
+Cluster restart complete — monitoring resumed: testnet-1: the cluster is
+producing blocks with 93.5% of stake active, and this validator is voting with
+every check healthy. Full alerting is back on.
+```
+
+Give perch the validator log so it can follow the wait itself:
+
+```toml
+[diagnose]
+log = "/home/sol/logs/agave-validator.log"
+```
+
+With the log, perch reads Agave's own wait-for-supermajority lines:
+
+- **The window cannot expire while the validator waits.** Some testnet restarts
+  wait longer than any deadline worth guessing up front. Each wait line pushes
+  the end of the window to two hours past it, which also leaves time to catch up
+  once the cluster starts. The extended end is what the hub is told, so it does
+  not report the box at the original deadline.
+- **The wait is the halt.** The window does not need five still minutes of
+  slots first.
+- **"Supermajority reached" is the restart.** It does not need two cycles of
+  slots moving first.
+- **The share of stake in gossip is a metric,**
+  `perch_cluster_restart_gossip_stake_percent`, so Grafana shows the climb to
+  80%.
+
+Without the log, slots alone drive the window and the deadline is fixed.
+Only appended lines are read each cycle, and the first read reaches back ten
+minutes. If the cluster restarts while this validator is still waiting, that is
+a problem to alert on: the wait stops holding the window, which then closes two
+hours after the last wait line.
+
+How it differs from `maint restart`:
+
+- **Only the cluster halting starts the work.** Operators stop their validators
+  before the cluster halts, so trouble on the box alone does not count. The
+  window cannot clear between your validator going down and the cluster
+  stopping.
+- **Slots are followed per endpoint.** The cluster usually resumes below the
+  highest slot seen before the halt, and endpoints come back at different times.
+  Any endpoint moving forward for two cycles in a row counts as producing again.
+  Stall baselines are reset at that point, so the abandoned fork's higher slots
+  do not keep the stall checks firing.
+- **A failed attempt goes back to waiting.** If the cluster halts again before
+  this validator has recovered, the window returns to halted.
+- **It survives a perch restart.** The phase is written into the silence file,
+  so a host reboot during the upgrade picks up where it left off.
+- **Resuming needs the same two clean cycles** as `maint restart`, with every
+  check healthy. That includes `cluster_stake`, so alerting stays held until
+  enough of the cluster is back above its floor.
+
+The deadline is still the backstop when nothing is waiting. If it passes, the
+window closes, alerting resumes, and Telegram says which stage the restart had
+reached.
+
 ### Maintenance reaches the hub
 
 A spoke **declares** its window in metrics, and the hub **remembers** it:
@@ -296,8 +388,9 @@ will fail the VAT check`, and `[diagnose]` picks that line up as a likely cause.
 
 When Alpenglow is scheduled on a cluster, perch enforces it at the very next
 boundary, as the runtime does. Once it is in force for the current epoch, the
-identity no longer pays for votes, so `identity_balance` stops paging and keeps
-only its Telegram warning.
+identity no longer pays for votes, so `identity_balance` stops alerting. What
+matters then is `vote_admission`: the vote account must hold the rent-exempt
+minimum plus the next epoch's VAT at every boundary.
 
 See [design.md](design.md#which-balance-matters-before-and-after-alpenglow)
 for the rules and where each one comes from in Agave.

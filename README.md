@@ -270,12 +270,15 @@ how close it is.
 
 ```sh
 perch maint restart      # suppress paging until the validator is back (1h deadline)
+perch maint cluster-restart  # hold alerts through a cluster restart (12h deadline)
 perch maint 30m          # plain timed silence
 perch maint off
 ```
 
 `maint restart` waits for the validator to actually go down, then resumes paging
-on its own once it is voting and healthy again. Log out and back in once after
+on its own once it is voting and healthy again. `maint cluster-restart` waits
+for the whole cluster to halt and produce blocks again, posting each stage to
+Telegram, then resumes once this validator is healthy. Log out and back in once after
 installing so the `perch` group membership takes effect.
 
 ### Next steps

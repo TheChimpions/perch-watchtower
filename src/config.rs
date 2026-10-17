@@ -1142,8 +1142,10 @@ pub struct JpoolBondCheckConfig {
     /// whatever the requirement.
     #[serde(default = "default_jpool_warn_sol")]
     pub warn_sol: f64,
-    /// Telegram note each time JPool draws on the bond (or it is withdrawn from).
-    #[serde(default = "yes")]
+    /// Telegram note each time JPool draws on the bond (or it is withdrawn
+    /// from). Off by default: claims land every epoch, and what matters is the
+    /// bond against the requirement, which the two bands already watch.
+    #[serde(default)]
     pub announce_drawdowns: bool,
     /// How often each endpoint is asked. Claims land once an epoch. Floored at 1m.
     #[serde(with = "humantime_serde", default = "default_pool_poll")]
@@ -1205,7 +1207,7 @@ fn default_jpool_bond() -> JpoolBondCheckConfig {
         security_sol_per_1000: default_jpool_security_sol_per_1000(),
         warn_coverage: default_jpool_warn_coverage(),
         warn_sol: default_jpool_warn_sol(),
-        announce_drawdowns: true,
+        announce_drawdowns: false,
         poll_interval: default_pool_poll(),
     }
 }
@@ -2282,6 +2284,17 @@ identity = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv"
         let c = Config::parse(MINIMAL).unwrap();
         assert_eq!(c.checks.identity_balance.page_sol, 0.5);
         assert_eq!(c.checks.identity_balance.warn_sol, 3.0);
+    }
+
+    /// Claims land every epoch; only the bond against the requirement alerts.
+    #[test]
+    fn jpool_drawdowns_are_not_announced_unless_asked() {
+        let c = Config::parse(MINIMAL).unwrap();
+        assert!(!c.checks.jpool_bond.announce_drawdowns);
+        let src = format!(
+            "{MINIMAL}\n[checks.jpool_bond]\npending_for = \"15m\"\nseverity = \"page\"\nannounce_drawdowns = true\n"
+        );
+        assert!(Config::parse(&src).unwrap().checks.jpool_bond.announce_drawdowns);
     }
 
     #[test]

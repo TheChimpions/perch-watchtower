@@ -341,9 +341,9 @@ alert_before_scheduled = false
 
 [checks.identity_balance]
 # Before Alpenglow the identity pays for every vote, so an empty one goes
-# delinquent and the critical band pages. Under Alpenglow votes cost nothing:
-# the critical band stops paging and one Telegram band covers everything below
-# warn_sol. The vote account is the balance that matters then (above).
+# delinquent and the critical band pages. Under Alpenglow votes cost nothing,
+# so neither band alerts. The vote account is the balance that matters then
+# (above).
 enabled = true
 # Telegram once when it crosses this.
 warn_sol = 3.0
@@ -409,8 +409,10 @@ security_sol_per_1000 = 0.5
 warn_coverage = 1.5
 # Telegram below this whatever the stake. JPool's documented minimum is 1 SOL.
 warn_sol = 1.0
-# Telegram note each time the bond goes down (a claim, or a withdrawal).
-announce_drawdowns = true
+# Telegram note each time the bond goes down (a claim, or a withdrawal). Off by
+# default: the two bands above already say when the bond is low against the
+# requirement, and claims land every epoch.
+announce_drawdowns = false
 poll_interval = "10m"
 pending_for = "15m"
 clear_after = 1
@@ -631,6 +633,10 @@ cache_for = "5m"
 # section to the alert -- panics, a full disk, no route to peers, the gateway
 # not answering ARP, DNS failures, a link flap, a restart. Matches are counted,
 # never quoted, because validator logs carry credentials.
+#
+# `log` on its own (no `validator`) is also what `perch maint cluster-restart`
+# reads to follow the wait for supermajority, and while the validator waits the
+# window cannot expire.
 #
 # The default unit sets ProtectHome, which hides a log under /home. Switch it to
 # `ProtectHome=tmpfs` and add `BindReadOnlyPaths=/home/sol/logs` to perch.service,

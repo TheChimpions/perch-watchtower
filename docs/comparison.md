@@ -57,7 +57,7 @@ thresholds: Telegram at 5 minutes, a page at 20.
 | Identity balance | yes, below 10 SOL ([L145–152](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L145-L152)) | yes, two bands (3 SOL notify, 0.5 SOL page), in epochs of voting left |
 | Vote account VAT balance (Alpenglow) | yes, once Alpenglow is active ([L346–363](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L346-L363), [L467–500](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L467-L500)) | yes, against the next boundary, with runway in epochs, and readiness shown before Alpenglow is scheduled |
 | BLS key registered (Alpenglow) | no | yes: a vote account without one is excluded whatever its balance |
-| Identity balance under Alpenglow | still alerts below 10 SOL | stops paging: votes no longer cost the identity anything |
+| Identity balance under Alpenglow | still alerts below 10 SOL | stops alerting: votes no longer cost the identity anything |
 | Commission changed | no | yes, pages immediately; compared in basis points, inflation and block revenue |
 | Delegation program minimum version | no | yes, for the current and next epoch |
 | Stake pool obligations (Vault invoices, JPool bond) | no | yes, found on-chain from the identity |

@@ -206,6 +206,9 @@ pub struct CycleReport<'a> {
     pub unix_time: u64,
     /// Unix deadline of an active maintenance window, or 0.
     pub maintenance_until: u64,
+    /// Share of stake a validator waiting for supermajority sees in gossip,
+    /// during a cluster-restart window.
+    pub restart_gossip_percent: Option<f64>,
     /// Unix time this process started. Lets a peer distinguish "has not cycled
     /// yet because it just booted" from "has not cycled because it is wedged".
     pub start_time: u64,
@@ -404,6 +407,15 @@ pub fn render(r: &CycleReport<'_>) -> String {
         &[],
         r.maintenance_until as f64,
     );
+
+    if let Some(p) = r.restart_gossip_percent {
+        e.metric(
+            "perch_cluster_restart_gossip_stake_percent",
+            "During a cluster restart, the share of activated stake the waiting validator sees in gossip; it starts at 80",
+            "gauge",
+        );
+        e.value("perch_cluster_restart_gossip_stake_percent", &[], p);
+    }
 
     e.metric(
         "perch_silenced",
@@ -1079,6 +1091,7 @@ mod notify_metrics {
             cycle_duration: Duration::from_secs(1),
             unix_time: 1_700_000_000,
             maintenance_until: 0,
+            restart_gossip_percent: None,
             start_time: 1_699_000_000,
             notify,
             maintenance_streak: 0,
@@ -1174,6 +1187,7 @@ mod version_metric {
             cycle_duration: Duration::from_secs(1),
             unix_time: 1_700_000_000,
             maintenance_until: 0,
+            restart_gossip_percent: None,
             start_time: 1_699_000_000,
             notify: NotifyCounts::default(),
             maintenance_streak: 0,
@@ -1228,7 +1242,7 @@ mod build_identity {
             snapshots: &[], host_snapshots: &[], peers: &[], is_owner: true, disk: &disk,
             outcomes: &[], states: &states, endpoint_health: &health, suppressed: &suppressed,
             visible: true, silenced: false, cycle_duration: Duration::from_secs(1),
-            unix_time: 1_700_000_000, maintenance_until: 0, start_time: 1_699_000_000,
+            unix_time: 1_700_000_000, maintenance_until: 0, restart_gossip_percent: None, start_time: 1_699_000_000,
             notify: NotifyCounts::default(), maintenance_streak: 0, maintenance_awaiting_work: false,
             watchtower_name: "t", solana_cluster: "unpinned", validator_labels: &HashMap::new(), alerting: crate::config::Alerting::Always,
             jpool_security_sol_per_1000: 0.5,
@@ -1272,6 +1286,7 @@ mod alpenglow_metrics {
             cycle_duration: Duration::from_secs(1),
             unix_time: 1_700_000_000,
             maintenance_until: 0,
+            restart_gossip_percent: None,
             start_time: 1_699_000_000,
             notify: NotifyCounts::default(),
             maintenance_streak: 0,

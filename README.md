@@ -133,7 +133,7 @@ disk and notification channel, and a ready-made Grafana dashboard.
 | `vote_admission` | notify / page | 10m | Alpenglow: BLS key and VAT balance for the next epoch boundary |
 | `commission_changed` | page | immediate | an unexpected change is a hijacked-identity signal |
 | `sfdp_version` | notify / page | — | below the delegation program's minimum version |
-| `vault_invoices` | notify / page | 15m | unpaid Vault invoices: 5 notify, 8 page, removal at 10 |
+| `vault_invoices` | notify / page | 15m | unpaid Vault invoices: 6 notify, 9 page, removal at 10 |
 | `jpool_bond` | notify / page | 15m | pages below the security requirement (0.5 SOL per 1,000 SOL of JPool stake); notifies under 1 SOL or 1.5x |
 | `node_behind` | page | 15m | a node *you operate* lagging or unreachable |
 | `disk_space` / `disk_fill` | notify / page | 10m / 15m | free-space floor and projected time-to-full |

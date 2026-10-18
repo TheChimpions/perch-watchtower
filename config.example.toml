@@ -381,9 +381,9 @@ announce_changes = false
 [checks.vault_invoices]
 enabled = true
 # Telegram at this many unpaid. Paying a few epochs at once is normal.
-warn_unpaid = 5
-# Pages at this many: about two epochs before removal.
-page_unpaid = 8
+warn_unpaid = 6
+# Pages at this many: one epoch before removal.
+page_unpaid = 9
 # Where the Vault removes a validator; only used to say how close it is.
 removal_at = 10
 # How often each endpoint is asked. Floored at 1m.
@@ -397,8 +397,9 @@ renotify_after = "12h"
 # JSOL bond, summed in SOL with JSOL at the pool's rate, against the stake the
 # pool delegates to the vote account (direct stake included). JPool's
 # requirement is a security part, below, plus an APY-shortfall part it computes
-# off-chain; JPool draws on the bond each epoch to cover that shortfall. Not in
-# JPool at all reads healthy.
+# off-chain; JPool draws on the bond each epoch to cover that shortfall. Only a
+# validator set up on JPool is judged: no bond account, or no stake from the
+# pool, reads healthy.
 [checks.jpool_bond]
 enabled = true
 # Pages below this many SOL per 1,000 SOL of JPool stake. The real requirement

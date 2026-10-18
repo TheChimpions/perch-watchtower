@@ -1153,12 +1153,12 @@ pub struct JpoolBondCheckConfig {
 }
 
 fn default_vault_warn_unpaid() -> u32 {
-    // Paying a few epochs at once is normal; five is ten days behind.
-    5
+    // Paying a few epochs at once is normal; six is four from removal.
+    6
 }
 fn default_vault_page_unpaid() -> u32 {
-    // Two invoices, roughly four days, before removal.
-    8
+    // One invoice, one epoch, before removal.
+    9
 }
 fn default_vault_removal_at() -> u32 {
     10

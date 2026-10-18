@@ -2082,6 +2082,7 @@ mod tests {
             vote_income: HashMap::new(),
             vault_invoices: HashMap::new(),
             jpool: HashMap::new(),
+            pools_refused: false,
             block_production: HashMap::new(),
             cluster_stake: None,
             transient_errors: vec![],

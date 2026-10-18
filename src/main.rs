@@ -54,6 +54,8 @@ enum Command {
     /// Declare planned work so it does not page.
     ///
     ///   perch maint restart [2h]   suppress until the validator is back (deadline 1h)
+    ///   perch maint cluster-restart [12h]
+    ///                              hold everything through a cluster restart (deadline 12h)
     ///   perch maint 30m            plain timed silence
     ///   perch maint off            resume paging now
     ///   perch maint                show current state
@@ -346,6 +348,7 @@ async fn main() -> Result<()> {
         maintenance_healthy_streak: 0,
         maintenance_window: None,
         maintenance_saw_trouble: false,
+        cluster_watch: None,
         peer_maintenance: restored.peer_maintenance.clone(),
         states: restored.states,
         announced: restored.announced,
@@ -431,6 +434,17 @@ async fn main() -> Result<()> {
     }
 }
 
+struct ClusterWatch {
+    deadline: chrono::DateTime<chrono::Utc>,
+    watch: perch::restart::Watch,
+    /// The validator log, when `[diagnose] log` names one.
+    tail: Option<perch::restart::LogTail>,
+    /// Whether an unreadable log has been reported for this window yet.
+    log_error_reported: bool,
+    /// Latest share of stake the waiting validator sees in gossip.
+    gossip_percent: Option<f64>,
+}
+
 struct Runtime {
     started_at_unix: u64,
     /// Consecutive clean cycles observed while in an `auto` maintenance window.
@@ -445,6 +459,9 @@ struct Runtime {
     /// before the operator has touched anything. Waiting for trouble first is
     /// what makes "arm it, then do the work" behave the way the name promises.
     maintenance_saw_trouble: bool,
+    /// What a cluster-restart window has seen, for the window whose deadline
+    /// it carries. Rebuilt from scratch for a new window.
+    cluster_watch: Option<ClusterWatch>,
     /// Peer name -> unix deadline of a maintenance window it declared.
     peer_maintenance: HashMap<String, u64>,
     states: HashMap<String, CheckState>,
@@ -868,13 +885,20 @@ async fn run_cycle(
             state::Silence::UntilRecovered { deadline } => {
                 !(rt.maintenance_window == Some(deadline) && rt.maintenance_saw_trouble)
             }
+            state::Silence::ClusterRestart { phase, .. } => phase == state::ClusterPhase::Running,
             _ => false,
         },
-        maintenance_until: match silence {
-            state::Silence::UntilRecovered { deadline } => deadline.timestamp().max(0) as u64,
-            state::Silence::Until(until) => until.timestamp().max(0) as u64,
-            state::Silence::None => 0,
+        maintenance_until: {
+            let declared = silence.deadline().map_or(0, |d| d.timestamp().max(0) as u64);
+            match (&silence, rt.cluster_watch.as_ref()) {
+                // Held open past its deadline while the validator waits.
+                (state::Silence::ClusterRestart { deadline, .. }, Some(cw)) if cw.deadline == *deadline => {
+                    declared.max(cw.watch.hold_until_unix().unwrap_or(0))
+                }
+                _ => declared,
+            }
         },
+        restart_gossip_percent: rt.cluster_watch.as_ref().and_then(|cw| cw.gossip_percent),
     });
     rt.metrics.set(match config.metrics.as_ref().and_then(|m| m.compat_prefix.as_deref()) {
         Some(prefix) => metrics::with_compat_alias(&rendered, prefix),
@@ -941,8 +965,17 @@ async fn run_cycle(
 
     // A maintenance window that waits for recovery, rather than a timer the
     // operator had to guess at up front.
-    if let state::Silence::UntilRecovered { deadline } = silence {
-        resolve_maintenance(config, notifier, rt, &outcomes, deadline, now_utc).await;
+    match silence {
+        state::Silence::UntilRecovered { deadline } => {
+            resolve_maintenance(config, notifier, rt, &outcomes, deadline, now_utc).await;
+        }
+        // Run even when this instance does not probe the cluster: it sees no
+        // slots then, so the window only ends at its deadline, but it does end.
+        state::Silence::ClusterRestart { deadline, phase } => {
+            resolve_cluster_restart(config, notifier, rt, &snapshots, &outcomes, deadline, phase, now_utc)
+                .await;
+        }
+        _ => {}
     }
 
     maybe_report_endpoints(config, notifier, rt, now).await;
@@ -1094,18 +1127,7 @@ async fn resolve_maintenance(
         rt.maintenance_healthy_streak = 0;
     }
 
-    let troubled: Vec<&str> = outcomes
-        .iter()
-        .filter(|o| matches!(o.verdict, Verdict::Unhealthy(_)))
-        .map(|o| o.id.as_str())
-        .collect();
-    // Only the recovery signals must be conclusive; a disk-fill projection still
-    // warming up says nothing about whether the validator came back.
-    let unconfirmed: Vec<&str> = outcomes
-        .iter()
-        .filter(|o| is_recovery_signal(&o.id) && matches!(o.verdict, Verdict::Unknown(_)))
-        .map(|o| o.id.as_str())
-        .collect();
+    let (troubled, unconfirmed) = recovery_blockers(outcomes);
 
     // The branch is decided by `maintenance_step` so the rule is testable on its
     // own; this function only carries it out.
@@ -1174,6 +1196,275 @@ async fn resolve_maintenance(
             body: format!(
                 "{} is voting and every check is healthy again. Full paging is back on.",
                 config.watchtower.name
+            ),
+        })
+        .await;
+}
+
+/// Checks reporting trouble, and recovery signals still inconclusive. Recovery
+/// needs both empty: only the recovery signals must be conclusive, because a
+/// disk-fill projection still warming up says nothing about whether the
+/// validator came back.
+fn recovery_blockers(outcomes: &[checks::CheckOutcome]) -> (Vec<&str>, Vec<&str>) {
+    let troubled = outcomes
+        .iter()
+        .filter(|o| matches!(o.verdict, Verdict::Unhealthy(_)))
+        .map(|o| o.id.as_str())
+        .collect();
+    let unconfirmed = outcomes
+        .iter()
+        .filter(|o| is_recovery_signal(&o.id) && matches!(o.verdict, Verdict::Unknown(_)))
+        .map(|o| o.id.as_str())
+        .collect();
+    (troubled, unconfirmed)
+}
+
+/// Follow a `cluster-restart` window: say when the cluster halts and when it
+/// produces blocks again, and resume alerting once it has and this validator
+/// is healthy on it. Everything on this box stays held until then, including
+/// trouble from operators stopping validators before the halt.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_cluster_restart(
+    config: &Config,
+    notifier: &Notifier,
+    rt: &mut Runtime,
+    snapshots: &[Snapshot],
+    outcomes: &[checks::CheckOutcome],
+    deadline: chrono::DateTime<chrono::Utc>,
+    phase: state::ClusterPhase,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) {
+    use perch::restart::{Event, Local, LogTail, Watch, HALT_AFTER_SECS};
+    use state::ClusterPhase;
+    let Some(path) = config.silence.file.as_deref() else {
+        return;
+    };
+    let name = &config.watchtower.name;
+    let deadline_text = deadline.format("%Y-%m-%d %H:%M UTC").to_string();
+    let end_window = |rt: &mut Runtime| {
+        let _ = std::fs::remove_file(path);
+        rt.cluster_watch = None;
+        rt.maintenance_healthy_streak = 0;
+    };
+
+    // A newly armed window starts its own watch; nothing is inherited.
+    if rt.cluster_watch.as_ref().map(|c| c.deadline) != Some(deadline) {
+        rt.cluster_watch = Some(ClusterWatch {
+            deadline,
+            watch: Watch::default(),
+            tail: config.diagnose.log.as_ref().map(LogTail::new),
+            log_error_reported: false,
+            gossip_percent: None,
+        });
+        rt.maintenance_healthy_streak = 0;
+    }
+    let Some(cw) = rt.cluster_watch.as_mut() else {
+        return;
+    };
+
+    // The log is read off the async runtime: the first read of a window can
+    // bisect a multi-gigabyte file.
+    let local = match cw.tail.take() {
+        None => Local::Unknown,
+        Some(mut tail) => {
+            let (tail, read) = tokio::task::spawn_blocking(move || {
+                let r = tail.poll(now_utc);
+                (tail, r)
+            })
+            .await
+            .unwrap_or_else(|e| panic!("log reader panicked: {e}"));
+            let local = match read {
+                Ok(()) => {
+                    cw.log_error_reported = false;
+                    tail.wait.local(now_utc)
+                }
+                Err(e) => {
+                    if !cw.log_error_reported {
+                        warn!(
+                            "cluster restart: cannot read validator log {}: {e}; following slots only",
+                            tail.path().display()
+                        );
+                        cw.log_error_reported = true;
+                    }
+                    Local::Unknown
+                }
+            };
+            cw.tail = Some(tail);
+            local
+        }
+    };
+    cw.gossip_percent = match local {
+        Local::Waiting { gossip_percent, .. } => gossip_percent,
+        _ => None,
+    };
+
+    let readings: Vec<(String, Option<u64>)> = snapshots
+        .iter()
+        .map(|s| (s.endpoint.clone(), s.epoch_info.as_ref().map(|e| e.absolute_slot)))
+        .collect();
+    let (next, event) = cw.watch.observe(phase, &readings, local, unix_now());
+    let expired = cw.watch.expired(deadline.timestamp().max(0) as u64, unix_now());
+    let previous = phase;
+    let phase = next;
+
+    if expired {
+        end_window(rt);
+        let (troubled, _) = recovery_blockers(outcomes);
+        let stage = match phase {
+            ClusterPhase::Running => "the cluster never halted",
+            ClusterPhase::Halted => "the cluster was still halted",
+            ClusterPhase::Restarted => "the cluster was producing blocks but this validator had not recovered",
+        };
+        warn!("cluster restart window expired ({stage}); alerting resumed");
+        notifier
+            .dispatch(&Alert {
+                kind: AlertKind::Info,
+                severity: Severity::Notify,
+                key: "cluster_restart".into(),
+                title: "Cluster restart window expired".into(),
+                body: format!(
+                    "{name}: the window ended at its deadline and {stage}, so alerting is back on. \
+                     {} check(s) still reporting trouble.",
+                    troubled.len()
+                ),
+            })
+            .await;
+        return;
+    }
+
+    if next != previous {
+        // The phase lives in the file so a perch restart keeps its place.
+        if let Err(e) = std::fs::write(path, state::cluster_restart_contents(deadline, next)) {
+            warn!("could not record cluster restart phase in {path}: {e}");
+        }
+    }
+
+    let stake = snapshots
+        .iter()
+        .filter_map(|s| s.cluster_stake.as_ref())
+        .filter(|cs| cs.total > 0)
+        .map(|cs| cs.current_percent())
+        .fold(None, |best: Option<f64>, p| Some(best.map_or(p, |b| b.max(p))));
+    let stake_text = stake.map_or_else(|| "not reported".to_string(), |p| format!("{p:.1}%"));
+
+    match event {
+        Some(Event::Halted { slot }) => {
+            rt.maintenance_healthy_streak = 0;
+            info!("cluster restart: cluster halted near slot {slot}");
+            notifier
+                .dispatch(&Alert {
+                    kind: AlertKind::Info,
+                    severity: Severity::Notify,
+                    key: "cluster_restart".into(),
+                    title: "Cluster halted".into(),
+                    body: format!(
+                        "{name}: no endpoint's slot has moved for {} minutes; the cluster stopped \
+                         near slot {slot}. Alerts stay held until it produces blocks again and this \
+                         validator recovers (deadline {deadline_text}{}).",
+                        HALT_AFTER_SECS / 60,
+                        if config.diagnose.log.is_some() {
+                            ", extended for as long as the validator waits for supermajority"
+                        } else {
+                            ""
+                        }
+                    ),
+                })
+                .await;
+        }
+        Some(Event::Waiting { slot, gossip_percent }) => {
+            rt.maintenance_healthy_streak = 0;
+            let at = slot.map_or_else(String::new, |s| format!(" at slot {s}"));
+            let seen = gossip_percent.map_or_else(
+                || "it has not yet reported how much stake it sees in gossip".to_string(),
+                |p| format!("{p:.1}% of stake is visible in gossip"),
+            );
+            info!("cluster restart: validator waiting for supermajority{at}");
+            notifier
+                .dispatch(&Alert {
+                    kind: AlertKind::Info,
+                    severity: Severity::Notify,
+                    key: "cluster_restart".into(),
+                    title: "Waiting for supermajority".into(),
+                    body: format!(
+                        "{name}: the validator is waiting for supermajority{at}; {seen}, and 80% is \
+                         needed. Alerts stay held, and the window will not expire while it waits."
+                    ),
+                })
+                .await;
+        }
+        Some(Event::SupermajorityReached { percent }) => {
+            rt.progress.rebaseline_after_cluster_restart();
+            let seen = percent.map_or_else(String::new, |p| format!(" with {p:.0}% of stake in gossip"));
+            info!("cluster restart: supermajority reached{seen}");
+            notifier
+                .dispatch(&Alert {
+                    kind: AlertKind::Info,
+                    severity: Severity::Notify,
+                    key: "cluster_restart".into(),
+                    title: "Supermajority reached".into(),
+                    body: format!(
+                        "{name}: the validator reached supermajority{seen} and is starting up. \
+                         Alerts resume once it is voting and every check is healthy."
+                    ),
+                })
+                .await;
+        }
+        Some(Event::Restarted { slot }) => {
+            // The restart resumes below the highest slot seen before the halt.
+            rt.progress.rebaseline_after_cluster_restart();
+            info!("cluster restart: cluster producing again at slot {slot}");
+            notifier
+                .dispatch(&Alert {
+                    kind: AlertKind::Info,
+                    severity: Severity::Notify,
+                    key: "cluster_restart".into(),
+                    title: "Cluster producing blocks again".into(),
+                    body: format!(
+                        "{name}: the cluster is past slot {slot} and advancing; active stake is \
+                         {stake_text}. Alerts resume once this validator is voting and every check \
+                         is healthy."
+                    ),
+                })
+                .await;
+        }
+        None => {}
+    }
+
+    if next != ClusterPhase::Restarted {
+        debug!("cluster restart: {next:?}, alerts held");
+        return;
+    }
+    let (troubled, unconfirmed) = recovery_blockers(outcomes);
+    // The halt was the trouble; the shared rule decides the rest.
+    match maintenance_step(false, troubled.len(), unconfirmed.len(), true, rt.maintenance_healthy_streak + 1) {
+        MaintenanceStep::Resume => {}
+        MaintenanceStep::Confirming => {
+            rt.maintenance_healthy_streak += 1;
+            debug!("cluster restart: first clean cycle, confirming");
+            return;
+        }
+        _ => {
+            rt.maintenance_healthy_streak = 0;
+            debug!(
+                "cluster restart: waiting, {} unhealthy / {} recovery signal(s) unconfirmed",
+                troubled.len(),
+                unconfirmed.len()
+            );
+            return;
+        }
+    }
+
+    end_window(rt);
+    info!("cluster restart complete; alerting resumed");
+    notifier
+        .dispatch(&Alert {
+            kind: AlertKind::Info,
+            severity: Severity::Notify,
+            key: "cluster_restart".into(),
+            title: "Cluster restart complete \u{2014} monitoring resumed".into(),
+            body: format!(
+                "{name}: the cluster is producing blocks with {stake_text} of stake active, and \
+                 this validator is voting with every check healthy. Full alerting is back on."
             ),
         })
         .await;
@@ -1791,6 +2082,7 @@ mod tests {
             vote_income: HashMap::new(),
             vault_invoices: HashMap::new(),
             jpool: HashMap::new(),
+            pools_refused: false,
             block_production: HashMap::new(),
             cluster_stake: None,
             transient_errors: vec![],

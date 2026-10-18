@@ -341,9 +341,9 @@ alert_before_scheduled = false
 
 [checks.identity_balance]
 # Before Alpenglow the identity pays for every vote, so an empty one goes
-# delinquent and the critical band pages. Under Alpenglow votes cost nothing:
-# the critical band stops paging and one Telegram band covers everything below
-# warn_sol. The vote account is the balance that matters then (above).
+# delinquent and the critical band pages. Under Alpenglow votes cost nothing,
+# so neither band alerts. The vote account is the balance that matters then
+# (above).
 enabled = true
 # Telegram once when it crosses this.
 warn_sol = 3.0
@@ -381,9 +381,9 @@ announce_changes = false
 [checks.vault_invoices]
 enabled = true
 # Telegram at this many unpaid. Paying a few epochs at once is normal.
-warn_unpaid = 5
-# Pages at this many: about two epochs before removal.
-page_unpaid = 8
+warn_unpaid = 6
+# Pages at this many: one epoch before removal.
+page_unpaid = 9
 # Where the Vault removes a validator; only used to say how close it is.
 removal_at = 10
 # How often each endpoint is asked. Floored at 1m.
@@ -397,8 +397,9 @@ renotify_after = "12h"
 # JSOL bond, summed in SOL with JSOL at the pool's rate, against the stake the
 # pool delegates to the vote account (direct stake included). JPool's
 # requirement is a security part, below, plus an APY-shortfall part it computes
-# off-chain; JPool draws on the bond each epoch to cover that shortfall. Not in
-# JPool at all reads healthy.
+# off-chain; JPool draws on the bond each epoch to cover that shortfall. Only a
+# validator set up on JPool is judged: no bond account, or no stake from the
+# pool, reads healthy.
 [checks.jpool_bond]
 enabled = true
 # Pages below this many SOL per 1,000 SOL of JPool stake. The real requirement
@@ -409,8 +410,10 @@ security_sol_per_1000 = 0.5
 warn_coverage = 1.5
 # Telegram below this whatever the stake. JPool's documented minimum is 1 SOL.
 warn_sol = 1.0
-# Telegram note each time the bond goes down (a claim, or a withdrawal).
-announce_drawdowns = true
+# Telegram note each time the bond goes down (a claim, or a withdrawal). Off by
+# default: the two bands above already say when the bond is low against the
+# requirement, and claims land every epoch.
+announce_drawdowns = false
 poll_interval = "10m"
 pending_for = "15m"
 clear_after = 1
@@ -631,6 +634,10 @@ cache_for = "5m"
 # section to the alert -- panics, a full disk, no route to peers, the gateway
 # not answering ARP, DNS failures, a link flap, a restart. Matches are counted,
 # never quoted, because validator logs carry credentials.
+#
+# `log` on its own (no `validator`) is also what `perch maint cluster-restart`
+# reads to follow the wait for supermajority, and while the validator waits the
+# window cannot expire.
 #
 # The default unit sets ProtectHome, which hides a log under /home. Switch it to
 # `ProtectHome=tmpfs` and add `BindReadOnlyPaths=/home/sol/logs` to perch.service,

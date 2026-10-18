@@ -17,6 +17,7 @@ pub mod notify;
 pub mod peer;
 pub mod persist;
 pub mod pools;
+pub mod restart;
 pub mod rpc;
 pub mod selfcheck;
 pub mod sfdp;

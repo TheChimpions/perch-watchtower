@@ -213,6 +213,10 @@ pub struct Snapshot {
     pub vault_invoices: HashMap<String, Result<Vec<crate::pools::Invoice>, String>>,
     /// Identity pubkey -> its JPool bonds and the pool's stake on it.
     pub jpool: HashMap<String, Result<crate::pools::JpoolPosition, String>>,
+    /// The endpoint refused a pool scan outright (an auth or plan limit, such
+    /// as publicnode's "indexed requests require a personal token"). It can
+    /// never answer the pool checks, so it must not count toward their quorum.
+    pub pools_refused: bool,
     /// Transport-level trouble seen while building this snapshot. Reported in
     /// the endpoint-health digest; never alerted on directly.
     pub transient_errors: Vec<String>,
@@ -240,6 +244,7 @@ impl Snapshot {
             vote_income: HashMap::new(),
             vault_invoices: HashMap::new(),
             jpool: HashMap::new(),
+            pools_refused: false,
             transient_errors: Vec::new(),
             config_errors: Vec::new(),
         }
@@ -588,6 +593,7 @@ async fn fetch_pools(
             if let Some(vote) = &vote {
                 let r = fetch_invoices(endpoint, vote, vault.poll_interval.max(floor)).await;
                 if let Err(FetchError::Rpc(e)) = &r {
+                    snap.pools_refused |= matches!(e, crate::rpc::RpcError::Config(_));
                     snap.record(e.clone());
                 }
                 snap.vault_invoices.insert(v.identity.clone(), r.map_err(|e| e.to_string()));
@@ -596,6 +602,7 @@ async fn fetch_pools(
         if jpool.base.enabled {
             let r = fetch_jpool(endpoint, &v.identity, vote.as_deref(), jpool.poll_interval.max(floor)).await;
             if let Err(FetchError::Rpc(e)) = &r {
+                snap.pools_refused |= matches!(e, crate::rpc::RpcError::Config(_));
                 snap.record(e.clone());
             }
             snap.jpool.insert(v.identity.clone(), r.map_err(|e| e.to_string()));

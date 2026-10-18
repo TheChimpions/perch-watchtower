@@ -76,7 +76,9 @@ const SIGNATURES: &[Signature] = &[
         cause: "PoH fell behind (CPU starved or throttled)",
     },
     Signature {
-        needle: "Waiting for supermajority",
+        // Agave: "Waiting for 80% of activated stake at slot N to be in
+        // gossip...". The words "waiting for supermajority" never appear.
+        needle: "% of activated stake at slot",
         cause: "the validator is waiting for supermajority (cluster restart)",
     },
     Signature {
@@ -95,7 +97,7 @@ pub struct LogFinding {
 
 /// Agave writes `[2026-09-30T06:07:11.261801371Z WARN  target] message`.
 /// Continuation lines (a multi-line panic, a debug dump) carry no timestamp.
-fn line_time(line: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn line_time(line: &str) -> Option<DateTime<Utc>> {
     let rest = line.strip_prefix('[')?;
     let stamp = rest.split(' ').next()?;
     DateTime::parse_from_rfc3339(stamp)
@@ -126,7 +128,7 @@ fn first_time_from(file: &mut File, offset: u64) -> Option<DateTime<Utc>> {
 /// Byte offset of roughly the first line written at or after `since`, found by
 /// bisection so a multi-gigabyte log costs a few dozen small reads, not a scan.
 /// Never further back than `max_bytes` from the end.
-fn offset_for(file: &mut File, len: u64, since: DateTime<Utc>, max_bytes: u64) -> u64 {
+pub(crate) fn offset_for(file: &mut File, len: u64, since: DateTime<Utc>, max_bytes: u64) -> u64 {
     let mut lo = len.saturating_sub(max_bytes);
     let mut hi = len;
     while hi - lo > 64 * 1024 {
@@ -454,6 +456,19 @@ mod tests {
         );
         assert_eq!(route.first, t("2026-09-30T06:02:00Z"));
         assert!(found.iter().any(|f| f.cause.contains("ARP")));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Agave's wording, from core/src/validator.rs. The earlier needle,
+    /// "Waiting for supermajority", appears nowhere in it.
+    #[test]
+    fn recognises_agaves_wait_for_supermajority_line() {
+        let lines = vec![
+            "[2026-10-21T03:00:00.000000000Z INFO  solana_core::validator] Waiting for 80% of activated stake at slot 451203317 to be in gossip...".to_string(),
+        ];
+        let path = write_log("wfsm", &lines);
+        let found = scan_log(&path, t("2026-10-21T02:50:00Z"), 1 << 30).unwrap();
+        assert!(found.iter().any(|f| f.cause.contains("waiting for supermajority")), "{found:?}");
         std::fs::remove_file(path).unwrap();
     }
 

@@ -370,12 +370,71 @@ pub enum Silence {
     UntilRecovered {
         deadline: chrono::DateTime<chrono::Utc>,
     },
+    /// A coordinated cluster restart: hold every alert while the cluster is
+    /// halted, say when it halts and when it produces blocks again, and resume
+    /// only once the cluster is back and this validator is healthy on it.
+    ///
+    /// Unlike `UntilRecovered`, trouble on this box alone never counts as the
+    /// work having started: operators stop their validators before the cluster
+    /// halts, and resuming on that would page through the restart itself.
+    /// `phase` is written back into the file, so a perch restart mid-window
+    /// (a host reboot during the upgrade, say) keeps its place.
+    ClusterRestart {
+        deadline: chrono::DateTime<chrono::Utc>,
+        phase: ClusterPhase,
+    },
+}
+
+/// How far a cluster restart has got, as this watchtower has seen it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterPhase {
+    /// Armed; the cluster is still producing blocks.
+    Running,
+    /// No endpoint's slot has moved for the halt threshold.
+    Halted,
+    /// Producing blocks again after a halt; waiting for full recovery.
+    Restarted,
+}
+
+impl ClusterPhase {
+    fn word(self) -> &'static str {
+        match self {
+            ClusterPhase::Running => "running",
+            ClusterPhase::Halted => "halted",
+            ClusterPhase::Restarted => "restarted",
+        }
+    }
+
+    fn parse(s: &str) -> Option<ClusterPhase> {
+        match s {
+            "running" => Some(ClusterPhase::Running),
+            "halted" => Some(ClusterPhase::Halted),
+            "restarted" => Some(ClusterPhase::Restarted),
+            _ => None,
+        }
+    }
 }
 
 impl Silence {
     pub fn suppresses_paging(&self) -> bool {
         !matches!(self, Silence::None)
     }
+
+    /// When the window ends at the latest, if it has an end.
+    pub fn deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Silence::None => None,
+            Silence::Until(t) => Some(*t),
+            Silence::UntilRecovered { deadline } | Silence::ClusterRestart { deadline, .. } => {
+                Some(*deadline)
+            }
+        }
+    }
+}
+
+/// The silence file body for a cluster-restart window.
+pub fn cluster_restart_contents(deadline: chrono::DateTime<chrono::Utc>, phase: ClusterPhase) -> String {
+    format!("cluster {} {}\n", deadline.format("%Y-%m-%dT%H:%M:%SZ"), phase.word())
 }
 
 /// Read the silence file.
@@ -384,6 +443,9 @@ impl Silence {
 ///   (empty)                        open-ended
 ///   2026-09-18T04:30:00Z           until that time
 ///   auto 2026-09-18T04:30:00Z      until recovered, or that deadline
+///   cluster 2026-09-18T04:30:00Z   until the cluster restarts and this
+///                                  validator recovers, or that deadline;
+///                                  perch appends the phase it has reached
 pub fn read_silence(path: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> Silence {
     let Some(path) = path else {
         return Silence::None;
@@ -396,6 +458,21 @@ pub fn read_silence(path: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> S
     if trimmed.is_empty() {
         // Far-future stand-in for "no end given".
         return Silence::Until(now + chrono::Duration::days(3650));
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("cluster") {
+        let mut words = rest.split_whitespace();
+        // Same backstop as `auto`: no readable deadline is an hour, not forever.
+        let deadline = words
+            .next()
+            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|| now + chrono::Duration::hours(1));
+        let phase = words
+            .next()
+            .and_then(ClusterPhase::parse)
+            .unwrap_or(ClusterPhase::Running);
+        return Silence::ClusterRestart { deadline, phase };
     }
 
     if let Some(rest) = trimmed.strip_prefix("auto") {
@@ -911,6 +988,47 @@ mod tests {
                 assert!((55..=65).contains(&hours), "got {hours} minutes");
             }
             other => panic!("expected UntilRecovered, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cluster_restart_window_round_trips_its_phase() {
+        let dir = std::env::temp_dir().join(format!("perch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("silence");
+        let p = path.to_str().unwrap();
+        let now = chrono::Utc::now();
+        let deadline = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for phase in [ClusterPhase::Running, ClusterPhase::Halted, ClusterPhase::Restarted] {
+            std::fs::write(&path, cluster_restart_contents(deadline, phase)).unwrap();
+            assert_eq!(read_silence(Some(p), now), Silence::ClusterRestart { deadline, phase });
+        }
+        // What `perch maint cluster-restart` writes: no phase yet.
+        std::fs::write(&path, "cluster 2099-01-01T00:00:00Z\n").unwrap();
+        assert_eq!(
+            read_silence(Some(p), now),
+            Silence::ClusterRestart { deadline, phase: ClusterPhase::Running }
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cluster_restart_window_without_a_deadline_defaults_to_an_hour() {
+        let dir = std::env::temp_dir().join(format!("perch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("silence");
+        std::fs::write(&path, "cluster").unwrap();
+        let now = chrono::Utc::now();
+        match read_silence(Some(path.to_str().unwrap()), now) {
+            Silence::ClusterRestart { deadline, phase } => {
+                let minutes = (deadline - now).num_minutes();
+                assert!((55..=65).contains(&minutes), "got {minutes} minutes");
+                assert_eq!(phase, ClusterPhase::Running);
+            }
+            other => panic!("expected ClusterRestart, got {other:?}"),
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

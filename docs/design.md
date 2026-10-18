@@ -221,8 +221,8 @@ when rewards were last withdrawn: across one real fleet it read anything from
 identity stops paying for them. On five testnet validators the identity fell
 about 1.9 SOL a day until the switch to Alpenglow, and has risen slowly since,
 on block fees alone. An empty identity no longer stops a validator voting, so
-`identity_balance` stops paging once Alpenglow governs the current epoch and
-drops to a single Telegram band.
+`identity_balance` stops alerting altogether once Alpenglow governs the current
+epoch. The balance stays in metrics and `perch status`.
 
 The vote account takes over (SIMD-0357). At the first slot of every epoch N+1
 the runtime decides which vote accounts take part in epoch N+2, and admits only
@@ -342,22 +342,24 @@ perfectly healthy. Perch reads two of them straight from the pools' programs:
 - **The Vault** bills each validator in vSOL, one `Invoice` account per epoch
   (program `EpoivtVh9dgWFxE6MYgF3YnobYWtZr2VfCuP7iT3N927`). Paying one zeroes
   its outstanding amount; ten unpaid and the Vault removes the validator.
-  `vault_invoices_warn` notifies at 5 unpaid, `vault_invoices_critical` pages
-  at 8, counted in the vault where the validator is furthest behind.
+  `vault_invoices_warn` notifies at 6 unpaid, `vault_invoices_critical` pages
+  at 9, counted in the vault where the validator is furthest behind.
 - **JPool** holds a bond against each validator (program
   `BondQ7KqZreTcW2UbeTNDcLCJQ3aXAtLn2Fm6ftaJDU`): the legacy SOL bond, the JSOL
   bond, or both, summed in SOL with JSOL at the pool's exchange rate. JPool
   claims from it each epoch the validator falls short of its target APY.
+  Only a validator set up on JPool is judged: one with a bond account and
+  stake from the pool. Either missing reads healthy.
   `jpool_bond_critical` pages when the bond is below the security requirement,
   0.5 SOL per 1,000 SOL of JPool stake. `jpool_bond_warn` notifies below JPool's
   documented 1 SOL minimum, or when the bond covers the security requirement
-  by less than 1.5x. Each time the bond goes down perch sends a Telegram note
-  with the amount.
+  by less than 1.5x. With `announce_drawdowns = true`, each drawdown also gets
+  a Telegram note with the amount.
 
 ```
-chimpions has 8 unpaid Vault invoices (epochs 1042-1049, 0.2160 vSOL owed to
-vault Fn5F...); the Vault removes a validator at 10, 2 more invoices (about 4
-days) away.
+chimpions has 9 unpaid Vault invoices (epochs 1042-1050, 0.2430 vSOL owed to
+vault Fn5F...); the Vault removes a validator at 10, 1 more invoice (1 epoch)
+away.
 ```
 
 Neither needs configuring. Invoices are found from the vote account the cluster
@@ -374,8 +376,8 @@ part exactly and treats it as a floor. The full requirement is never lower, so
 a bond below it is certainly under 100% health, with no false positive possible
 from the part perch cannot see. The cost is the other direction: a bond above
 the security requirement can still be under 100% if the shortfall part is
-large, which the drawdown notes and the 1.5x headroom warning are there to
-catch early.
+large, which the 1.5x headroom warning is there to catch early. Per-claim
+drawdown notes are available with `announce_drawdowns = true`, off by default.
 
 ```
 chimpions JPool bond is 0.8000 SOL, below the 1.0000 SOL security requirement

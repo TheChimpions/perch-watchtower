@@ -33,6 +33,9 @@ use serde_json::Value;
 
 pub const ALPENGLOW_FEATURE: &str = "A1pengvuM6JEcyNuTnMqepBKhwHE3N6PmUrdATGawhJS";
 
+/// The feature program. Only an account it owns is a feature.
+pub const FEATURE_PROGRAM: &str = "Feature111111111111111111111111111111111111";
+
 /// `VoteStateV4::size_of()`: the same as V3, so accounts never need resizing.
 pub const VOTE_STATE_V4_SIZE: u64 = 3762;
 
@@ -85,8 +88,17 @@ impl FeatureState {
     /// A feature account is bincode `Feature { activated_at: Option<u64> }`.
     /// The RPC hands it back as `[base64, "base64"]` even under jsonParsed,
     /// because nothing parses the feature program's accounts.
+    ///
+    /// Anyone can send SOL to a feature's address, which leaves a
+    /// system-owned account with no data there. The runtime only activates
+    /// accounts the feature program owns, so that is not scheduled -- mainnet's
+    /// Alpenglow address read exactly so on 2026-10-19, and parsing it as a
+    /// feature left every vote_admission check inconclusive.
     pub fn from_account(account: &Value) -> Option<FeatureState> {
         if account.is_null() {
+            return Some(FeatureState::Absent);
+        }
+        if account["owner"].as_str()? != FEATURE_PROGRAM {
             return Some(FeatureState::Absent);
         }
         let b64 = account["data"].get(0)?.as_str()?;
@@ -489,7 +501,7 @@ mod tests {
         if let Some(s) = active_at {
             d.extend_from_slice(&s.to_le_bytes());
         }
-        json!({"data": [base64::engine::general_purpose::STANDARD.encode(d), "base64"], "lamports": 1})
+        json!({"data": [base64::engine::general_purpose::STANDARD.encode(d), "base64"], "lamports": 1, "owner": FEATURE_PROGRAM})
     }
 
     /// testnet, measured: epoch 1049 at slot 447,765,650, with Alpenglow
@@ -557,11 +569,33 @@ mod tests {
             Some(FeatureState::Active(444_620_256))
         );
         // What testnet actually returned for the Alpenglow feature account.
-        let real = json!({"data": ["AeBdgBoAAAAA", "base64"]});
+        let real = json!({"data": ["AeBdgBoAAAAA", "base64"], "owner": FEATURE_PROGRAM});
         assert_eq!(
             FeatureState::from_account(&real),
             Some(FeatureState::Active(0x1a80_5de0))
         );
+    }
+
+    /// What mainnet returned for the Alpenglow address on 2026-10-19: SOL sent
+    /// to it, so a system-owned account with no data. Not a feature yet.
+    #[test]
+    fn a_funded_address_the_feature_program_does_not_own_is_not_scheduled() {
+        let funded = json!({
+            "data": ["", "base64"],
+            "lamports": 1_000_000,
+            "owner": "11111111111111111111111111111111",
+            "space": 0
+        });
+        assert_eq!(FeatureState::from_account(&funded), Some(FeatureState::Absent));
+    }
+
+    /// An account the feature program owns but whose data cannot be read is
+    /// still unknown, never silently "not scheduled".
+    #[test]
+    fn an_unreadable_feature_account_stays_unknown() {
+        let bad = json!({"data": ["", "base64"], "owner": FEATURE_PROGRAM});
+        assert_eq!(FeatureState::from_account(&bad), None);
+        assert_eq!(FeatureState::from_account(&json!({"data": ["AQ==", "base64"]})), None, "no owner, no answer");
     }
 
     #[test]

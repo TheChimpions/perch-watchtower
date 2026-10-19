@@ -28,8 +28,8 @@ between arming it and touching the box. Once something does go wrong, it starts
 watching for recovery, and clears itself when the validator is genuinely back:
 
 ```
-Back online — monitoring resumed: chimps-1 is voting and every check is
-healthy again. Full paging is back on.
+Back online — monitoring resumed: chimps-1 is voting and caught up again.
+Full paging is back on.
 ```
 
 Two metrics make the wait legible rather than opaque:
@@ -50,10 +50,14 @@ Three deliberate properties:
 - **It needs two clean cycles**, because a validator often looks briefly fine
   mid-restart before the next check catches up.
 
-Recovery is judged only on the checks that show the validator voting. An earlier
-version waited for *no* check to be inconclusive, which could never happen on a
-freshly restarted watchtower — `disk_fill` is Unknown by design for its first 45
-minutes, so maintenance would have hung in exactly the situation it exists for.
+The window starts and ends on the checks that show the validator voting:
+`vote_delinquent`, `vote_lag`, `root_lag`, `vote_stalled` and `node_behind`.
+Nothing else is caused by a restart. A JPool bond warning that has been firing
+for a day does not hold the window open, and it does not count as the work
+having started. Anything else still wrong keeps alerting once paging is back
+on. An earlier version waited for *no* check to be inconclusive, which could
+never happen on a freshly restarted watchtower: `disk_fill` is Unknown by
+design for its first 45 minutes.
 
 ### Cluster restarts
 
@@ -89,11 +93,11 @@ is needed. Alerts stay held, and the window will not expire while it waits.
 
 Supermajority reached: testnet-1: the validator reached supermajority with 81%
 of stake in gossip and is starting up. Alerts resume once it is voting and
-every check is healthy.
+caught up.
 
 Cluster restart complete — monitoring resumed: testnet-1: the cluster is
-producing blocks with 93.5% of stake active, and this validator is voting with
-every check healthy. Full alerting is back on.
+producing blocks with 93.5% of stake active, and this validator is voting and
+caught up. Full alerting is back on.
 ```
 
 Give perch the validator log so it can follow the wait itself:
@@ -139,9 +143,10 @@ How it differs from `maint restart`:
   this validator has recovered, the window returns to halted.
 - **It survives a perch restart.** The phase is written into the silence file,
   so a host reboot during the upgrade picks up where it left off.
-- **Resuming needs the same two clean cycles** as `maint restart`, with every
-  check healthy. That includes `cluster_stake`, so alerting stays held until
-  enough of the cluster is back above its floor.
+- **Resuming needs the same two clean cycles** as `maint restart`, on the same
+  vote checks plus `cluster_stalled` and `cluster_stake`. Alerting stays held
+  until the cluster is producing blocks and enough of it is back above the
+  stake floor.
 
 The deadline is still the backstop when nothing is waiting. If it passes, the
 window closes, alerting resumes, and Telegram says which stage the restart had

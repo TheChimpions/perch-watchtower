@@ -983,10 +983,14 @@ async fn run_cycle(
 
 /// Checks that actually indicate the validator is back.
 ///
-/// Recovery is judged only on these. An earlier version required *every* check
-/// to be conclusive, which could never happen on a freshly restarted watchtower:
-/// `disk_fill` is Unknown by design until it has 45 minutes of history, so
-/// maintenance would never clear in exactly the situation it exists for.
+/// A maintenance window starts, and ends, on these alone. An earlier version
+/// required *every* check to be conclusive, which could never happen on a
+/// freshly restarted watchtower: `disk_fill` is Unknown by design until it has
+/// 45 minutes of history. A later one required every check to be healthy, so a
+/// JPool bond warning that had been firing for a day held refi-main's window
+/// open long after it was voting again -- and an unrelated warning counted as
+/// the work having started. Nothing outside this list is caused by a restart,
+/// and anything else still wrong keeps alerting once paging is back on.
 fn is_recovery_signal(check_id: &str) -> bool {
     [
         "vote_delinquent:",
@@ -1127,7 +1131,7 @@ async fn resolve_maintenance(
         rt.maintenance_healthy_streak = 0;
     }
 
-    let (troubled, unconfirmed) = recovery_blockers(outcomes);
+    let (troubled, unconfirmed) = recovery_blockers(outcomes, &[]);
 
     // The branch is decided by `maintenance_step` so the rule is testable on its
     // own; this function only carries it out.
@@ -1153,8 +1157,8 @@ async fn resolve_maintenance(
                     key: "maintenance".into(),
                     title: "Maintenance window expired".into(),
                     body: format!(
-                        "The validator did not return to health before the deadline, so paging is back on. {} check(s) still reporting trouble. A restart that does not finish is an outage, not maintenance.",
-                        troubled.len()
+                        "The validator was not voting and caught up by the deadline, so paging is back on. {} A restart that does not finish is an outage, not maintenance.",
+                        still_failing(&troubled)
                     ),
                 })
                 .await;
@@ -1194,7 +1198,7 @@ async fn resolve_maintenance(
             key: "maintenance".into(),
             title: "Back online \u{2014} monitoring resumed".into(),
             body: format!(
-                "{} is voting and every check is healthy again. Full paging is back on.",
+                "{} is voting and caught up again. Full paging is back on.",
                 config.watchtower.name
             ),
         })
@@ -1205,19 +1209,36 @@ async fn resolve_maintenance(
 /// needs both empty: only the recovery signals must be conclusive, because a
 /// disk-fill projection still warming up says nothing about whether the
 /// validator came back.
-fn recovery_blockers(outcomes: &[checks::CheckOutcome]) -> (Vec<&str>, Vec<&str>) {
+fn recovery_blockers<'a>(
+    outcomes: &'a [checks::CheckOutcome],
+    also: &[&str],
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    let watched = |id: &str| is_recovery_signal(id) || also.contains(&id);
     let troubled = outcomes
         .iter()
-        .filter(|o| matches!(o.verdict, Verdict::Unhealthy(_)))
+        .filter(|o| watched(&o.id) && matches!(o.verdict, Verdict::Unhealthy(_)))
         .map(|o| o.id.as_str())
         .collect();
     let unconfirmed = outcomes
         .iter()
-        .filter(|o| is_recovery_signal(&o.id) && matches!(o.verdict, Verdict::Unknown(_)))
+        .filter(|o| watched(&o.id) && matches!(o.verdict, Verdict::Unknown(_)))
         .map(|o| o.id.as_str())
         .collect();
     (troubled, unconfirmed)
 }
+
+/// "Still failing: vote_lag:chimps-1." for an expiry note, or nothing.
+fn still_failing(troubled: &[&str]) -> String {
+    if troubled.is_empty() {
+        String::new()
+    } else {
+        format!("Still failing: {}.", troubled.join(", "))
+    }
+}
+
+/// A cluster restart is over only when the whole cluster is back: producing
+/// blocks and with stake above its floor, as well as this validator voting.
+const CLUSTER_RECOVERY_CHECKS: &[&str] = &["cluster_stalled", "cluster_stake"];
 
 /// Follow a `cluster-restart` window: say when the cluster halts and when it
 /// produces blocks again, and resume alerting once it has and this validator
@@ -1309,7 +1330,7 @@ async fn resolve_cluster_restart(
 
     if expired {
         end_window(rt);
-        let (troubled, _) = recovery_blockers(outcomes);
+        let (troubled, _) = recovery_blockers(outcomes, CLUSTER_RECOVERY_CHECKS);
         let stage = match phase {
             ClusterPhase::Running => "the cluster never halted",
             ClusterPhase::Halted => "the cluster was still halted",
@@ -1323,9 +1344,8 @@ async fn resolve_cluster_restart(
                 key: "cluster_restart".into(),
                 title: "Cluster restart window expired".into(),
                 body: format!(
-                    "{name}: the window ended at its deadline and {stage}, so alerting is back on. \
-                     {} check(s) still reporting trouble.",
-                    troubled.len()
+                    "{name}: the window ended at its deadline and {stage}, so alerting is back on. {}",
+                    still_failing(&troubled)
                 ),
             })
             .await;
@@ -1404,7 +1424,7 @@ async fn resolve_cluster_restart(
                     title: "Supermajority reached".into(),
                     body: format!(
                         "{name}: the validator reached supermajority{seen} and is starting up. \
-                         Alerts resume once it is voting and every check is healthy."
+                         Alerts resume once it is voting and caught up."
                     ),
                 })
                 .await;
@@ -1421,8 +1441,8 @@ async fn resolve_cluster_restart(
                     title: "Cluster producing blocks again".into(),
                     body: format!(
                         "{name}: the cluster is past slot {slot} and advancing; active stake is \
-                         {stake_text}. Alerts resume once this validator is voting and every check \
-                         is healthy."
+                         {stake_text}. Alerts resume once this validator is voting and caught up, \
+                         and stake is back above its floor."
                     ),
                 })
                 .await;
@@ -1434,7 +1454,7 @@ async fn resolve_cluster_restart(
         debug!("cluster restart: {next:?}, alerts held");
         return;
     }
-    let (troubled, unconfirmed) = recovery_blockers(outcomes);
+    let (troubled, unconfirmed) = recovery_blockers(outcomes, CLUSTER_RECOVERY_CHECKS);
     // The halt was the trouble; the shared rule decides the rest.
     match maintenance_step(false, troubled.len(), unconfirmed.len(), true, rt.maintenance_healthy_streak + 1) {
         MaintenanceStep::Resume => {}
@@ -1464,7 +1484,7 @@ async fn resolve_cluster_restart(
             title: "Cluster restart complete \u{2014} monitoring resumed".into(),
             body: format!(
                 "{name}: the cluster is producing blocks with {stake_text} of stake active, and \
-                 this validator is voting with every check healthy. Full alerting is back on."
+                 this validator is voting and caught up. Full alerting is back on."
             ),
         })
         .await;
@@ -2224,6 +2244,68 @@ mod tests {
         assert!(!is_recovery_signal("disk_fill_critical:hw /mnt/ledger"));
         assert!(!is_recovery_signal("identity_balance_warn:chimps-1"));
         assert!(!is_recovery_signal("cluster_stalled"));
+    }
+
+    fn outcome(id: &str, verdict: Verdict) -> checks::CheckOutcome {
+        checks::CheckOutcome {
+            id: id.into(),
+            title: id.into(),
+            cfg: config::CheckConfig {
+                enabled: true,
+                pending_for: Duration::from_secs(60),
+                clear_after: 1,
+                severity: Severity::Page,
+                renotify_after: Duration::ZERO,
+            },
+            verdict,
+            tally: Default::default(),
+            warming_up: false,
+            owner: None,
+        }
+    }
+
+    /// refi-main, 2026-10-19: voting again after a restart, with a JPool bond
+    /// warning that had been firing for a day. Only the vote checks decide.
+    #[test]
+    fn an_unrelated_firing_warning_does_not_hold_the_window() {
+        let outcomes = vec![
+            outcome("vote_delinquent:refi-main", Verdict::Healthy),
+            outcome("vote_lag:refi-main", Verdict::Healthy),
+            outcome("jpool_bond_warn:refi-main", Verdict::unhealthy("bond 1.05x")),
+            outcome("identity_balance_warn:refi-main", Verdict::unhealthy("low")),
+            outcome("vote_admission_warn:refi-main", Verdict::unknown("not observed")),
+        ];
+        let (troubled, unconfirmed) = recovery_blockers(&outcomes, &[]);
+        assert!(troubled.is_empty(), "{troubled:?}");
+        assert!(unconfirmed.is_empty(), "{unconfirmed:?}");
+    }
+
+    #[test]
+    fn a_vote_check_still_failing_holds_the_window() {
+        let outcomes = vec![
+            outcome("vote_delinquent:refi-main", Verdict::Healthy),
+            outcome("vote_lag:refi-main", Verdict::unhealthy("behind")),
+            outcome("root_lag:refi-main", Verdict::unknown("no endpoint")),
+        ];
+        let (troubled, unconfirmed) = recovery_blockers(&outcomes, &[]);
+        assert_eq!(troubled, vec!["vote_lag:refi-main"]);
+        assert_eq!(unconfirmed, vec!["root_lag:refi-main"]);
+        assert_eq!(still_failing(&troubled), "Still failing: vote_lag:refi-main.");
+    }
+
+    /// A cluster restart also waits for the cluster; a plain restart does not.
+    #[test]
+    fn only_a_cluster_restart_waits_on_cluster_checks() {
+        let outcomes = vec![
+            outcome("vote_delinquent:chimp-test", Verdict::Healthy),
+            outcome("cluster_stake", Verdict::unhealthy("71%")),
+            outcome("cluster_stalled", Verdict::unknown("establishing cluster slot baseline")),
+        ];
+        let (troubled, unconfirmed) = recovery_blockers(&outcomes, &[]);
+        assert!(troubled.is_empty() && unconfirmed.is_empty());
+        let (troubled, unconfirmed) = recovery_blockers(&outcomes, CLUSTER_RECOVERY_CHECKS);
+        assert_eq!(troubled, vec!["cluster_stake"]);
+        assert_eq!(unconfirmed, vec!["cluster_stalled"]);
     }
 
     #[test]

@@ -70,7 +70,7 @@ const VALIDATORS: [Validator; 3] = [
 fn account_for(key: &str) -> Value {
     if key == ALPENGLOW {
         // Feature { activated_at: Some(0) }
-        return json!({"lamports": 1, "data": ["AQAAAAAAAAAA", "base64"]});
+        return json!({"lamports": 1, "owner": "Feature111111111111111111111111111111111111", "data": ["AQAAAAAAAAAA", "base64"]});
     }
     for v in &VALIDATORS {
         if key == v.vote {

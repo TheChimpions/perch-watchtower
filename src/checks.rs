@@ -51,6 +51,9 @@ pub struct Progress {
     /// between votes: mind-main's swung 1.6-2.8 SOL over four days while an
     /// assumed 2 SOL/epoch cost said "0.9 epochs left".
     identity_history: HashMap<String, crate::fillrate::FillHistory>,
+    /// JPool bond headroom over the security requirement, per identity, in
+    /// lamports, so the bond warning can say how long is left.
+    bond_history: HashMap<String, crate::fillrate::FillHistory>,
 }
 
 /// One identity-balance sample per this interval, over this window. A day
@@ -58,6 +61,32 @@ pub struct Progress {
 const IDENTITY_SAMPLE_EVERY: Duration = Duration::from_secs(10 * 60);
 const IDENTITY_WINDOW: Duration = Duration::from_secs(24 * 3600);
 const IDENTITY_MIN_SPAN: Duration = Duration::from_secs(6 * 3600);
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// "18 hours", "3 days": how long a runway is.
+fn runway_text(d: Duration) -> String {
+    let hours = d.as_secs_f64() / 3600.0;
+    if hours < 48.0 {
+        format!("{hours:.0} hours")
+    } else {
+        format!("{:.0} days", hours / 24.0)
+    }
+}
+
+/// Bond headroom moves in steps: one claim an epoch (about a day), and jumps
+/// when the pool's stake changes. An hour between samples is plenty, a week
+/// smooths several claims into one rate, and two days is the least that
+/// contains more than one claim to fit a slope through.
+const BOND_SAMPLE_EVERY: Duration = Duration::from_secs(3600);
+const BOND_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
+const BOND_MIN_SPAN: Duration = Duration::from_secs(48 * 3600);
+const BOND_MIN_SAMPLES: usize = 24;
 
 impl Progress {
     /// Export the high-water marks for persistence. Losing these across a
@@ -87,6 +116,29 @@ impl Progress {
 
     pub fn import_identity_history(&mut self, h: HashMap<String, crate::fillrate::FillHistory>) {
         self.identity_history = h;
+    }
+
+    pub fn export_bond_history(&self) -> HashMap<String, crate::fillrate::FillHistory> {
+        self.bond_history.clone()
+    }
+
+    pub fn import_bond_history(&mut self, h: HashMap<String, crate::fillrate::FillHistory>) {
+        self.bond_history = h;
+    }
+
+    fn record_bond_headroom(&mut self, identity: &str, now_unix: u64, headroom: u64) {
+        self.bond_history.entry(identity.to_string()).or_default().record(
+            now_unix,
+            headroom,
+            BOND_SAMPLE_EVERY,
+            BOND_WINDOW,
+        );
+    }
+
+    fn bond_trend(&self, identity: &str) -> Option<crate::fillrate::Projection> {
+        self.bond_history
+            .get(identity)
+            .map(|h| h.project(BOND_MIN_SPAN, BOND_MIN_SAMPLES))
     }
 
     fn record_identity(&mut self, identity: &str, now_unix: u64, lamports: u64) {
@@ -550,7 +602,7 @@ pub fn evaluate(
 
     }
 
-    out.extend(evaluate_pools(snapshots, config, &stale));
+    out.extend(evaluate_pools(snapshots, config, &stale, progress));
 
     if c.cluster_stake.base.enabled {
         let min_percent = c.cluster_stake.min_percent;
@@ -598,7 +650,12 @@ pub fn evaluate(
 /// programs, and a check no endpoint can answer would only ever report itself
 /// starved. Quorum is capped at the endpoints that can answer, so adding a
 /// local node to a two-provider config does not make these unconfirmable.
-fn evaluate_pools(snapshots: &[Snapshot], config: &Config, stale: &HashMap<String, u64>) -> Vec<CheckOutcome> {
+fn evaluate_pools(
+    snapshots: &[Snapshot],
+    config: &Config,
+    stale: &HashMap<String, u64>,
+    progress: &mut Progress,
+) -> Vec<CheckOutcome> {
     let remote = config.pool_endpoints();
     let mut out = Vec::new();
     if remote == 0 {
@@ -650,6 +707,22 @@ fn evaluate_pools(snapshots: &[Snapshot], config: &Config, stale: &HashMap<Strin
 
         if c.jpool_bond.base.enabled {
             let jc = &c.jpool_bond;
+            // One reading per cycle feeds the runway: the first endpoint that
+            // answered, is not behind, and shows the validator on JPool.
+            if let Some(pos) = snapshots
+                .iter()
+                .filter(|s| !stale.contains_key(&s.endpoint) && !refused.contains(s.endpoint.as_str()))
+                .find_map(|s| match s.jpool.get(&id) {
+                    Some(Ok(pos)) if !pos.bonds.is_empty() && pos.pool_stake > 0 => Some(pos),
+                    _ => None,
+                })
+            {
+                let headroom = pos
+                    .bond_lamports()
+                    .saturating_sub(pos.security_requirement(jc.security_sol_per_1000));
+                progress.record_bond_headroom(&id, unix_now(), headroom);
+            }
+            let trend = progress.bond_trend(&id);
             for (suffix, severity) in [("critical", jc.base.severity), ("warn", Severity::Notify)] {
                 let mut cfg = jc.base.clone();
                 cfg.severity = severity;
@@ -658,7 +731,7 @@ fn evaluate_pools(snapshots: &[Snapshot], config: &Config, stale: &HashMap<Strin
                     format!("{who} JPool bond is low"),
                     cfg,
                     per_endpoint(snapshots, stale, &|s| match s.jpool.get(&id) {
-                        Some(Ok(pos)) => jpool_verdict(pos, &who, suffix == "critical", jc),
+                        Some(Ok(pos)) => jpool_verdict(pos, &who, suffix == "critical", jc, trend.as_ref()),
                         Some(Err(e)) => Verdict::unknown(e.clone()),
                         None => Verdict::unknown("JPool bonds not read from this endpoint"),
                     }),
@@ -731,7 +804,9 @@ fn jpool_verdict(
     who: &str,
     critical: bool,
     c: &crate::config::JpoolBondCheckConfig,
+    trend: Option<&crate::fillrate::Projection>,
 ) -> Verdict {
+    use crate::fillrate::Projection;
     use crate::pools::Asset;
     if pos.bonds.is_empty() || pos.pool_stake == 0 {
         return Verdict::Healthy;
@@ -766,12 +841,32 @@ fn jpool_verdict(
     if bond_sol < c.warn_sol {
         reasons.push(format!("below JPool's {} SOL minimum bond", c.warn_sol));
     }
-    if (bond as f64) < required as f64 * c.warn_coverage {
-        reasons.push(format!(
-            "only {:.2}x {requirement}; performance claims draw on it every epoch, and the \
-             delegation is cut once it falls below",
-            bond as f64 / required as f64
-        ));
+    match trend {
+        // Measured: warn on how long is left, not on how thin it looks. A bond
+        // at 1.05x losing nothing is fine; one at 3x losing it fast is not.
+        Some(Projection::Filling { time_to_full, bytes_per_sec }) => {
+            if *time_to_full < c.warn_runway {
+                reasons.push(format!(
+                    "at the rate its headroom over {requirement} has been shrinking (about {:.4} \
+                     SOL a day, from claims and changes in pool stake), it falls below in about {}, \
+                     and the delegation is cut once it does",
+                    bytes_per_sec * 86_400.0 / 1e9,
+                    runway_text(*time_to_full)
+                ));
+            }
+        }
+        Some(Projection::NotFilling) => {}
+        // Not watched long enough to measure: fall back to headroom alone.
+        Some(Projection::Insufficient { .. }) | None => {
+            if (bond as f64) < required as f64 * c.warn_coverage {
+                reasons.push(format!(
+                    "only {:.2}x {requirement}; performance claims draw on it every epoch, and the \
+                     delegation is cut once it falls below (a runway is measured after two days of \
+                     history)",
+                    bond as f64 / required as f64
+                ));
+            }
+        }
     }
     if reasons.is_empty() {
         return Verdict::Healthy;
@@ -2552,6 +2647,70 @@ mod tests {
 
         fn jpool(pos: Option<JpoolPosition>) -> Vec<CheckOutcome> {
             evaluate(&snaps(&["a", "b"], None, pos), &config(two_providers(), ""), &mut Progress::default())
+        }
+
+        /// Three days of hourly headroom readings ending an hour ago, from
+        /// `headroom(hours_ago)` in SOL, then one evaluation now.
+        fn jpool_with_history(pos: JpoolPosition, headroom: impl Fn(u64) -> f64) -> Vec<CheckOutcome> {
+            let mut p = Progress::default();
+            let now = unix_now();
+            for hours_ago in (1..=72).rev() {
+                p.record_bond_headroom(ID, now - hours_ago * 3600, (headroom(hours_ago) * 1e9) as u64);
+            }
+            evaluate(&snaps(&["a", "b"], None, Some(pos)), &config(two_providers(), ""), &mut p)
+        }
+
+        /// refi-main, 2026-10-19: 2.0033 SOL against a 1.9136 SOL requirement,
+        /// headroom shrinking about 0.05 SOL a day. Under two days left.
+        #[test]
+        fn a_measured_short_runway_warns_with_the_time_left() {
+            let pos = JpoolPosition { bonds: vec![sol_bond(2_003_303_804)], pool_stake: 3_827_292_431_390 };
+            let out = jpool_with_history(pos, |h| 0.0897 + h as f64 / 24.0 * 0.05);
+            assert_eq!(verdict(&out, "jpool_bond_critical:chimps-1"), Verdict::Healthy);
+            let w = verdict(&out, "jpool_bond_warn:chimps-1");
+            assert!(
+                matches!(&w, Verdict::Unhealthy(m) if m.contains("falls below in about") && m.contains("hours")
+                    && m.contains("0.05") && !m.contains("only 1.")),
+                "{w:?}"
+            );
+        }
+
+        /// Thin but not shrinking: the 1.5x guess would warn; the measurement
+        /// says there is nothing to do.
+        #[test]
+        fn a_thin_bond_that_is_not_shrinking_is_quiet() {
+            let pos = JpoolPosition { bonds: vec![sol_bond(2_003_303_804)], pool_stake: 3_827_292_431_390 };
+            let out = jpool_with_history(pos, |_| 0.0897);
+            assert_eq!(verdict(&out, "jpool_bond_warn:chimps-1"), Verdict::Healthy);
+        }
+
+        /// Three times the requirement, but losing a third of it a day.
+        #[test]
+        fn a_thick_bond_draining_fast_warns() {
+            // Requirement 1.0 SOL on 2,000 SOL of stake; bond 3.0 SOL.
+            let pos = JpoolPosition { bonds: vec![sol_bond(3_000_000_000)], pool_stake: 2_000_000_000_000 };
+            let out = jpool_with_history(pos, |h| 2.0 + h as f64 / 24.0 * 0.4);
+            let w = verdict(&out, "jpool_bond_warn:chimps-1");
+            assert!(matches!(&w, Verdict::Unhealthy(m) if m.contains("falls below in about 5 days")), "{w:?}");
+        }
+
+        /// Months of runway is not news.
+        #[test]
+        fn a_long_runway_is_quiet() {
+            let pos = JpoolPosition { bonds: vec![sol_bond(3_000_000_000)], pool_stake: 2_000_000_000_000 };
+            let out = jpool_with_history(pos, |h| 2.0 + h as f64 / 24.0 * 0.02);
+            assert_eq!(verdict(&out, "jpool_bond_warn:chimps-1"), Verdict::Healthy);
+        }
+
+        /// The headroom is sampled from what the endpoints report, so a real
+        /// evaluation builds the history the runway is measured from.
+        #[test]
+        fn evaluation_records_the_headroom() {
+            let mut p = Progress::default();
+            let pos = JpoolPosition { bonds: vec![sol_bond(3_000_000_000)], pool_stake: 2_000_000_000_000 };
+            evaluate(&snaps(&["a", "b"], None, Some(pos)), &config(two_providers(), ""), &mut p);
+            let h = p.export_bond_history();
+            assert_eq!(h.get(ID).map(|h| h.len()), Some(1));
         }
 
         /// chimps after the epoch-1050 claim: 0.5044 SOL against 28.4 SOL of

@@ -352,9 +352,13 @@ perfectly healthy. Perch reads two of them straight from the pools' programs:
   stake from the pool. Either missing reads healthy.
   `jpool_bond_critical` pages when the bond is below the security requirement,
   0.5 SOL per 1,000 SOL of JPool stake. `jpool_bond_warn` notifies below JPool's
-  documented 1 SOL minimum, or when the bond covers the security requirement
-  by less than 1.5x. With `announce_drawdowns = true`, each drawdown also gets
-  a Telegram note with the amount.
+  documented 1 SOL minimum, or when the headroom over the security requirement
+  will run out within a week. That runway is fitted from a week of hourly
+  readings, so it counts both claims and the requirement rising with pool
+  stake. Until two days of readings exist, it falls back to warning when the
+  bond covers the requirement by less than 1.5x. With
+  `announce_drawdowns = true`, each drawdown also gets a Telegram note with the
+  amount.
 
 ```
 chimpions has 9 unpaid Vault invoices (epochs 1042-1050, 0.2430 vSOL owed to
@@ -376,7 +380,7 @@ part exactly and treats it as a floor. The full requirement is never lower, so
 a bond below it is certainly under 100% health, with no false positive possible
 from the part perch cannot see. The cost is the other direction: a bond above
 the security requirement can still be under 100% if the shortfall part is
-large, which the 1.5x headroom warning is there to catch early. Per-claim
+large, which the runway warning is there to catch early. Per-claim
 drawdown notes are available with `announce_drawdowns = true`, off by default.
 
 ```

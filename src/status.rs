@@ -265,29 +265,24 @@ fn print_endpoints(
 /// Alpenglow admission per validator. Returns whether anything was printed.
 ///
 /// Shown whether or not anything is wrong: the runway is the number to watch
-/// between alerts, and before Alpenglow is scheduled it is what *would* happen.
+/// between alerts.
 fn print_vote_accounts(s: &Style, snapshots: &[Snapshot], config: &Config) -> bool {
-    use crate::alpenglow::{requirement, runway, Bls, Phase};
-    let Some((cluster, pos)) = snapshots
+    use crate::alpenglow::{requirement, runway, Bls};
+    let Some((rent, pos)) = snapshots
         .iter()
-        .filter_map(|sn| Some((sn.alpenglow.as_ref()?, checks::position(sn)?)))
+        .filter_map(|sn| Some((sn.vote_rent_lamports?, checks::position(sn)?)))
         .filter(|(_, p)| p.slots_in_epoch > 0)
         .max_by_key(|(_, p)| p.absolute_slot)
     else {
         return false;
     };
-    let req = requirement(cluster, &pos);
+    let req = requirement(rent, &pos);
     let sol = |l: u64| l as f64 / 1e9;
-    let phase = match req.phase {
-        Phase::NotScheduled => "Alpenglow not scheduled",
-        Phase::ActivatesAtNextBoundary => "Alpenglow ACTIVATES at the next boundary",
-        Phase::Active => "Alpenglow active",
-    };
     println!("{}", s.bold("VOTE ACCOUNTS"));
     println!(
         "  {}",
         s.dim(&format!(
-            "{phase} · VAT {:.2} SOL/epoch · each needs {:.4} SOL at the start of epoch {} (in ~{:.0}h)",
+            "VAT {:.2} SOL/epoch · each needs {:.4} SOL at the start of epoch {} (in ~{:.0}h)",
             sol(req.vat_lamports),
             sol(req.minimum_lamports()),
             req.checked_at_epoch,
@@ -315,11 +310,7 @@ fn print_vote_accounts(s: &Style, snapshots: &[Snapshot], config: &Config) -> bo
         } else {
             s.green("ok    ")
         };
-        let story = if req.phase == Phase::NotScheduled {
-            run.describe_hypothetically(&req)
-        } else {
-            run.describe(&req)
-        };
+        let story = run.describe(&req);
         let key = match vote.bls {
             Bls::Registered => "BLS ok",
             Bls::Missing => "no BLS key",

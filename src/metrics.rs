@@ -604,11 +604,6 @@ pub fn render(r: &CycleReport<'_>) -> String {
         "gauge",
     );
     e.metric(
-        "perch_validator_balance_sol",
-        "Account balance in SOL",
-        "gauge",
-    );
-    e.metric(
         "perch_validator_leader_slots",
         "Leader slots assigned this epoch",
         "gauge",
@@ -629,14 +624,9 @@ pub fn render(r: &CycleReport<'_>) -> String {
     let alpenglow = r
         .snapshots
         .iter()
-        .filter_map(|s| Some((s.alpenglow.as_ref()?, crate::checks::position(s)?)))
+        .filter_map(|s| Some((s.vote_rent_lamports?, crate::checks::position(s)?)))
         .filter(|(_, p)| p.slots_in_epoch > 0)
         .max_by_key(|(_, p)| p.absolute_slot);
-    e.metric(
-        "perch_alpenglow_phase",
-        "Alpenglow on this cluster: 0 not scheduled, 1 activates at the next epoch boundary, 2 active",
-        "gauge",
-    );
     e.metric(
         "perch_vat_per_epoch_sol",
         "Validator Admission Ticket burned from each vote account per epoch under Alpenglow",
@@ -647,14 +637,8 @@ pub fn render(r: &CycleReport<'_>) -> String {
         "Balance a vote account must hold at the next epoch boundary to be admitted (rent-exempt plus one VAT)",
         "gauge",
     );
-    if let Some((cluster, pos)) = alpenglow {
-        let req = crate::alpenglow::requirement(cluster, &pos);
-        let phase = match req.phase {
-            crate::alpenglow::Phase::NotScheduled => 0.0,
-            crate::alpenglow::Phase::ActivatesAtNextBoundary => 1.0,
-            crate::alpenglow::Phase::Active => 2.0,
-        };
-        e.value("perch_alpenglow_phase", &[], phase);
+    if let Some((rent, pos)) = alpenglow {
+        let req = crate::alpenglow::requirement(rent, &pos);
         e.value("perch_vat_per_epoch_sol", &[], lamports_to_sol(req.vat_lamports));
         e.value("perch_vote_account_minimum_sol", &[], lamports_to_sol(req.minimum_lamports()));
     }
@@ -785,8 +769,8 @@ pub fn render(r: &CycleReport<'_>) -> String {
         if let Some(i) = income {
             e.value("perch_validator_vote_income_sol", &labels, lamports_to_sol(i));
         }
-        if let (Some((cluster, pos)), Some(vote)) = (alpenglow, votes.iter().max_by_key(|v| v.lamports)) {
-            let req = crate::alpenglow::requirement(cluster, &pos);
+        if let (Some((rent, pos)), Some(vote)) = (alpenglow, votes.iter().max_by_key(|v| v.lamports)) {
+            let req = crate::alpenglow::requirement(rent, &pos);
             let run = crate::alpenglow::runway(vote, &req, income);
             e.value("perch_validator_vote_net_sol_per_epoch", &labels, run.net_per_epoch as f64 / 1e9);
             if let Some(n) = run.boundaries {
@@ -798,23 +782,6 @@ pub fn render(r: &CycleReport<'_>) -> String {
             e.value("perch_validator_bls_registered", &labels, 1.0);
         } else if votes.iter().any(|v| v.bls == Bls::Missing) {
             e.value("perch_validator_bls_registered", &labels, 0.0);
-        }
-
-        if let Some(lamports) = r
-            .snapshots
-            .iter()
-            .filter_map(|s| s.identity_balances.get(identity).copied().flatten())
-            .max()
-        {
-            e.value(
-                "perch_validator_balance_sol",
-                &[
-                    ("identity", identity.as_str()),
-                    ("validator", label),
-                    ("account", "identity"),
-                ],
-                lamports_to_sol(lamports),
-            );
         }
 
         // Pool readings are cached per endpoint and differ only in age; any
@@ -1263,7 +1230,7 @@ mod build_identity {
 mod alpenglow_metrics {
     use super::*;
     use crate::{
-        alpenglow::{Bls, ClusterVat, FeatureState, VoteAccountState},
+        alpenglow::{Bls, VoteAccountState},
         notify::NotifyCounts,
         snapshot::{EpochInfo, ValidatorObservation, VoteAccountInfo},
     };
@@ -1314,11 +1281,7 @@ mod alpenglow_metrics {
                 epoch_credits: vec![(10, 5, 0)],
             }),
         );
-        s.alpenglow = Some(ClusterVat {
-            alpenglow: FeatureState::Active(0),
-            slot_time: [FeatureState::Absent; 4],
-            rent_lamports: 19_761_200,
-        });
+        s.vote_rent_lamports = Some(19_761_200);
         s.vote_states.insert(
             "ID".into(),
             VoteAccountState { lamports: 6_481_200_000, bls, inflation_commission_bps: None, block_revenue_commission_bps: None },
@@ -1332,16 +1295,15 @@ mod alpenglow_metrics {
         let labels = HashMap::from([("ID".to_string(), "chimps-1".to_string())]);
         let out = render_with(&[snap(Bls::Registered)], &labels);
         for line in [
-            "perch_alpenglow_phase 2",
-            "perch_vat_per_epoch_sol 1.6",
-            "perch_vote_account_minimum_sol 1.6197612",
+            "perch_vat_per_epoch_sol 0.8",
+            "perch_vote_account_minimum_sol 0.8197612",
             r#"perch_validator_vote_account_balance_sol{identity="ID",validator="chimps-1"} 6.4812"#,
             r#"perch_validator_bls_registered{identity="ID",validator="chimps-1"} 1"#,
             r#"perch_validator_vote_income_sol{identity="ID",validator="chimps-1"} 0.637"#,
-            // 0.637 earned against a 1.6 SOL VAT at 400ms slots.
-            r#"perch_validator_vote_net_sol_per_epoch{identity="ID",validator="chimps-1"} -0.963"#,
-            // (6.4812 - 1.6198) / 0.963 = 5.05, plus the boundary passed now.
-            r#"perch_validator_vote_runway_epochs{identity="ID",validator="chimps-1"} 6"#,
+            // 0.637 earned against the 0.8 SOL VAT.
+            r#"perch_validator_vote_net_sol_per_epoch{identity="ID",validator="chimps-1"} -0.163"#,
+            // (6.4812 - 0.8198) / 0.163 = 34.7, plus the boundary passed now.
+            r#"perch_validator_vote_runway_epochs{identity="ID",validator="chimps-1"} 35"#,
         ] {
             assert!(out.contains(line), "missing {line:?} in:\n{out}");
         }
@@ -1355,7 +1317,7 @@ mod alpenglow_metrics {
         let mut s = snap(Bls::Registered);
         s.vote_income.insert("ID".into(), 2_000_000_000);
         let out = render_with(&[s], &HashMap::new());
-        assert!(out.contains(r#"perch_validator_vote_net_sol_per_epoch{identity="ID",validator="ID"} 0.4"#), "got:\n{out}");
+        assert!(out.contains(r#"perch_validator_vote_net_sol_per_epoch{identity="ID",validator="ID"} 1.2"#), "got:\n{out}");
         assert!(!out.contains("perch_validator_vote_runway_epochs{"), "got:\n{out}");
     }
 

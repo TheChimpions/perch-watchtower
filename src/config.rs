@@ -719,13 +719,11 @@ pub struct VoteAdmissionCheckConfig {
     /// epoch boundaries of VAT with no income.
     #[serde(default = "default_vote_admission_warn_epochs")]
     pub warn_epochs: u64,
-    /// Also notify about readiness before Alpenglow is scheduled on the
-    /// cluster. Off by default: until it is scheduled nothing is enforced, and
-    /// a vote account swept down to rent after a commission withdrawal is
-    /// routine treasury work, not news. Readiness stays visible in `perch
-    /// status` and Grafana either way.
+    /// Removed in 1.3.0 with the readiness notes it enabled: Alpenglow is
+    /// active on every cluster perch watches. Accepted and ignored so an older
+    /// config still loads.
     #[serde(default)]
-    pub alert_before_scheduled: bool,
+    pub alert_before_scheduled: Option<bool>,
 }
 
 fn default_vote_admission_warn_epochs() -> u64 {
@@ -742,29 +740,8 @@ fn default_vote_admission() -> VoteAdmissionCheckConfig {
             ..CheckConfig::new(d(10 * 60), Severity::Page)
         },
         warn_epochs: default_vote_admission_warn_epochs(),
-        alert_before_scheduled: false,
+        alert_before_scheduled: None,
     }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct BalanceCheckConfig {
-    #[serde(flatten)]
-    pub base: CheckConfig,
-    /// Telegram at this level...
-    pub warn_sol: f64,
-    /// ...page at this one.
-    pub page_sol: f64,
-    /// What voting costs per epoch, used to express a balance as remaining
-    /// epochs in the alert. "0.4 epochs of voting left" is actionable in a way
-    /// that "0.8 SOL" is not, and it is the mechanism by which an empty identity
-    /// takes the validator delinquent.
-    #[serde(default = "default_sol_per_epoch")]
-    pub sol_per_epoch: f64,
-}
-
-fn default_sol_per_epoch() -> f64 {
-    2.0
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -891,8 +868,11 @@ pub struct Checks {
     pub vote_stalled: CheckConfig,
     #[serde(default = "default_vote_admission")]
     pub vote_admission: VoteAdmissionCheckConfig,
-    #[serde(default = "default_identity_balance")]
-    pub identity_balance: BalanceCheckConfig,
+    /// Removed in 1.3.0: under Alpenglow votes cost the identity nothing, so
+    /// its balance cannot take a validator delinquent. Accepted and ignored so
+    /// an older config still loads.
+    #[serde(default)]
+    pub identity_balance: Option<toml::Value>,
     #[serde(default = "default_commission")]
     pub commission_changed: CheckConfig,
     /// Whether the validator meets the Solana Foundation Delegation Program's
@@ -1041,28 +1021,6 @@ fn default_root_lag() -> LagCheckConfig {
 }
 fn default_vote_stalled() -> CheckConfig {
     CheckConfig::new(d(5 * 60), Severity::Page)
-}
-fn default_identity_balance() -> BalanceCheckConfig {
-    BalanceCheckConfig {
-        base: CheckConfig {
-            // A draining balance is measured in days, so repeating the same
-            // message every 30 minutes says nothing new and trains you to skim
-            // past it. Said once when it crosses, and once more only if it
-            // falls to the paging band. PagerDuty owns escalation from there;
-            // re-sending the same dedup key would only update the incident.
-            renotify_after: Duration::ZERO,
-            ..CheckConfig::new(d(15 * 60), Severity::Page)
-        },
-        // The identity pays for every vote transaction, at roughly 2 SOL per
-        // epoch. When it empties the validator simply stops voting and goes
-        // delinquent, so this is the one balance that is load-bearing.
-        warn_sol: 3.0,
-        // Roughly a quarter of an epoch of voting left: late enough that it has
-        // not paged for a balance that was going to be topped up anyway, early
-        // enough to act before it stops voting.
-        page_sol: 0.5,
-        sol_per_epoch: default_sol_per_epoch(),
-    }
 }
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -1257,7 +1215,7 @@ impl Default for Checks {
             root_lag: default_root_lag(),
             vote_stalled: default_vote_stalled(),
             vote_admission: default_vote_admission(),
-            identity_balance: default_identity_balance(),
+            identity_balance: None,
             commission_changed: default_commission(),
             sfdp_version: default_sfdp_version(),
             vault_invoices: default_vault_invoices(),
@@ -1570,9 +1528,17 @@ impl Config {
             }
         }
 
-        let b = &self.checks.identity_balance;
-        if b.page_sol > b.warn_sol {
-            bail!("checks.identity_balance.page_sol must be <= warn_sol");
+        if self.checks.identity_balance.is_some() {
+            tracing::warn!(
+                "[checks.identity_balance] is ignored: under Alpenglow the identity no longer pays \
+                 for votes, and vote_admission watches the vote account instead. Remove the section."
+            );
+        }
+        if self.checks.vote_admission.alert_before_scheduled.is_some() {
+            tracing::warn!(
+                "checks.vote_admission.alert_before_scheduled is ignored: Alpenglow is active, so \
+                 there is no readiness to report. Remove the setting."
+            );
         }
         let v = &self.checks.vault_invoices;
         if v.warn_unpaid == 0 || v.warn_unpaid > v.page_unpaid {
@@ -2184,11 +2150,11 @@ identity = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv"
     /// owns everything it evaluates.
     #[test]
     fn only_a_peers_hub_disowns_validator_checks() {
-        assert!(!Alerting::Peers.owns_check("identity_balance_warn:mind-main"));
+        assert!(!Alerting::Peers.owns_check("vote_admission_warn:mind-main"));
         assert!(Alerting::Peers.owns_check("peer_down:mind-main"));
         assert!(Alerting::Peers.owns_check("machine_down:mind-main"));
         for mode in [Alerting::Always, Alerting::Auto, Alerting::Never] {
-            assert!(mode.owns_check("identity_balance_warn:mind-main"));
+            assert!(mode.owns_check("vote_admission_warn:mind-main"));
         }
     }
 
@@ -2289,11 +2255,18 @@ identity = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv"
         assert!(Config::parse(&src).is_err());
     }
 
+    /// Settings removed with the pre-Alpenglow checks must not stop an older
+    /// config from loading.
     #[test]
-    fn identity_balance_pages_at_one_sol_of_runway() {
-        let c = Config::parse(MINIMAL).unwrap();
-        assert_eq!(c.checks.identity_balance.page_sol, 0.5);
-        assert_eq!(c.checks.identity_balance.warn_sol, 3.0);
+    fn removed_pre_alpenglow_settings_still_load() {
+        let src = format!(
+            "{MINIMAL}\n[checks.identity_balance]\npending_for = \"15m\"\nseverity = \"page\"\n\
+             warn_sol = 3.0\npage_sol = 0.5\nsol_per_epoch = 2.0\n\
+             [checks.vote_admission]\npending_for = \"10m\"\nseverity = \"page\"\nalert_before_scheduled = true\n"
+        );
+        let c = Config::parse(&src).unwrap();
+        assert!(c.checks.identity_balance.is_some());
+        assert_eq!(c.checks.vote_admission.alert_before_scheduled, Some(true));
     }
 
     /// Claims land every epoch; only the bond against the requirement alerts.
@@ -2305,15 +2278,6 @@ identity = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv"
             "{MINIMAL}\n[checks.jpool_bond]\npending_for = \"15m\"\nseverity = \"page\"\nannounce_drawdowns = true\n"
         );
         assert!(Config::parse(&src).unwrap().checks.jpool_bond.announce_drawdowns);
-    }
-
-    #[test]
-    fn rejects_inverted_balance_thresholds() {
-        let src = format!(
-            "{MINIMAL}\n[checks.identity_balance]\npending_for = \"15m\"\nseverity = \"page\"\n\
-             warn_sol = 0.5\npage_sol = 2.0\n"
-        );
-        assert!(Config::parse(&src).is_err());
     }
 
     #[test]

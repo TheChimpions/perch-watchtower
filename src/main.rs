@@ -2096,8 +2096,7 @@ mod tests {
                 slots_in_epoch: 432_000,
             }),
             validators: HashMap::new(),
-            identity_balances: HashMap::new(),
-            alpenglow: None,
+            vote_rent_lamports: None,
             vote_states: HashMap::new(),
             vote_income: HashMap::new(),
             vault_invoices: HashMap::new(),
@@ -2242,7 +2241,7 @@ mod tests {
         assert!(is_recovery_signal("vote_delinquent:chimps-1"));
         assert!(is_recovery_signal("node_behind:localhost"));
         assert!(!is_recovery_signal("disk_fill_critical:hw /mnt/ledger"));
-        assert!(!is_recovery_signal("identity_balance_warn:chimps-1"));
+        assert!(!is_recovery_signal("vote_admission_warn:chimps-1"));
         assert!(!is_recovery_signal("cluster_stalled"));
     }
 
@@ -2272,7 +2271,7 @@ mod tests {
             outcome("vote_delinquent:refi-main", Verdict::Healthy),
             outcome("vote_lag:refi-main", Verdict::Healthy),
             outcome("jpool_bond_warn:refi-main", Verdict::unhealthy("bond 1.05x")),
-            outcome("identity_balance_warn:refi-main", Verdict::unhealthy("low")),
+            outcome("skip_rate_warn:refi-main", Verdict::unhealthy("high")),
             outcome("vote_admission_warn:refi-main", Verdict::unknown("not observed")),
         ];
         let (troubled, unconfirmed) = recovery_blockers(&outcomes, &[]);

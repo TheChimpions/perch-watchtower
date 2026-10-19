@@ -296,11 +296,11 @@ mod tests {
     fn unrelated_checks_are_never_inhibited() {
         let outcomes = vec![
             bad("vote_delinquent:chimps-1"),
-            bad("identity_balance_critical:chimps-1"),
+            bad("vote_admission_critical:chimps-1"),
             bad("commission_changed:chimps-1"),
         ];
         let s = compute(&outcomes);
-        assert!(!s.contains_key("identity_balance_critical:chimps-1"));
+        assert!(!s.contains_key("vote_admission_critical:chimps-1"));
         assert!(
             !s.contains_key("commission_changed:chimps-1"),
             "a possible key compromise must never be masked by delinquency"

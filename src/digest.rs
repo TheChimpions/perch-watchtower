@@ -2,7 +2,7 @@
 //!
 //! Alerts tell you when something is wrong. The digest tells you, once an
 //! epoch, that the watchtower is still looking and what it saw: leader slots,
-//! blocks produced and skipped, credits earned, balance, version. The weekly
+//! blocks produced and skipped, credits earned, vote account balance, version. The weekly
 //! self-test proves perch can deliver; this proves it is watching.
 
 use crate::{config::Config, snapshot::Snapshot};
@@ -16,8 +16,7 @@ pub struct EpochTail {
     pub epoch: u64,
     pub leader_slots: u64,
     pub blocks_produced: u64,
-    pub balance_lamports: Option<u64>,
-    /// Under Alpenglow, the balance that pays the VAT each epoch.
+    /// The balance that pays the VAT each epoch.
     pub vote_lamports: Option<u64>,
     pub version: Option<String>,
 }
@@ -44,16 +43,12 @@ pub fn capture(snapshots: &[Snapshot], config: &Config) -> (Option<u64>, HashMap
             .iter()
             .filter(|s| s.epoch_info.as_ref().map(|e| e.epoch) == Some(epoch))
             .find_map(|s| s.block_production.get(&v.identity));
-        let balance = snapshots
-            .iter()
-            .find_map(|s| s.identity_balances.get(&v.identity).copied().flatten());
         tails.insert(
             v.identity.clone(),
             EpochTail {
                 epoch,
                 leader_slots: prod.map(|p| p.leader_slots).unwrap_or(0),
                 blocks_produced: prod.map(|p| p.blocks_produced).unwrap_or(0),
-                balance_lamports: balance,
                 vote_lamports: snapshots
                     .iter()
                     .find_map(|s| s.vote_states.get(&v.identity).map(|vs| vs.lamports)),
@@ -81,16 +76,15 @@ pub fn credits_for(snapshots: &[Snapshot], identity: &str, epoch: u64) -> Option
 }
 
 /// The vote account against the VAT, counting the commission it earned in the
-/// epoch being summarised. Before Alpenglow is scheduled this is what it
-/// *would* do, so the trend is visible before it costs anything.
+/// epoch being summarised.
 fn vat_runway(snapshots: &[Snapshot], identity: &str, vote_lamports: u64) -> Option<String> {
-    use crate::alpenglow::{requirement, runway, Bls, Phase, VoteAccountState};
-    let (cluster, pos) = snapshots
+    use crate::alpenglow::{requirement, runway, Bls, VoteAccountState};
+    let (rent, pos) = snapshots
         .iter()
-        .filter_map(|s| Some((s.alpenglow.as_ref()?, crate::checks::position(s)?)))
+        .filter_map(|s| Some((s.vote_rent_lamports?, crate::checks::position(s)?)))
         .filter(|(_, p)| p.slots_in_epoch > 0)
         .max_by_key(|(_, p)| p.absolute_slot)?;
-    let req = requirement(cluster, &pos);
+    let req = requirement(rent, &pos);
     if req.vat_lamports == 0 {
         return None;
     }
@@ -101,11 +95,7 @@ fn vat_runway(snapshots: &[Snapshot], identity: &str, vote_lamports: u64) -> Opt
         block_revenue_commission_bps: None,
     };
     let r = runway(&vote, &req, crate::checks::income_for(snapshots, identity));
-    Some(if req.phase == Phase::NotScheduled {
-        r.describe_hypothetically(&req)
-    } else {
-        r.describe(&req)
-    })
+    Some(r.describe(&req))
 }
 
 fn sol(lamports: u64) -> String {
@@ -152,9 +142,6 @@ pub fn render(
             Some(c) => lines.push(format!("  credits earned {}", with_commas(c))),
             None => lines.push("  credits earned: not reported".into()),
         }
-        if let Some(b) = t.balance_lamports {
-            lines.push(format!("  identity balance {}", sol(b)));
-        }
         if let Some(b) = t.vote_lamports {
             let runway = vat_runway(snapshots, &v.identity, b)
                 .map(|r| format!(": {r}"))
@@ -187,7 +174,7 @@ mod tests {
     fn skip_percentage_is_of_leader_slots_and_absent_when_none() {
         let mut tails = HashMap::new();
         tails.insert("id".to_string(), EpochTail {
-            epoch: 10, leader_slots: 40, blocks_produced: 38, balance_lamports: Some(18_796_000_000), vote_lamports: Some(6_481_200_000), version: Some("4.2.2".into()),
+            epoch: 10, leader_slots: 40, blocks_produced: 38, vote_lamports: Some(6_481_200_000), version: Some("4.2.2".into()),
         });
         let config: Config = toml::from_str(r#"
             [[validators]]
@@ -199,7 +186,7 @@ mod tests {
         assert_eq!(title, "Epoch 10 summary");
         assert!(body.contains("chimps"), "{body}");
         assert!(body.contains("leader slots 40, produced 38, skipped 2 (5.0%)"), "{body}");
-        assert!(body.contains("identity balance 18.80 SOL"), "{body}");
+        assert!(!body.contains("identity"), "{body}");
         assert!(body.contains("agave 4.2.2"), "{body}");
         // No Alpenglow state observed: the balance, but no VAT runway claim.
         assert!(body.contains("vote account 6.48 SOL\n"), "{body}");
@@ -215,7 +202,7 @@ mod tests {
     fn a_stale_tail_is_not_reported() {
         let mut tails = HashMap::new();
         tails.insert("id".to_string(), EpochTail {
-            epoch: 9, leader_slots: 1, blocks_produced: 1, balance_lamports: None, vote_lamports: None, version: None,
+            epoch: 9, leader_slots: 1, blocks_produced: 1, vote_lamports: None, version: None,
         });
         let config: Config = toml::from_str(r#"
             [[validators]]
@@ -228,29 +215,25 @@ mod tests {
     /// Under Alpenglow the summary says how many epochs of VAT are left.
     #[test]
     fn the_vote_account_line_carries_vat_runway_under_alpenglow() {
-        use crate::alpenglow::{ClusterVat, FeatureState};
         use crate::snapshot::EpochInfo;
         let mut snap = Snapshot::empty_for_test("a");
         snap.epoch_info = Some(EpochInfo { absolute_slot: 4_320_100, epoch: 10, slot_index: 100, slots_in_epoch: 432_000 });
-        snap.alpenglow = Some(ClusterVat {
-            alpenglow: FeatureState::Active(0),
-            slot_time: [FeatureState::Absent; 4],
-            rent_lamports: 19_761_200,
-        });
+        snap.vote_rent_lamports = Some(19_761_200);
         let mut tails = HashMap::new();
         tails.insert("id".to_string(), EpochTail {
-            epoch: 10, leader_slots: 0, blocks_produced: 0, balance_lamports: None,
+            epoch: 10, leader_slots: 0, blocks_produced: 0,
             vote_lamports: Some(6_481_200_000), version: None,
         });
         let config: Config = toml::from_str("[[validators]]\nidentity = \"id\"\n").unwrap();
         let (_, body) = render(10, &tails, std::slice::from_ref(&snap), &config).unwrap();
-        // (6.4812 - 1.6198) / 1.6 + 1 = 4, with no income reported.
-        assert!(body.contains("vote account 6.48 SOL: pays 1.60 SOL VAT per epoch: 4 more epoch(s)"), "{body}");
+        // (6.4812 - 0.8198) / 0.8 = 7.08, plus the boundary passed now: 8, with
+        // no income reported.
+        assert!(body.contains("vote account 6.48 SOL: pays 0.80 SOL VAT per epoch: 8 more epoch(s)"), "{body}");
 
-        // A mainnet vote account, measured: 0.637 SOL commission against a 1.6 SOL VAT here.
+        // A mainnet vote account, measured: 0.637 SOL commission against the 0.8 SOL VAT.
         let mut with_income = snap.clone();
         with_income.vote_income.insert("id".into(), 637_000_000);
         let (_, body) = render(10, &tails, &[with_income], &config).unwrap();
-        assert!(body.contains("loses about 0.96 SOL per epoch (1.60 SOL VAT, 0.64 SOL commission income): about 6 epoch(s) left"), "{body}");
+        assert!(body.contains("loses about 0.16 SOL per epoch (0.80 SOL VAT, 0.64 SOL commission income): about 35 epoch(s) left"), "{body}");
     }
 }

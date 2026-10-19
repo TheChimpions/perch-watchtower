@@ -195,34 +195,18 @@ Delinquency can afford to be strict because it already requires
 the false-positive load, so making it long bought almost no accuracy and cost
 minutes of a real outage — which is lost block rewards.
 
-### Which balance matters, before and after Alpenglow
+### The vote account is the balance that matters
 
-**Before Alpenglow, the identity.** It pays for every vote transaction,
-currently about **2 SOL per epoch**. When it empties, the validator stops voting
-and goes delinquent. That is the load-bearing balance, and the alert says so:
+Before Alpenglow the identity paid for every vote transaction, about 2 SOL per
+epoch, and an empty one took the validator delinquent. perch watched it in two
+bands until 1.3.0.
 
-```
-chimps-1 identity balance is 0.800 SOL (floor 1 SOL), about 0.4 more epoch(s)
-of voting at 2 SOL/epoch -- an empty identity cannot vote and goes delinquent
-```
-
-Two bands, and it says each thing once. Telegram when it drops below 3 SOL —
-roughly 1.5 epochs of voting left — and a page below 0.5 SOL, about a quarter of
-an epoch. `renotify_after = "0s"` is the default here: a balance draining over
-days does not change between one 30-minute message and the next, and repeating
-it is how an alert becomes something you skim past. PagerDuty owns escalation
-once the paging band is crossed.
-
-The vote account, meanwhile, only needs to stay rent-exempt. Its balance tracks
-when rewards were last withdrawn: across one real fleet it read anything from
-0.035 to 52,412 SOL among healthy validators.
-
-**Under Alpenglow, the vote account.** Votes stop being transactions, so the
-identity stops paying for them. On five testnet validators the identity fell
-about 1.9 SOL a day until the switch to Alpenglow, and has risen slowly since,
-on block fees alone. An empty identity no longer stops a validator voting, so
-`identity_balance` stops alerting altogether once Alpenglow governs the current
-epoch. The balance stays in metrics and `perch status`.
+Under Alpenglow votes are not transactions, so the identity pays for nothing
+that keeps a validator voting. On five testnet validators the identity fell
+about 1.9 SOL a day until the switch, and has risen slowly since, on block fees
+alone. perch no longer fetches or checks the identity balance. A state an older
+version saved for `identity_balance` is retired on upgrade like any other
+removed check, so an incident it opened is resolved rather than left open.
 
 The vote account takes over (SIMD-0357). At the first slot of every epoch N+1
 the runtime decides which vote accounts take part in epoch N+2, and admits only
@@ -239,8 +223,7 @@ account that fails cannot vote or produce blocks for an epoch, and earns no
 rewards for it.
 
 `vote_admission` evaluates 1 and 2 against the next boundary, from public RPC:
-the feature accounts (Alpenglow, and the slot-time reductions that set the VAT),
-the vote account, and the rent minimum. It pages when the next boundary would
+the vote account and the rent minimum. It pages when the next boundary would
 exclude the validator, and sends a Telegram warning when the balance covers
 fewer than three more boundaries with no income:
 
@@ -253,19 +236,12 @@ blocks in epoch 1051.
 
 Three details decide whether that is right:
 
-- **Scheduled is enforced immediately.** Feature activation runs before epoch
-  stakes are computed, so the boundary that activates Alpenglow already
-  applies the check. perch treats a scheduled (pending) feature account as
-  enforced at the next boundary. Before anything is scheduled nothing is
-  enforced, so nothing notifies by default: readiness (a missing BLS key, a
-  balance too low to pass) is shown in `perch status` and Grafana, and on
-  Telegram only with `alert_before_scheduled = true`. A vote account swept to
-  rent by a commission withdrawal is routine until then. Once it is scheduled,
-  the boundary may be hours away, so check readiness before that happens.
-- **The VAT follows the slot time.** It is 1.6 SOL at 400ms slots and falls
-  with each reduction (1.4, 1.2, 1.0, 0.8 SOL at 350, 300, 250 and 200ms). A
-  reduction takes effect the epoch after it activates. At the time of writing
-  that makes it 1.0 SOL on mainnet and 0.8 SOL on testnet.
+- **No feature account is read.** 1.3.0 ships after Alpenglow and every
+  slot-time reduction are active on every cluster perch watches. 200ms slots
+  took effect on mainnet in epoch 1053, so the VAT is a constant 0.8 SOL. It
+  was 1.6 SOL at 400ms and fell with each reduction. Pointed at a cluster
+  without Alpenglow or still on longer slots, `vote_admission` would be wrong,
+  so disable it there.
 - **"Not reported" is not "missing".** An RPC node too old to report BLS keys
   reads as unknown, never as a validator without one.
 

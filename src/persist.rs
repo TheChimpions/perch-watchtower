@@ -72,6 +72,10 @@ pub struct PersistedState {
     /// files from before it existed, which simply start measuring afresh.
     #[serde(default)]
     pub identity_history: HashMap<String, crate::fillrate::FillHistory>,
+    /// JPool bond headroom history behind its runway. A week of it; losing it
+    /// on every restart would leave the warning on its fallback for two days.
+    #[serde(default)]
+    pub bond_history: HashMap<String, crate::fillrate::FillHistory>,
 }
 
 fn now_unix() -> u64 {
@@ -138,6 +142,7 @@ pub fn save(
         last_self_test_unix,
         last_digest_epoch,
         identity_history: progress.export_identity_history(),
+        bond_history: progress.export_bond_history(),
     };
 
     if let Some(parent) = path.parent() {
@@ -233,6 +238,7 @@ pub fn load(
 
     progress.import(parsed.validator_credits, parsed.cluster_slot);
     progress.import_identity_history(parsed.identity_history);
+    progress.import_bond_history(parsed.bond_history);
     disk.import(parsed.disk_history);
     blindness.restore(parsed.blind_incident_key, parsed.blind_announced);
 
@@ -476,6 +482,37 @@ mod self_test_clock {
             restored.last_self_test_unix, 1_700_000_000,
             "a reboot must not reset the interval, or a box that restarts often never tests at all"
         );
+    }
+
+    /// A week of bond headroom is what the JPool runway is measured from; a
+    /// restart must not put the warning back on its fallback for two days.
+    #[test]
+    fn the_bond_history_survives_a_restart() {
+        let d = tmpdir();
+        let path = d.join("state.json");
+        let mut h = crate::fillrate::FillHistory::default();
+        h.record(1_700_000_000, 90_000_000, Duration::from_secs(3600), Duration::from_secs(7 * 86_400));
+        h.record(1_700_003_600, 88_000_000, Duration::from_secs(3600), Duration::from_secs(7 * 86_400));
+        let mut progress = Progress::default();
+        progress.import_bond_history(HashMap::from([("refi".to_string(), h)]));
+        save(
+            &path,
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &progress,
+            &DiskHistory::default(),
+            &BlindnessState::default(),
+            false,
+            0,
+            None,
+            Instant::now(),
+        )
+        .unwrap();
+
+        let mut restored = Progress::default();
+        load(&path, &mut restored, &mut DiskHistory::default(), &mut BlindnessState::default());
+        assert_eq!(restored.export_bond_history().get("refi").map(|h| h.len()), Some(2));
     }
 
     /// Every deployed box already has a state.json written before this field

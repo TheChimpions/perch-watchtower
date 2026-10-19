@@ -406,7 +406,12 @@ enabled = true
 # is never lower, so a bond below it is certainly under 100% health: JPool's
 # grace period has started and the delegation is being cut.
 security_sol_per_1000 = 0.5
-# Telegram when the bond covers the security requirement by less than this.
+# Telegram when the headroom over the security requirement will run out within
+# this long, measured from a week of the bond's own history (claims each epoch,
+# and the requirement rising with pool stake).
+warn_runway = "7d"
+# Until two days of history exist, Telegram when the bond covers the security
+# requirement by less than this instead.
 warn_coverage = 1.5
 # Telegram below this whatever the stake. JPool's documented minimum is 1 SOL.
 warn_sol = 1.0

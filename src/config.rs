@@ -1134,8 +1134,13 @@ pub struct JpoolBondCheckConfig {
     /// certainly below 100% health.
     #[serde(default = "default_jpool_security_sol_per_1000")]
     pub security_sol_per_1000: f64,
-    /// Telegram when the bond covers the security requirement by less than
-    /// this multiple: performance claims draw it down each epoch.
+    /// Telegram when the bond's headroom over the security requirement will
+    /// run out within this long, measured from its own history: claims each
+    /// epoch draw it down, and growing pool stake raises the requirement.
+    #[serde(with = "humantime_serde", default = "default_jpool_warn_runway")]
+    pub warn_runway: Duration,
+    /// Until there is enough history to measure that (about two days), Telegram
+    /// when the bond covers the security requirement by less than this multiple.
     #[serde(default = "default_jpool_warn_coverage")]
     pub warn_coverage: f64,
     /// Telegram below this many SOL-equivalent across the validator's bonds,
@@ -1174,6 +1179,10 @@ fn default_jpool_security_sol_per_1000() -> f64 {
 fn default_jpool_warn_coverage() -> f64 {
     1.5
 }
+fn default_jpool_warn_runway() -> Duration {
+    // A week to notice, find SOL and run `jbond topup`.
+    d(7 * 24 * 3600)
+}
 fn default_pool_poll() -> Duration {
     d(10 * 60)
 }
@@ -1205,6 +1214,7 @@ fn default_jpool_bond() -> JpoolBondCheckConfig {
     JpoolBondCheckConfig {
         base: pool_check_base(),
         security_sol_per_1000: default_jpool_security_sol_per_1000(),
+        warn_runway: default_jpool_warn_runway(),
         warn_coverage: default_jpool_warn_coverage(),
         warn_sol: default_jpool_warn_sol(),
         announce_drawdowns: false,

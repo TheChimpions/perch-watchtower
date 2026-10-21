@@ -1576,8 +1576,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Vote and root distance",
-      "description": "Slots between the cluster tip (the most advanced endpoint) and the validator's last vote and root. Dashed lines are the default alert limits: 200 for votes, 400 for roots.",
+      "title": "Vote distance",
+      "description": "Slots between the cluster tip (the most advanced endpoint) and the validator's last vote. The dashed line is the default alert limit, 200 slots.",
       "targets": [
         {
           "datasource": {
@@ -1585,20 +1585,8 @@
             "uid": "${datasource}"
           },
           "expr": "max by (validator) (max by (instance) (perch_endpoint_slot{job=~\"$job\", instance=~\"$instance\"}) - on (instance) group_right perch_validator_last_vote_slot{job=~\"$job\", instance=~\"$instance\", validator=~\"$validator\"})",
-          "legendFormat": "{{validator}} vote",
+          "legendFormat": "{{validator}}",
           "refId": "A",
-          "editorMode": "code",
-          "range": true,
-          "instant": false
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "max by (validator) (max by (instance) (perch_endpoint_slot{job=~\"$job\", instance=~\"$instance\"}) - on (instance) group_right perch_validator_root_slot{job=~\"$job\", instance=~\"$instance\", validator=~\"$validator\"})",
-          "legendFormat": "{{validator}} root",
-          "refId": "B",
           "editorMode": "code",
           "range": true,
           "instant": false
@@ -1634,12 +1622,8 @@
                 "value": null
               },
               {
-                "color": "orange",
-                "value": 200
-              },
-              {
                 "color": "red",
-                "value": 400
+                "value": 200
               }
             ]
           },
@@ -2162,7 +2146,7 @@
     {
       "type": "stat",
       "title": "VAT per epoch",
-      "description": "The Validator Admission Ticket burned from every admitted vote account at each epoch boundary. It falls as slot times shorten.",
+      "description": "The Validator Admission Ticket burned from every admitted vote account at each epoch boundary: 0.8 SOL at 200ms slots.",
       "targets": [
         {
           "datasource": {
@@ -2226,7 +2210,7 @@
     {
       "type": "stat",
       "title": "Vote accounts under the minimum",
-      "description": "Selected validators whose vote account holds less than rent-exempt plus one VAT. Under Alpenglow they will be excluded at the next boundary.",
+      "description": "Selected validators whose vote account holds less than rent-exempt plus one VAT. They will be excluded at the next boundary.",
       "targets": [
         {
           "datasource": {
@@ -2292,7 +2276,7 @@
     {
       "type": "stat",
       "title": "Missing BLS keys",
-      "description": "Selected validators whose vote account has no BLS public key. Under Alpenglow a vote account without one cannot vote or produce blocks.",
+      "description": "Selected validators whose vote account has no BLS public key. A vote account without one cannot vote or produce blocks.",
       "targets": [
         {
           "datasource": {

@@ -1,8 +1,8 @@
 //! Alert inhibition.
 //!
 //! A delinquent validator is, necessarily and simultaneously, a validator whose
-//! last vote is stale, whose root slot is stale, and whose vote credits have
-//! stopped. Without inhibition that single event opens four PagerDuty incidents.
+//! last vote is stale and whose vote credits have stopped. Without inhibition
+//! that single event opens three PagerDuty incidents.
 //! Prometheus solves this with `inhibit_rules`; this is the same idea, keyed on
 //! the per-validator check IDs.
 //!
@@ -26,15 +26,14 @@ const RULES: &[(&str, &[&str])] = &[
             "vote_delinquent",
             "vote_account_missing",
             "vote_lag",
-            "root_lag",
             "vote_stalled",
         ],
     ),
     (
         "vote_account_missing",
-        &["vote_delinquent", "vote_lag", "root_lag", "vote_stalled"],
+        &["vote_delinquent", "vote_lag", "vote_stalled"],
     ),
-    ("vote_delinquent", &["vote_lag", "root_lag", "vote_stalled"]),
+    ("vote_delinquent", &["vote_lag", "vote_stalled"]),
     // Deliberately absent: vote_admission_critical inhibiting delinquency. It
     // is about the *next* boundary, so while it fires the validator is still
     // admitted to the current epoch, and a delinquency now is a different
@@ -75,17 +74,17 @@ const RULES: &[(&str, &[&str])] = &[
 const CROSS_RULES: &[(&str, &[&str])] = &[
     (
         "disk_readonly",
-        &["vote_delinquent", "vote_lag", "root_lag", "vote_stalled"],
+        &["vote_delinquent", "vote_lag", "vote_stalled"],
     ),
     (
         "disk_space_critical",
-        &["vote_delinquent", "vote_lag", "root_lag", "vote_stalled"],
+        &["vote_delinquent", "vote_lag", "vote_stalled"],
     ),
     // The machine is gone. "chimps-1's machine is hard down" is the page worth
     // reading; "chimps-1 delinquent" is a consequence of it.
     (
         "machine_down",
-        &["vote_delinquent", "vote_lag", "root_lag", "vote_stalled"],
+        &["vote_delinquent", "vote_lag", "vote_stalled"],
     ),
 ];
 
@@ -226,17 +225,16 @@ mod tests {
 
     #[test]
     fn delinquency_absorbs_its_own_symptoms() {
-        // The exact case measured against the real binary: one delinquency
-        // producing four pages.
+        // The case measured against the real binary: one delinquency producing
+        // a page per symptom.
         let outcomes = vec![
             bad("vote_delinquent:chimps-1"),
             bad("vote_lag:chimps-1"),
-            bad("root_lag:chimps-1"),
             bad("vote_stalled:chimps-1"),
         ];
         let s = compute(&outcomes);
-        assert_eq!(s.len(), 3);
-        for sym in ["vote_lag", "root_lag", "vote_stalled"] {
+        assert_eq!(s.len(), 2);
+        for sym in ["vote_lag", "vote_stalled"] {
             assert_eq!(
                 s.get(&format!("{sym}:chimps-1")).map(String::as_str),
                 Some("vote_delinquent:chimps-1")
@@ -413,7 +411,7 @@ mod tests {
         let outcomes = vec![
             bad("vote_delinquent:chimps-1"),
             bad("vote_lag:chimps-1"),
-            bad("root_lag:chimps-1"),
+            bad("vote_stalled:chimps-1"),
         ];
         let s = compute(&outcomes);
         let listed = symptoms_of("vote_delinquent:chimps-1", &s, &outcomes);

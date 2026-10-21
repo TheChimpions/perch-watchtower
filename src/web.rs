@@ -239,9 +239,7 @@ pub fn render(d: &PageData<'_>) -> String {
                 let warn_floor = d
                     .disk_space
                     .effective_floor(d.disk_space.warn_free_gb, fs.size_gb());
-                let tag = if fs.readonly {
-                    "t-bad"
-                } else if fs.avail_gb() < page_floor {
+                let tag = if fs.readonly || fs.avail_gb() < page_floor {
                     "t-bad"
                 } else if fs.avail_gb() < warn_floor {
                     "t-warn"

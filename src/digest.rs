@@ -212,9 +212,9 @@ mod tests {
         assert_eq!(render(10, &tails, &[], &config), None);
     }
 
-    /// Under Alpenglow the summary says how many epochs of VAT are left.
+    /// The summary says how many epochs of VAT are left.
     #[test]
-    fn the_vote_account_line_carries_vat_runway_under_alpenglow() {
+    fn the_vote_account_line_carries_vat_runway() {
         use crate::snapshot::EpochInfo;
         let mut snap = Snapshot::empty_for_test("a");
         snap.epoch_info = Some(EpochInfo { absolute_slot: 4_320_100, epoch: 10, slot_index: 100, slots_in_epoch: 432_000 });

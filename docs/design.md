@@ -69,15 +69,15 @@ visibility returns, and the first bad reading would page immediately.
 
 ### One event, one page
 
-A delinquent validator is necessarily also a validator whose last vote is stale,
-whose root slot is stale, and whose credits have stopped. Without inhibition,
-an early perch build opened **four** PagerDuty incidents for that single event. Prometheus
+A delinquent validator is necessarily also a validator whose last vote is stale
+and whose credits have stopped. Without inhibition, an early perch build opened
+a PagerDuty incident for each of those symptoms of that single event. Prometheus
 solves this with `inhibit_rules`; perch does the same, keyed per validator:
 
 ```
 cluster_stalled       inhibits  every validator vote/lag check
-vote_account_missing  inhibits  vote_delinquent, vote_lag, root_lag, vote_stalled
-vote_delinquent       inhibits  vote_lag, root_lag, vote_stalled
+vote_account_missing  inhibits  vote_delinquent, vote_lag, vote_stalled
+vote_delinquent       inhibits  vote_lag, vote_stalled
 ```
 
 The surviving alert lists the suppressed symptoms in its body, so you lose

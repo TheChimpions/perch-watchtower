@@ -54,8 +54,6 @@ pub struct VoteAccountInfo {
     pub commission: u8,
     #[serde(default)]
     pub last_vote: u64,
-    #[serde(default)]
-    pub root_slot: u64,
     /// `[(epoch, credits, previous_credits)]`
     #[serde(default)]
     pub epoch_credits: Vec<(u64, u64, u64)>,
@@ -706,7 +704,6 @@ mod tests {
             activated_stake: 100,
             commission: 8,
             last_vote,
-            root_slot: last_vote.saturating_sub(32),
             epoch_credits: vec![(10, credits, credits.saturating_sub(1000))],
         }
     }
@@ -901,7 +898,6 @@ mod chain_sentinels {
             activated_stake: 1,
             commission: 0,
             last_vote: 1,
-            root_slot: 1,
             epoch_credits,
         }
     }

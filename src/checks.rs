@@ -339,20 +339,6 @@ pub fn evaluate(
             ));
         }
 
-        if c.root_lag.base.enabled {
-            let id = identity.clone();
-            let max_slots = c.root_lag.max_slots;
-            out.push(outcome(
-                format!("root_lag:{who}"),
-                format!("{who} root slot is behind the cluster"),
-                c.root_lag.base.clone(),
-                per_endpoint(snapshots, &stale, |s| {
-                    lag_verdict(s, &id, &who, max_slots, "root slot", |i| i.root_slot)
-                }),
-                mc,
-            ));
-        }
-
         if c.vote_stalled.enabled {
             let observed = best(snapshots, |s| {
                 if stale.contains_key(&s.endpoint) {
@@ -1421,7 +1407,6 @@ pub fn still_configured(id: &str, config: &Config) -> bool {
         "vote_delinquent" => c.vote_delinquent.enabled && validator(subject),
         "vote_account_missing" => c.vote_account_missing.enabled && validator(subject),
         "vote_lag" => c.vote_lag.base.enabled && validator(subject),
-        "root_lag" => c.root_lag.base.enabled && validator(subject),
         "vote_stalled" => c.vote_stalled.enabled && validator(subject),
         // Only produced for validators with an expected commission set.
         "commission_changed" => {
@@ -1581,14 +1566,13 @@ mod tests {
     use super::*;
     use crate::snapshot::{EpochInfo, VoteAccountInfo};
 
-    fn vai(node: &str, last_vote: u64, root: u64, credits: u64, commission: u8) -> VoteAccountInfo {
+    fn vai(node: &str, last_vote: u64, credits: u64, commission: u8) -> VoteAccountInfo {
         VoteAccountInfo {
             vote_pubkey: format!("vote-{node}"),
             node_pubkey: node.into(),
             activated_stake: 1,
             commission,
             last_vote,
-            root_slot: root,
             epoch_credits: vec![(10, credits, 0)],
         }
     }
@@ -1624,7 +1608,7 @@ mod tests {
         snap(
             name,
             slot,
-            ValidatorObservation::Voting(vai("val", slot - 10, slot - 42, 5, 8)),
+            ValidatorObservation::Voting(vai("val", slot - 10, 5, 8)),
         )
     }
 
@@ -1872,7 +1856,7 @@ mod tests {
         let s = snap(
             "stale",
             1000,
-            ValidatorObservation::Voting(vai("val", 1200, 1168, 5, 8)),
+            ValidatorObservation::Voting(vai("val", 1200, 5, 8)),
         );
         let v = lag_verdict(&s, "val", "val", 100, "last vote", |i| i.last_vote);
         assert!(matches!(v, Verdict::Unknown(_)), "got {v}");
@@ -1883,7 +1867,7 @@ mod tests {
         let s = snap(
             "ok",
             1000,
-            ValidatorObservation::Voting(vai("val", 950, 918, 5, 8)),
+            ValidatorObservation::Voting(vai("val", 950, 5, 8)),
         );
         assert_eq!(
             lag_verdict(&s, "val", "val", 100, "last vote", |i| i.last_vote),
@@ -1896,7 +1880,7 @@ mod tests {
         let s = snap(
             "ok",
             1000,
-            ValidatorObservation::Voting(vai("val", 500, 468, 5, 8)),
+            ValidatorObservation::Voting(vai("val", 500, 5, 8)),
         );
         assert!(matches!(
             lag_verdict(&s, "val", "val", 100, "last vote", |i| i.last_vote),
@@ -1947,7 +1931,7 @@ mod tests {
             out.extend(evaluate_peers(&[peer_status("hub", false, None)], &snaps, &c, Duration::from_secs(300), &HashMap::new(), 0));
             // Exact on purpose: a new check kind changes this count, and whoever
             // adds it must also teach still_configured about it.
-            assert_eq!(out.len(), 20, "check kinds changed: update still_configured, then this count");
+            assert_eq!(out.len(), 19, "check kinds changed: update still_configured, then this count");
             for o in &out {
                 assert!(still_configured(&o.id, &c), "{} is produced but would be retired", o.id);
             }
@@ -1967,16 +1951,21 @@ mod tests {
             assert_eq!(orphaned(states.iter(), &[], &c), vec!["vote_balance_critical:chimps-1"]);
         }
 
-        /// Identity balance checks were removed once Alpenglow made votes free.
-        /// A state saved by an older version, firing or not, must be retired so
-        /// an incident it opened is resolved rather than left open.
+        /// Identity balance and root lag checks were removed in 1.3.0. A
+        /// state saved by an older version, firing or not, must be retired so
+        /// an incident it opened is resolved rather than left open -- refi-main's
+        /// root_lag page was open when 1.3.0 was prepared.
         #[test]
-        fn identity_balance_states_from_before_alpenglow_are_orphaned() {
+        fn checks_removed_in_1_3_are_orphaned() {
             let c = config("");
-            let states = ["identity_balance_critical:chimps-1".to_string(), "identity_balance_warn:chimps-1".to_string()];
+            let states = [
+                "identity_balance_critical:chimps-1".to_string(),
+                "identity_balance_warn:chimps-1".to_string(),
+                "root_lag:chimps-1".to_string(),
+            ];
             assert_eq!(
                 orphaned(states.iter(), &[], &c),
-                vec!["identity_balance_critical:chimps-1", "identity_balance_warn:chimps-1"]
+                vec!["identity_balance_critical:chimps-1", "identity_balance_warn:chimps-1", "root_lag:chimps-1"]
             );
         }
 
@@ -2212,7 +2201,7 @@ mod tests {
                 .iter()
                 .map(|n| {
                     let mut s = bare_snapshot(n, Some(4_320_100));
-                    s.validators.insert(ID.into(), ValidatorObservation::Voting(vai(ID, 4_320_090, 4_320_058, 5, 5)));
+                    s.validators.insert(ID.into(), ValidatorObservation::Voting(vai(ID, 4_320_090, 5, 5)));
                     if let Some(i) = &invoices {
                         s.vault_invoices.insert(ID.into(), Ok(i.clone()));
                     }

@@ -82,7 +82,7 @@ each claim on your own machine.
 
 ## Features
 
-**Validator health.** Delinquency, vote and root lag, stalled vote credits,
+**Validator health.** Delinquency, vote lag, stalled vote credits,
 skipped leader slots, unexpected commission changes, and the delegation program's minimum version for this epoch
 and the next.
 
@@ -124,7 +124,7 @@ disk and notification channel, and a ready-made Grafana dashboard.
 | check | tier | fires after | notes |
 |---|---|---|---|
 | `vote_delinquent` | page | 60s | strict on purpose; corroboration does the filtering |
-| `vote_lag` / `root_lag` | page | 3m / 5m | slots behind the cluster tip |
+| `vote_lag` | page | 3m | last vote slots behind the cluster tip |
 | `vote_stalled` | page | 5m | credits not advancing: catches voting-but-not-landing |
 | `skip_rate` | notify / page | 20m | leader slots assigned vs blocks produced |
 | `vote_admission` | notify / page | 10m | Alpenglow: BLS key and VAT balance for the next epoch boundary |
@@ -151,7 +151,7 @@ version, checked against its v4.3.0 source:
 | A majority of RPC endpoints fail | pages "Watchtower is unreliable" after ~2 min | reported separately: Telegram at 5 min, page at 20 |
 | Endpoints | exactly 1 or 3 | any number, with configurable quorum |
 | Severity | everything is critical | page, notify or log, per check |
-| Vote and root lag, credit stalls, skip rate | no | yes |
+| Vote lag, credit stalls, skip rate | no | yes |
 | Commission changes, delegation-program version | no | yes |
 | Disks, own-node lag, machine down | no | yes |
 | Planned maintenance | pages you | `perch maint restart` |

@@ -111,12 +111,6 @@ pub struct MetricsConfig {
     /// convenience link; perch never talks to Grafana itself.
     #[serde(default)]
     pub grafana_url: Option<String>,
-    /// Emit every metric a second time under this prefix. Exists only to make a
-    /// rename survivable: during a staged rollout the un-renamed half of the
-    /// fleet, and any dashboard or rule still written against the old name,
-    /// keep working. Remove it once the rollout is done.
-    #[serde(default)]
-    pub compat_prefix: Option<String>,
 }
 
 fn default_metrics_listen() -> String {
@@ -719,11 +713,6 @@ pub struct VoteAdmissionCheckConfig {
     /// epoch boundaries of VAT with no income.
     #[serde(default = "default_vote_admission_warn_epochs")]
     pub warn_epochs: u64,
-    /// Removed in 1.3.0 with the readiness notes it enabled: Alpenglow is
-    /// active on every cluster perch watches. Accepted and ignored so an older
-    /// config still loads.
-    #[serde(default)]
-    pub alert_before_scheduled: Option<bool>,
 }
 
 fn default_vote_admission_warn_epochs() -> u64 {
@@ -740,7 +729,6 @@ fn default_vote_admission() -> VoteAdmissionCheckConfig {
             ..CheckConfig::new(d(10 * 60), Severity::Page)
         },
         warn_epochs: default_vote_admission_warn_epochs(),
-        alert_before_scheduled: None,
     }
 }
 
@@ -862,17 +850,10 @@ pub struct Checks {
     pub vote_account_missing: CheckConfig,
     #[serde(default = "default_vote_lag")]
     pub vote_lag: LagCheckConfig,
-    #[serde(default = "default_root_lag")]
-    pub root_lag: LagCheckConfig,
     #[serde(default = "default_vote_stalled")]
     pub vote_stalled: CheckConfig,
     #[serde(default = "default_vote_admission")]
     pub vote_admission: VoteAdmissionCheckConfig,
-    /// Removed in 1.3.0: under Alpenglow votes cost the identity nothing, so
-    /// its balance cannot take a validator delinquent. Accepted and ignored so
-    /// an older config still loads.
-    #[serde(default)]
-    pub identity_balance: Option<toml::Value>,
     #[serde(default = "default_commission")]
     pub commission_changed: CheckConfig,
     /// Whether the validator meets the Solana Foundation Delegation Program's
@@ -1011,12 +992,6 @@ fn default_vote_lag() -> LagCheckConfig {
     LagCheckConfig {
         base: CheckConfig::new(d(3 * 60), Severity::Page),
         max_slots: 200,
-    }
-}
-fn default_root_lag() -> LagCheckConfig {
-    LagCheckConfig {
-        base: CheckConfig::new(d(5 * 60), Severity::Page),
-        max_slots: 400,
     }
 }
 fn default_vote_stalled() -> CheckConfig {
@@ -1212,10 +1187,8 @@ impl Default for Checks {
             vote_delinquent: default_delinquent(),
             vote_account_missing: default_missing(),
             vote_lag: default_vote_lag(),
-            root_lag: default_root_lag(),
             vote_stalled: default_vote_stalled(),
             vote_admission: default_vote_admission(),
-            identity_balance: None,
             commission_changed: default_commission(),
             sfdp_version: default_sfdp_version(),
             vault_invoices: default_vault_invoices(),
@@ -1528,18 +1501,6 @@ impl Config {
             }
         }
 
-        if self.checks.identity_balance.is_some() {
-            tracing::warn!(
-                "[checks.identity_balance] is ignored: under Alpenglow the identity no longer pays \
-                 for votes, and vote_admission watches the vote account instead. Remove the section."
-            );
-        }
-        if self.checks.vote_admission.alert_before_scheduled.is_some() {
-            tracing::warn!(
-                "checks.vote_admission.alert_before_scheduled is ignored: Alpenglow is active, so \
-                 there is no readiness to report. Remove the setting."
-            );
-        }
         let v = &self.checks.vault_invoices;
         if v.warn_unpaid == 0 || v.warn_unpaid > v.page_unpaid {
             bail!("checks.vault_invoices needs 1 <= warn_unpaid <= page_unpaid");
@@ -1630,7 +1591,7 @@ impl Config {
 
         if self.checks.node_behind.base.enabled
             && !self.endpoints.iter().any(|e| e.monitor)
-            && self.endpoints.iter().count() > 0
+            && !self.endpoints.is_empty()
         {
             tracing::debug!(
                 "checks.node_behind is enabled but no endpoint sets monitor = true, so it \
@@ -2255,21 +2216,27 @@ identity = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv"
         assert!(Config::parse(&src).is_err());
     }
 
-    /// Settings removed with the pre-Alpenglow checks must not stop an older
-    /// config from loading.
+    /// Settings removed in 1.3.0 are unknown keys now, and an unknown key is
+    /// a config error like any other typo.
     #[test]
-    fn removed_pre_alpenglow_settings_still_load() {
-        let src = format!(
+    fn settings_removed_in_1_3_are_rejected() {
+        let section = format!(
             "{MINIMAL}\n[checks.identity_balance]\npending_for = \"15m\"\nseverity = \"page\"\n\
-             warn_sol = 3.0\npage_sol = 0.5\nsol_per_epoch = 2.0\n\
-             [checks.vote_admission]\npending_for = \"10m\"\nseverity = \"page\"\nalert_before_scheduled = true\n"
+             warn_sol = 3.0\npage_sol = 0.5\n"
         );
-        let c = Config::parse(&src).unwrap();
-        assert!(c.checks.identity_balance.is_some());
-        assert_eq!(c.checks.vote_admission.alert_before_scheduled, Some(true));
+        assert!(Config::parse(&section).is_err());
+        let flag = format!(
+            "{MINIMAL}\n[checks.vote_admission]\npending_for = \"10m\"\nseverity = \"page\"\n\
+             alert_before_scheduled = true\n"
+        );
+        assert!(Config::parse(&flag).is_err());
+        // What the five testnet configs carried on 2026-10-21.
+        let root_lag = format!(
+            "{MINIMAL}\n[checks.root_lag]\nenabled = true\nmax_slots = 800\npending_for = \"10m\"\nseverity = \"notify\"\n"
+        );
+        assert!(Config::parse(&root_lag).is_err());
     }
 
-    /// Claims land every epoch; only the bond against the requirement alerts.
     #[test]
     fn jpool_drawdowns_are_not_announced_unless_asked() {
         let c = Config::parse(MINIMAL).unwrap();

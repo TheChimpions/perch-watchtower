@@ -51,7 +51,7 @@ Three deliberate properties:
   mid-restart before the next check catches up.
 
 The window starts and ends on the checks that show the validator voting:
-`vote_delinquent`, `vote_lag`, `root_lag`, `vote_stalled` and `node_behind`.
+`vote_delinquent`, `vote_lag`, `vote_stalled` and `node_behind`.
 Nothing else is caused by a restart. A JPool bond warning that has been firing
 for a day does not hold the window open, and it does not count as the work
 having started. Anything else still wrong keeps alerting once paging is back
@@ -395,10 +395,18 @@ transactions, so an empty identity cannot take a validator delinquent. What
 matters is `vote_admission`: the vote account must hold the rent-exempt minimum
 plus the next epoch's VAT at every boundary.
 
-`identity_balance` was removed in 1.3.0. On upgrade, any state an older version
-saved for it is retired, and an incident it opened is resolved. A config that
-still has `[checks.identity_balance]` or `alert_before_scheduled` loads, with a
-warning to remove them.
+`identity_balance` and `root_lag` were removed in 1.3.0. On upgrade, any state
+an older version saved for them is retired, and an incident it opened is
+resolved. Delete `[checks.identity_balance]`, `[checks.root_lag]` and
+`alert_before_scheduled` from an older config before upgrading: unknown keys are
+a config error, so it will not load.
+
+`root_lag` went because the root slot a vote account records is no longer a
+health signal under Alpenglow. On mainnet on 2026-10-21 it sat thousands of
+slots behind on validators that were voting within 10 slots of the tip,
+finalizing locally, and earning the cluster's median credits, then jumped to
+current minutes later. `vote_lag`, `vote_stalled` and `vote_delinquent` cover a
+validator that stops voting or stops earning.
 
 See [design.md](design.md#the-vote-account-is-the-balance-that-matters)
 for the rules and where each one comes from in Agave.
@@ -443,7 +451,7 @@ CHECKS
   ARMING vote_delinquent:chimps-1   page  delinquent, last vote 312869910
                                           (0s of 1m banked, fires in ~1m)
   MUTED  vote_lag:chimps-1          page  explained by vote_delinquent:chimps-1
-  MUTED  root_lag:chimps-1          page  explained by vote_delinquent:chimps-1
+  MUTED  vote_stalled:chimps-1      page  explained by vote_delinquent:chimps-1
   FROZEN disk_fill_critical:...     page  only 12m of history, need 45m
   ok     vote_admission_warn:...  notify 2 endpoint(s) agree
 
@@ -521,7 +529,7 @@ Both are tested against a live Grafana and Prometheus.
   age, alerting owner, silences, and the perch and validator versions.
 - **Checks**: when each check was unhealthy or could not be evaluated, how far
   unhealthy checks are toward their hold-down, and what is firing now.
-- **Validators**: vote and root distance from the cluster tip, delinquency,
+- **Validators**: vote distance from the cluster tip, delinquency,
   vote credits per hour, skip rate, and leader slots this epoch.
 - **RPC endpoints**: which endpoints answered, errors by kind, and how far each
   is behind the most advanced one.
@@ -612,7 +620,6 @@ perch_node_version{endpoint="...",version="...",feature_set="..."}
 perch_cycle_duration_seconds
 perch_check_pending_for_seconds{check="..."}
 perch_endpoint_config_errors_total{endpoint="..."}
-perch_validator_root_slot{identity="..."}
 perch_silenced
 perch_maintenance_awaiting_work            1 while armed and work has not begun
 perch_maintenance_healthy_streak           clean cycles banked toward resuming
@@ -661,17 +668,6 @@ It checks that no peer resolves to this instance's own listen address, that the
 silence directory exists so maintenance mode can actually be declared, and
 reports the sandbox as fact rather than as whatever the unit file requested.
 `--check-config` runs the same checks.
-
-### Renaming without an outage
-
-`[metrics] compat_prefix = "old_name"` emits every metric a second time under a
-second prefix. It exists so a fleet can be renamed one box at a time: peers speak
-the metric protocol to each other, so a renamed instance and an un-renamed one
-would otherwise declare each other down in both directions at once. Dashboards
-and alert rules written against the old names keep working too.
-
-Set it during a rollout, remove it once every box is across. Leaving it on is
-harmless but doubles the exposition.
 
 ## Rules worth adding to Prometheus
 

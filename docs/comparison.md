@@ -51,7 +51,7 @@ thresholds: Telegram at 5 minutes, a page at 20.
 |---|---|---|
 | Validator delinquent | yes ([L444–449](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L444-L449)) | yes, corroborated |
 | Vote account missing from the cluster | yes ([L450–456](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L450-L456)) | yes |
-| Vote lag / root lag (slots behind) | no | yes |
+| Vote lag (slots behind) | no | yes |
 | Vote credits not advancing | no | yes: catches "voting but not landing" |
 | Skipped leader slots | no | yes, warn then page |
 | Identity balance | yes, below 10 SOL ([L145–152](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L145-L152)) | no: under Alpenglow votes no longer cost the identity anything |

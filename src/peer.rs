@@ -139,14 +139,7 @@ fn absorb_exposition(status: &mut PeerStatus, text: &str, now_unix: f64) {
         let Some((name, labels, value)) = parse_line(line) else {
             continue;
         };
-        // A peer mid-rename still speaks the old prefix. Matching on the suffix
-        // lets a renamed instance and an un-renamed one read each other, which
-        // is the difference between a staged rollout and a fleet-wide false
-        // `peer_down` in both directions at once.
-        let Some(suffix) = name
-            .strip_prefix("perch_")
-            .or_else(|| name.strip_prefix("chimpstower_"))
-        else {
+        let Some(suffix) = name.strip_prefix("perch_") else {
             continue;
         };
         match suffix {
@@ -572,7 +565,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod rename_compat {
+mod exposition_parsing {
     use super::*;
 
     fn blank() -> PeerStatus {
@@ -605,29 +598,15 @@ mod rename_compat {
         out
     }
 
-    /// The rollout property: a renamed instance must be able to read a peer
-    /// still running the old binary. Without this the hub and every spoke
-    /// declare each other down the moment the first box is upgraded.
     #[test]
-    fn a_renamed_instance_can_read_an_unrenamed_peer() {
+    fn a_peer_exposition_is_read() {
         let now = 1_700_000_000.0;
         let mut st = blank();
-        absorb_exposition(&mut st, &exposition("chimpstower", now), now);
+        absorb_exposition(&mut st, &exposition("perch", now), now);
         assert_eq!(st.visible, Some(true));
         assert_eq!(st.version.as_deref(), Some("0.1.0"));
         assert!(st.last_cycle_age.unwrap().as_secs() <= 11);
         assert!(st.uptime.unwrap().as_secs() >= 3599);
-    }
-
-    #[test]
-    fn the_new_prefix_still_reads_identically() {
-        let now = 1_700_000_000.0;
-        let (mut a, mut b) = (blank(), blank());
-        absorb_exposition(&mut a, &exposition("perch", now), now);
-        absorb_exposition(&mut b, &exposition("chimpstower", now), now);
-        assert_eq!(a.visible, b.visible);
-        assert_eq!(a.version, b.version);
-        assert_eq!(a.last_cycle_age, b.last_cycle_age);
     }
 
     /// An unrelated exporter on the same port must not be mistaken for a peer.

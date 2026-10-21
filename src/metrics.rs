@@ -233,33 +233,6 @@ pub struct CycleReport<'a> {
     pub jpool_security_sol_per_1000: f64,
 }
 
-/// Duplicate a rendered exposition under a second metric prefix.
-///
-/// Purely a rename shim. A fleet cannot be renamed atomically, so for the
-/// duration of a rollout the old names have to keep answering -- for the half of
-/// the fleet still running the old binary, and for every dashboard and alert
-/// rule written against them. Delete the config key and this function once the
-/// rollout is finished.
-pub fn with_compat_alias(rendered: &str, prefix: &str) -> String {
-    let mut out = String::with_capacity(rendered.len() * 2);
-    for line in rendered.lines() {
-        out.push_str(line);
-        out.push('\n');
-        let aliased = if let Some(rest) = line.strip_prefix("# HELP perch_") {
-            Some(format!("# HELP {prefix}_{rest}"))
-        } else if let Some(rest) = line.strip_prefix("# TYPE perch_") {
-            Some(format!("# TYPE {prefix}_{rest}"))
-        } else {
-            line.strip_prefix("perch_").map(|rest| format!("{prefix}_{rest}"))
-        };
-        if let Some(a) = aliased {
-            out.push_str(&a);
-            out.push('\n');
-        }
-    }
-    out
-}
-
 pub fn render(r: &CycleReport<'_>) -> String {
     let mut e = Exposition::new();
 
@@ -589,11 +562,6 @@ pub fn render(r: &CycleReport<'_>) -> String {
         "gauge",
     );
     e.metric(
-        "perch_validator_root_slot",
-        "Highest root slot reported for the validator",
-        "gauge",
-    );
-    e.metric(
         "perch_validator_credits",
         "Highest cumulative vote credits reported for the validator",
         "gauge",
@@ -629,7 +597,7 @@ pub fn render(r: &CycleReport<'_>) -> String {
         .max_by_key(|(_, p)| p.absolute_slot);
     e.metric(
         "perch_vat_per_epoch_sol",
-        "Validator Admission Ticket burned from each vote account per epoch under Alpenglow",
+        "Validator Admission Ticket burned from each vote account per epoch",
         "gauge",
     );
     e.metric(
@@ -644,7 +612,7 @@ pub fn render(r: &CycleReport<'_>) -> String {
     }
     e.metric(
         "perch_validator_vote_account_balance_sol",
-        "Vote account balance in SOL. Under Alpenglow this pays the VAT every epoch.",
+        "Vote account balance in SOL. It pays the VAT every epoch.",
         "gauge",
     );
     e.metric(
@@ -654,7 +622,7 @@ pub fn render(r: &CycleReport<'_>) -> String {
     );
     e.metric(
         "perch_validator_vote_net_sol_per_epoch",
-        "Commission income minus VAT per epoch. Negative is a vote account that drains under Alpenglow.",
+        "Commission income minus VAT per epoch. Negative is a vote account that drains.",
         "gauge",
     );
     e.metric(
@@ -717,9 +685,6 @@ pub fn render(r: &CycleReport<'_>) -> String {
 
         if let Some(v) = infos.iter().filter_map(|o| o.info()).map(|i| i.last_vote).max() {
             e.value("perch_validator_last_vote_slot", &labels, v as f64);
-        }
-        if let Some(v) = infos.iter().filter_map(|o| o.info()).map(|i| i.root_slot).max() {
-            e.value("perch_validator_root_slot", &labels, v as f64);
         }
         if let Some(v) = infos
             .iter()
@@ -1098,40 +1063,6 @@ mod notify_metrics {
 }
 
 #[cfg(test)]
-mod compat_alias {
-    use super::*;
-
-    #[test]
-    fn every_metric_line_gains_an_aliased_twin() {
-        let src = "# HELP perch_visible help text\n# TYPE perch_visible gauge\nperch_visible 1\n";
-        let out = with_compat_alias(src, "chimpstower");
-        for expected in [
-            "# HELP chimpstower_visible help text",
-            "# TYPE chimpstower_visible gauge",
-            "chimpstower_visible 1",
-            "perch_visible 1",
-        ] {
-            assert!(out.contains(expected), "missing {expected} in:\n{out}");
-        }
-    }
-
-    #[test]
-    fn labels_survive_the_alias() {
-        let out = with_compat_alias("perch_check_firing{check=\"vote:a\"} 1\n", "chimpstower");
-        assert!(out.contains("chimpstower_check_firing{check=\"vote:a\"} 1"), "{out}");
-    }
-
-    /// Only perch's own metrics are aliased. A comment or a foreign line must
-    /// not be duplicated, or the exposition stops being parseable.
-    #[test]
-    fn unrelated_lines_are_not_duplicated() {
-        let out = with_compat_alias("# a bare comment\nnode_up 1\n", "chimpstower");
-        assert_eq!(out.matches("node_up 1").count(), 1);
-        assert_eq!(out.matches("# a bare comment").count(), 1);
-    }
-}
-
-#[cfg(test)]
 mod version_metric {
     use super::*;
     use crate::{notify::NotifyCounts, snapshot::NodeVersion};
@@ -1277,7 +1208,6 @@ mod alpenglow_metrics {
                 activated_stake: 1,
                 commission: 5,
                 last_vote: 4_320_090,
-                root_slot: 4_320_060,
                 epoch_credits: vec![(10, 5, 0)],
             }),
         );

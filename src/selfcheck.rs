@@ -181,20 +181,6 @@ pub fn run(config: &Config) -> Vec<Finding> {
         }
     }
 
-    if let Some(prefix) = config
-        .metrics
-        .as_ref()
-        .and_then(|m| m.compat_prefix.as_deref())
-    {
-        out.push(Finding {
-            severity: Severity::Note,
-            message: format!(
-                "metrics.compat_prefix is set to \"{prefix}\", doubling the exposition. \
-                 It exists for a rollout; remove it once every instance is renamed."
-            ),
-        });
-    }
-
     out
 }
 

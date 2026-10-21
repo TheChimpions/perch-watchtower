@@ -69,7 +69,6 @@ fn healthy_body(method: &str, delinquent: bool, tick: u64) -> String {
         "getGenesisHash" => r#""5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d""#.to_string(),
         "getEpochInfo" => format!(r#"{{"absoluteSlot":{slot},"epoch":820}}"#),
         "getVoteAccounts" => format!(r#"{{"current":{current},"delinquent":{delinq}}}"#),
-        "getBalance" => format!(r#"{{"context":{{"slot":{slot}}},"value":25000000000}}"#),
         _ => "null".to_string(),
     };
     format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#)

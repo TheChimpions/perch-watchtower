@@ -68,10 +68,6 @@ pub struct PersistedState {
     /// not watch.
     #[serde(default)]
     pub last_digest_epoch: Option<u64>,
-    /// Identity balance history behind the measured runway. Absent in state
-    /// files from before it existed, which simply start measuring afresh.
-    #[serde(default)]
-    pub identity_history: HashMap<String, crate::fillrate::FillHistory>,
     /// JPool bond headroom history behind its runway. A week of it; losing it
     /// on every restart would leave the warning on its fallback for two days.
     #[serde(default)]
@@ -141,7 +137,6 @@ pub fn save(
         disk_history: disk.export(),
         last_self_test_unix,
         last_digest_epoch,
-        identity_history: progress.export_identity_history(),
         bond_history: progress.export_bond_history(),
     };
 
@@ -237,7 +232,6 @@ pub fn load(
         .collect();
 
     progress.import(parsed.validator_credits, parsed.cluster_slot);
-    progress.import_identity_history(parsed.identity_history);
     progress.import_bond_history(parsed.bond_history);
     disk.import(parsed.disk_history);
     blindness.restore(parsed.blind_incident_key, parsed.blind_announced);
@@ -536,5 +530,33 @@ mod self_test_clock {
             &mut BlindnessState::default(),
         );
         assert_eq!(restored.last_self_test_unix, 0);
+    }
+
+    /// A 1.2.x state file carries identity balance history and identity
+    /// balance check states. Neither may stop it loading: the check states
+    /// are restored so the orphan sweep can resolve any incident they opened.
+    #[test]
+    fn state_from_before_identity_balances_were_dropped_still_loads() {
+        let d = tmpdir();
+        let path = d.join("state.json");
+        let legacy = format!(
+            r#"{{"version":{FORMAT_VERSION},"saved_at_unix":1700000000,
+               "checks":{{"identity_balance_critical:chimps-1":{{"unhealthy_for_secs":3600,
+                 "healthy_streak":0,"firing":true,"incident_key":"k","incident_closed":false,
+                 "pending_ago_secs":null}}}},
+               "announced":["identity_balance_critical:chimps-1"],"validator_credits":{{}},
+               "cluster_slot":null,"blind_incident_key":null,"blind_announced":false,
+               "identity_history":{{"ID":{{"samples":[[1700000000,100000000]]}}}}}}"#
+        );
+        std::fs::write(&path, legacy).unwrap();
+
+        let restored = load(
+            &path,
+            &mut Progress::default(),
+            &mut DiskHistory::default(),
+            &mut BlindnessState::default(),
+        );
+        assert!(restored.states.get("identity_balance_critical:chimps-1").is_some_and(|s| s.is_firing()));
+        assert!(restored.announced.contains("identity_balance_critical:chimps-1"));
     }
 }

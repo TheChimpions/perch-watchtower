@@ -91,9 +91,9 @@ a different kind of system.
 perch issues **4 calls per cycle per endpoint** for one validator —
 `getEpochInfo`; `getVoteAccounts` filtered to your vote account and
 `getBlockProduction`, each per validator; and `getMultipleAccounts` for the
-vote accounts, identity balances and Alpenglow feature accounts, ten accounts
-per call (the most publicnode accepts), which is one call for a single
-validator. At a 60-second interval that is 5,760/day, ~173,000/month per
+vote accounts, ten per call (the most publicnode accepts), which is one call
+for up to ten validators. The rent minimum and last epoch's commission are
+fetched once an hour. At a 60-second interval that is 5,760/day, ~173,000/month per
 endpoint. Three options, in order of preference:
 
 **1. Your own validator's RPC — free, unlimited, best signal.** Bind it to

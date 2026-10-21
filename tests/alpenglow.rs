@@ -1,10 +1,9 @@
 //! Alpenglow admission, end to end: real HTTP, real JSON-RPC parsing, real
-//! check evaluation, against a mock cluster where Alpenglow is active.
+//! check evaluation, against a mock cluster.
 //!
 //! The mock enforces publicnode's limit of 10 accounts per
-//! `getMultipleAccounts`. Three validators need 11 (five feature accounts plus
-//! a vote account and an identity each), which is how the first version of
-//! this check went Unknown on a live testnet endpoint every cycle.
+//! `getMultipleAccounts`. Eleven validators need 11 vote accounts; exceeding the limit is how the first version of this
+//! check went Unknown on a live testnet endpoint every cycle.
 
 use perch::{
     checks::{self, Progress},
@@ -17,7 +16,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -27,7 +26,6 @@ use tokio::{
     net::TcpListener,
 };
 
-const ALPENGLOW: &str = "A1pengvuM6JEcyNuTnMqepBKhwHE3N6PmUrdATGawhJS";
 const SLOT: u64 = 4_320_100;
 
 struct Validator {
@@ -36,17 +34,19 @@ struct Validator {
     vote: &'static str,
     vote_lamports: u64,
     bls: bool,
-    identity_lamports: u64,
 }
 
-const VALIDATORS: [Validator; 3] = [
+const fn healthy(label: &'static str, identity: &'static str, vote: &'static str) -> Validator {
+    Validator { label, identity, vote, vote_lamports: 56_528_579_320_676, bls: true }
+}
+
+const VALIDATORS: [Validator; 11] = [
     Validator {
         label: "healthy",
         identity: "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv",
         vote: "3xPsGpzsAAiF4aU3jsEHcZtZHQVGKVCJqJ2bDYPHF6oy",
         vote_lamports: 56_528_579_320_676,
         bls: true,
-        identity_lamports: 107_390_000_000,
     },
     Validator {
         label: "underfunded",
@@ -54,8 +54,6 @@ const VALIDATORS: [Validator; 3] = [
         vote: "UnderfundedVote11111111111111111111111111111",
         vote_lamports: 19_761_200,
         bls: true,
-        // Under 0.5 SOL: would page before Alpenglow, must not under it.
-        identity_lamports: 100_000_000,
     },
     Validator {
         label: "no-bls",
@@ -63,15 +61,29 @@ const VALIDATORS: [Validator; 3] = [
         vote: "NoBLSKeyVote11111111111111111111111111111111",
         vote_lamports: 174_057_848_124_337,
         bls: false,
-        identity_lamports: 50_000_000_000,
     },
+    healthy("healthy-2", "Healthy2Id111111111111111111111111111111111", "Healthy2Vote1111111111111111111111111111111"),
+    healthy("healthy-3", "Healthy3Id111111111111111111111111111111111", "Healthy3Vote1111111111111111111111111111111"),
+    healthy("healthy-4", "Healthy4Id111111111111111111111111111111111", "Healthy4Vote1111111111111111111111111111111"),
+    healthy("healthy-5", "Healthy5Id111111111111111111111111111111111", "Healthy5Vote1111111111111111111111111111111"),
+    healthy("healthy-6", "Healthy6Id111111111111111111111111111111111", "Healthy6Vote1111111111111111111111111111111"),
+    healthy("healthy-7", "Healthy7Id111111111111111111111111111111111", "Healthy7Vote1111111111111111111111111111111"),
+    healthy("healthy-8", "Healthy8Id111111111111111111111111111111111", "Healthy8Vote1111111111111111111111111111111"),
+    healthy("healthy-9", "Healthy9Id111111111111111111111111111111111", "Healthy9Vote1111111111111111111111111111111"),
 ];
 
+/// What one mock endpoint was asked for.
+#[derive(Default)]
+struct Seen {
+    /// The largest `getMultipleAccounts` batch.
+    largest: AtomicUsize,
+    /// Every account key requested, across batches.
+    total: AtomicUsize,
+    /// Some batch asked for a validator identity.
+    identity: AtomicBool,
+}
+
 fn account_for(key: &str) -> Value {
-    if key == ALPENGLOW {
-        // Feature { activated_at: Some(0) }
-        return json!({"lamports": 1, "owner": "Feature111111111111111111111111111111111111", "data": ["AQAAAAAAAAAA", "base64"]});
-    }
     for v in &VALIDATORS {
         if key == v.vote {
             return json!({"lamports": v.vote_lamports, "data": {"parsed": {"type": "vote", "info": {
@@ -82,15 +94,11 @@ fn account_for(key: &str) -> Value {
                 "blsPubkeyCompressed": if v.bls { json!("BLSPUBKEYPLACEHOLDER") } else { Value::Null },
             }}}});
         }
-        if key == v.identity {
-            return json!({"lamports": v.identity_lamports, "data": ["", "base64"]});
-        }
     }
-    // The slot-time reduction features: not scheduled, so the VAT is 1.6 SOL.
     Value::Null
 }
 
-fn answer(method: &str, params: &Value, largest: &AtomicUsize) -> (&'static str, String) {
+fn answer(method: &str, params: &Value, seen: &Seen) -> (&'static str, String) {
     let result = match method {
         "getEpochInfo" => {
             json!({"absoluteSlot": SLOT, "epoch": 10, "slotIndex": 100, "slotsInEpoch": 432000})
@@ -110,7 +118,11 @@ fn answer(method: &str, params: &Value, largest: &AtomicUsize) -> (&'static str,
         }
         "getMultipleAccounts" => {
             let keys = params[0].as_array().cloned().unwrap_or_default();
-            largest.fetch_max(keys.len(), Ordering::SeqCst);
+            seen.largest.fetch_max(keys.len(), Ordering::SeqCst);
+            seen.total.fetch_add(keys.len(), Ordering::SeqCst);
+            if keys.iter().any(|k| VALIDATORS.iter().any(|v| k.as_str() == Some(v.identity))) {
+                seen.identity.store(true, Ordering::SeqCst);
+            }
             if keys.len() > 10 {
                 return (
                     "403 Forbidden",
@@ -132,12 +144,12 @@ fn answer(method: &str, params: &Value, largest: &AtomicUsize) -> (&'static str,
     )
 }
 
-/// A mock endpoint; returns its URL and the largest batch it was sent.
-async fn spawn() -> (String, Arc<AtomicUsize>) {
+/// A mock endpoint; returns its URL and what it was asked for.
+async fn spawn() -> (String, Arc<Seen>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let largest = Arc::new(AtomicUsize::new(0));
-    let seen = Arc::clone(&largest);
+    let asked = Arc::new(Seen::default());
+    let seen = Arc::clone(&asked);
     tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -182,7 +194,7 @@ async fn spawn() -> (String, Arc<AtomicUsize>) {
             });
         }
     });
-    (format!("http://{addr}"), largest)
+    (format!("http://{addr}"), asked)
 }
 
 fn config(urls: &[String]) -> Config {
@@ -201,7 +213,7 @@ fn config(urls: &[String]) -> Config {
     Config::parse(&toml).unwrap()
 }
 
-async fn evaluate() -> (Vec<checks::CheckOutcome>, Vec<Arc<AtomicUsize>>) {
+async fn evaluate() -> (Vec<checks::CheckOutcome>, Vec<Arc<Seen>>) {
     let (a, seen_a) = spawn().await;
     let (b, seen_b) = spawn().await;
     let cfg = config(&[a, b]);
@@ -229,14 +241,15 @@ async fn admission_is_judged_by_both_endpoints_despite_the_batch_limit() {
     let (out, seen) = evaluate().await;
     for s in &seen {
         assert!(
-            s.load(Ordering::SeqCst) <= 10,
+            s.largest.load(Ordering::SeqCst) <= 10,
             "a batch over 10 accounts was sent"
         );
+        assert_eq!(s.total.load(Ordering::SeqCst), 11, "eleven vote accounts, so the batch had to split");
     }
 
     let under = find(&out, "vote_admission_critical:underfunded");
     assert!(
-        matches!(&under.verdict, Verdict::Unhealthy(m) if m.contains("0.0198 SOL and needs 1.6198 SOL")),
+        matches!(&under.verdict, Verdict::Unhealthy(m) if m.contains("0.0198 SOL and needs 0.8198 SOL")),
         "{:?}",
         under.verdict
     );
@@ -259,19 +272,13 @@ async fn admission_is_judged_by_both_endpoints_despite_the_batch_limit() {
     );
 }
 
+/// Under Alpenglow the identity pays for nothing that keeps it voting, so its
+/// balance is neither fetched nor checked.
 #[tokio::test]
-async fn identity_balances_come_through_the_same_batched_call() {
-    let (out, _) = evaluate().await;
-    // The mock's validators are voting; if they were not, the identity checks
-    // would rightly stay quiet and this test would prove nothing.
-    assert_eq!(find(&out, "vote_delinquent:underfunded").verdict, Verdict::Healthy);
-    // 0.1 SOL would page before Alpenglow; under it, neither band alerts.
-    assert_eq!(
-        find(&out, "identity_balance_critical:underfunded").verdict,
-        Verdict::Healthy
-    );
-    let warn = find(&out, "identity_balance_warn:underfunded");
-    assert_eq!(warn.verdict, Verdict::Healthy);
-    // Both endpoints answered: quiet because of Alpenglow, not for want of data.
-    assert_eq!(warn.tally.healthy, 2);
+async fn identity_balances_are_neither_fetched_nor_checked() {
+    let (out, seen) = evaluate().await;
+    for s in &seen {
+        assert!(!s.identity.load(Ordering::SeqCst), "an identity account was requested");
+    }
+    assert!(!out.iter().any(|o| o.id.starts_with("identity_balance")));
 }

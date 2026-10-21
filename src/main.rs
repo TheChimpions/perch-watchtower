@@ -900,10 +900,7 @@ async fn run_cycle(
         },
         restart_gossip_percent: rt.cluster_watch.as_ref().and_then(|cw| cw.gossip_percent),
     });
-    rt.metrics.set(match config.metrics.as_ref().and_then(|m| m.compat_prefix.as_deref()) {
-        Some(prefix) => metrics::with_compat_alias(&rendered, prefix),
-        None => rendered,
-    });
+    rt.metrics.set(rendered);
 
     rt.metrics.set_html(web::render(&web::PageData {
         name: &config.watchtower.name,
@@ -995,7 +992,6 @@ fn is_recovery_signal(check_id: &str) -> bool {
     [
         "vote_delinquent:",
         "vote_lag:",
-        "root_lag:",
         "vote_stalled:",
         "node_behind:",
     ]
@@ -2096,8 +2092,7 @@ mod tests {
                 slots_in_epoch: 432_000,
             }),
             validators: HashMap::new(),
-            identity_balances: HashMap::new(),
-            alpenglow: None,
+            vote_rent_lamports: None,
             vote_states: HashMap::new(),
             vote_income: HashMap::new(),
             vault_invoices: HashMap::new(),
@@ -2242,7 +2237,7 @@ mod tests {
         assert!(is_recovery_signal("vote_delinquent:chimps-1"));
         assert!(is_recovery_signal("node_behind:localhost"));
         assert!(!is_recovery_signal("disk_fill_critical:hw /mnt/ledger"));
-        assert!(!is_recovery_signal("identity_balance_warn:chimps-1"));
+        assert!(!is_recovery_signal("vote_admission_warn:chimps-1"));
         assert!(!is_recovery_signal("cluster_stalled"));
     }
 
@@ -2272,7 +2267,7 @@ mod tests {
             outcome("vote_delinquent:refi-main", Verdict::Healthy),
             outcome("vote_lag:refi-main", Verdict::Healthy),
             outcome("jpool_bond_warn:refi-main", Verdict::unhealthy("bond 1.05x")),
-            outcome("identity_balance_warn:refi-main", Verdict::unhealthy("low")),
+            outcome("skip_rate_warn:refi-main", Verdict::unhealthy("high")),
             outcome("vote_admission_warn:refi-main", Verdict::unknown("not observed")),
         ];
         let (troubled, unconfirmed) = recovery_blockers(&outcomes, &[]);
@@ -2285,11 +2280,11 @@ mod tests {
         let outcomes = vec![
             outcome("vote_delinquent:refi-main", Verdict::Healthy),
             outcome("vote_lag:refi-main", Verdict::unhealthy("behind")),
-            outcome("root_lag:refi-main", Verdict::unknown("no endpoint")),
+            outcome("vote_stalled:refi-main", Verdict::unknown("no endpoint")),
         ];
         let (troubled, unconfirmed) = recovery_blockers(&outcomes, &[]);
         assert_eq!(troubled, vec!["vote_lag:refi-main"]);
-        assert_eq!(unconfirmed, vec!["root_lag:refi-main"]);
+        assert_eq!(unconfirmed, vec!["vote_stalled:refi-main"]);
         assert_eq!(still_failing(&troubled), "Still failing: vote_lag:refi-main.");
     }
 

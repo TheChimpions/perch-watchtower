@@ -1576,8 +1576,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Vote and root distance",
-      "description": "Slots between the cluster tip (the most advanced endpoint) and the validator's last vote and root. Dashed lines are the default alert limits: 200 for votes, 400 for roots.",
+      "title": "Vote distance",
+      "description": "Slots between the cluster tip (the most advanced endpoint) and the validator's last vote. The dashed line is the default alert limit, 200 slots.",
       "targets": [
         {
           "datasource": {
@@ -1585,20 +1585,8 @@
             "uid": "${datasource}"
           },
           "expr": "max by (validator) (max by (instance) (perch_endpoint_slot{job=~\"$job\", instance=~\"$instance\"}) - on (instance) group_right perch_validator_last_vote_slot{job=~\"$job\", instance=~\"$instance\", validator=~\"$validator\"})",
-          "legendFormat": "{{validator}} vote",
+          "legendFormat": "{{validator}}",
           "refId": "A",
-          "editorMode": "code",
-          "range": true,
-          "instant": false
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "max by (validator) (max by (instance) (perch_endpoint_slot{job=~\"$job\", instance=~\"$instance\"}) - on (instance) group_right perch_validator_root_slot{job=~\"$job\", instance=~\"$instance\", validator=~\"$validator\"})",
-          "legendFormat": "{{validator}} root",
-          "refId": "B",
           "editorMode": "code",
           "range": true,
           "instant": false
@@ -1634,12 +1622,8 @@
                 "value": null
               },
               {
-                "color": "orange",
-                "value": 200
-              },
-              {
                 "color": "red",
-                "value": 400
+                "value": 200
               }
             ]
           },
@@ -1829,7 +1813,7 @@
       "id": 17,
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 12,
         "x": 0,
         "y": 37
       },
@@ -1916,95 +1900,8 @@
       "id": 18,
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 37
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Identity balance",
-      "description": "SOL in the identity account, which pays for votes. Default limits: below 3 SOL notifies, below 0.5 SOL pages.",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "max by (validator) (perch_validator_balance_sol{job=~\"$job\", instance=~\"$instance\", validator=~\"$validator\", account=\"identity\"})",
-          "legendFormat": "{{validator}}",
-          "refId": "A",
-          "editorMode": "code",
-          "range": true,
-          "instant": false
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "lineInterpolation": "stepAfter",
-            "spanNulls": false,
-            "axisSoftMin": 0,
-            "thresholdsStyle": {
-              "mode": "dashed"
-            },
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            }
-          },
-          "color": {
-            "mode": "palette-classic"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.5
-              },
-              {
-                "color": "green",
-                "value": 3
-              }
-            ]
-          },
-          "decimals": 2
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "id": 19,
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
+        "w": 12,
+        "x": 12,
         "y": 37
       },
       "datasource": {
@@ -2221,7 +2118,7 @@
           "show": false
         }
       },
-      "id": 20,
+      "id": 19,
       "gridPos": {
         "h": 6,
         "w": 24,
@@ -2238,7 +2135,7 @@
       "title": "Alpenglow",
       "collapsed": false,
       "panels": [],
-      "id": 21,
+      "id": 20,
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -2248,100 +2145,8 @@
     },
     {
       "type": "stat",
-      "title": "Alpenglow",
-      "description": "Whether Alpenglow is in force on this cluster. Once it is scheduled, the very next epoch boundary already checks every vote account.",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "max(perch_alpenglow_phase{job=~\"$job\", instance=~\"$instance\"})",
-          "legendFormat": "",
-          "refId": "A",
-          "editorMode": "code",
-          "range": false,
-          "instant": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "blue",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.5
-              },
-              {
-                "color": "green",
-                "value": 1.5
-              }
-            ]
-          },
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "0": {
-                  "text": "not scheduled",
-                  "color": "blue",
-                  "index": 0
-                },
-                "1": {
-                  "text": "activates next epoch",
-                  "color": "orange",
-                  "index": 1
-                },
-                "2": {
-                  "text": "active",
-                  "color": "green",
-                  "index": 2
-                }
-              }
-            }
-          ],
-          "noValue": "Not reported"
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "textMode": "value",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "id": 22,
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 0,
-        "y": 52
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      }
-    },
-    {
-      "type": "stat",
       "title": "VAT per epoch",
-      "description": "The Validator Admission Ticket burned from every admitted vote account at each epoch boundary. It falls as slot times shorten.",
+      "description": "The Validator Admission Ticket burned from every admitted vote account at each epoch boundary: 0.8 SOL at 200ms slots.",
       "targets": [
         {
           "datasource": {
@@ -2390,11 +2195,11 @@
           "values": false
         }
       },
-      "id": 23,
+      "id": 21,
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 6,
+        "w": 8,
+        "x": 0,
         "y": 52
       },
       "datasource": {
@@ -2405,7 +2210,7 @@
     {
       "type": "stat",
       "title": "Vote accounts under the minimum",
-      "description": "Selected validators whose vote account holds less than rent-exempt plus one VAT. Under Alpenglow they will be excluded at the next boundary.",
+      "description": "Selected validators whose vote account holds less than rent-exempt plus one VAT. They will be excluded at the next boundary.",
       "targets": [
         {
           "datasource": {
@@ -2456,11 +2261,11 @@
           "values": false
         }
       },
-      "id": 24,
+      "id": 22,
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 12,
+        "w": 8,
+        "x": 8,
         "y": 52
       },
       "datasource": {
@@ -2471,7 +2276,7 @@
     {
       "type": "stat",
       "title": "Missing BLS keys",
-      "description": "Selected validators whose vote account has no BLS public key. Under Alpenglow a vote account without one cannot vote or produce blocks.",
+      "description": "Selected validators whose vote account has no BLS public key. A vote account without one cannot vote or produce blocks.",
       "targets": [
         {
           "datasource": {
@@ -2522,11 +2327,11 @@
           "values": false
         }
       },
-      "id": 25,
+      "id": 23,
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 18,
+        "w": 8,
+        "x": 16,
         "y": 52
       },
       "datasource": {
@@ -2647,7 +2452,7 @@
           "sort": "desc"
         }
       },
-      "id": 26,
+      "id": 24,
       "gridPos": {
         "h": 7,
         "w": 24,
@@ -2662,7 +2467,7 @@
     {
       "type": "table",
       "title": "Vote accounts",
-      "description": "Balance, BLS key, and what the commission earned last epoch does against the VAT. Epochs left counts the boundaries the balance still passes at that rate; blank means the account earns more than the VAT and is not draining. Before Alpenglow is scheduled these are what would happen.",
+      "description": "Balance, BLS key, and what the commission earned last epoch does against the VAT. Epochs left counts the boundaries the balance still passes at that rate; blank means the account earns more than the VAT and is not draining.",
       "targets": [
         {
           "datasource": {
@@ -2980,7 +2785,7 @@
           "show": false
         }
       },
-      "id": 27,
+      "id": 25,
       "gridPos": {
         "h": 7,
         "w": 24,
@@ -2997,7 +2802,7 @@
       "title": "RPC endpoints",
       "collapsed": false,
       "panels": [],
-      "id": 28,
+      "id": 26,
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -3077,7 +2882,7 @@
           "mode": "single"
         }
       },
-      "id": 29,
+      "id": 27,
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -3170,7 +2975,7 @@
           "sort": "desc"
         }
       },
-      "id": 30,
+      "id": 28,
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -3253,7 +3058,7 @@
           "sort": "desc"
         }
       },
-      "id": 31,
+      "id": 29,
       "gridPos": {
         "h": 7,
         "w": 24,
@@ -3270,7 +3075,7 @@
       "title": "Disks",
       "collapsed": false,
       "panels": [],
-      "id": 32,
+      "id": 30,
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -3354,7 +3159,7 @@
           "sort": "desc"
         }
       },
-      "id": 33,
+      "id": 31,
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -3434,7 +3239,7 @@
           "sort": "desc"
         }
       },
-      "id": 34,
+      "id": 32,
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -3535,7 +3340,7 @@
           "sort": "desc"
         }
       },
-      "id": 35,
+      "id": 33,
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -3661,7 +3466,7 @@
           "show": false
         }
       },
-      "id": 36,
+      "id": 34,
       "gridPos": {
         "h": 8,
         "w": 6,
@@ -3820,7 +3625,7 @@
           "show": false
         }
       },
-      "id": 37,
+      "id": 35,
       "gridPos": {
         "h": 8,
         "w": 6,
@@ -3837,7 +3642,7 @@
       "title": "Watchtowers",
       "collapsed": false,
       "panels": [],
-      "id": 38,
+      "id": 36,
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -3916,7 +3721,7 @@
           "sort": "desc"
         }
       },
-      "id": 39,
+      "id": 37,
       "gridPos": {
         "h": 7,
         "w": 8,
@@ -3995,7 +3800,7 @@
           "sort": "desc"
         }
       },
-      "id": 40,
+      "id": 38,
       "gridPos": {
         "h": 7,
         "w": 8,
@@ -4079,7 +3884,7 @@
           "mode": "single"
         }
       },
-      "id": 41,
+      "id": 39,
       "gridPos": {
         "h": 7,
         "w": 8,
@@ -4287,7 +4092,7 @@
           "show": false
         }
       },
-      "id": 42,
+      "id": 40,
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -4367,7 +4172,7 @@
           "sort": "desc"
         }
       },
-      "id": 43,
+      "id": 41,
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -4384,7 +4189,7 @@
       "title": "Notifications",
       "collapsed": false,
       "panels": [],
-      "id": 44,
+      "id": 42,
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -4565,7 +4370,7 @@
           "show": false
         }
       },
-      "id": 45,
+      "id": 43,
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -4674,7 +4479,7 @@
         }
       },
       "interval": "5m",
-      "id": 46,
+      "id": 44,
       "gridPos": {
         "h": 8,
         "w": 16,
@@ -4758,7 +4563,7 @@
           "sort": "desc"
         }
       },
-      "id": 47,
+      "id": 45,
       "gridPos": {
         "h": 6,
         "w": 24,

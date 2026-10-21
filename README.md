@@ -82,9 +82,8 @@ each claim on your own machine.
 
 ## Features
 
-**Validator health.** Delinquency, vote and root lag, stalled vote credits,
-skipped leader slots, identity balance in epochs of voting left, unexpected
-commission changes, and the delegation program's minimum version for this epoch
+**Validator health.** Delinquency, vote lag, stalled vote credits,
+skipped leader slots, unexpected commission changes, and the delegation program's minimum version for this epoch
 and the next.
 
 **Stake pool obligations.** Unpaid invoices from The Vault, which removes a
@@ -92,13 +91,12 @@ validator at ten, and the balance of JPool's bond, with a note each time JPool
 draws on it. Both are found on-chain from the validator's identity, so joining
 either pool needs no configuration.
 
-**Ready for Alpenglow.** Whether each vote account will be admitted at the next
+**Built for Alpenglow.** Whether each vote account will be admitted at the next
 epoch boundary: a BLS key registered, and enough SOL for rent plus the VAT, with
 the deadline and the epoch at stake in the page. It counts the commission each
 vote account earns against the VAT, so you see which accounts drain and how many
-weeks they have. Before Alpenglow is scheduled, `perch status` and Grafana show
-which validators are not ready, without notifying; once it is, the identity
-balance stops paging, because votes no longer cost the identity anything.
+weeks they have. The vote account is the only balance perch watches: votes no
+longer cost the identity anything.
 
 **Infrastructure.** Disk free space, projected time-to-full, read-only
 remounts and inode exhaustion via node_exporter. Your own RPC node falling
@@ -126,10 +124,9 @@ disk and notification channel, and a ready-made Grafana dashboard.
 | check | tier | fires after | notes |
 |---|---|---|---|
 | `vote_delinquent` | page | 60s | strict on purpose; corroboration does the filtering |
-| `vote_lag` / `root_lag` | page | 3m / 5m | slots behind the cluster tip |
+| `vote_lag` | page | 3m | last vote slots behind the cluster tip |
 | `vote_stalled` | page | 5m | credits not advancing: catches voting-but-not-landing |
 | `skip_rate` | notify / page | 20m | leader slots assigned vs blocks produced |
-| `identity_balance` | notify / page | 15m | the balance that pays for votes, until Alpenglow |
 | `vote_admission` | notify / page | 10m | Alpenglow: BLS key and VAT balance for the next epoch boundary |
 | `commission_changed` | page | immediate | an unexpected change is a hijacked-identity signal |
 | `sfdp_version` | notify / page | — | below the delegation program's minimum version |
@@ -154,7 +151,7 @@ version, checked against its v4.3.0 source:
 | A majority of RPC endpoints fail | pages "Watchtower is unreliable" after ~2 min | reported separately: Telegram at 5 min, page at 20 |
 | Endpoints | exactly 1 or 3 | any number, with configurable quorum |
 | Severity | everything is critical | page, notify or log, per check |
-| Vote and root lag, credit stalls, skip rate | no | yes |
+| Vote lag, credit stalls, skip rate | no | yes |
 | Commission changes, delegation-program version | no | yes |
 | Disks, own-node lag, machine down | no | yes |
 | Planned maintenance | pages you | `perch maint restart` |
@@ -162,7 +159,7 @@ version, checked against its v4.3.0 source:
 | Watchtower dies | silence | heartbeat, or a standby takes over |
 | Proves its alert path works | no | test-notify and a weekly self-test |
 | Metrics | InfluxDB datapoints | Prometheus and a Grafana dashboard |
-| Alpenglow admission: VAT balance | yes, once active | yes, plus BLS key, net runway, and readiness shown before activation |
+| Alpenglow admission: VAT balance | yes, once active | yes, plus BLS key and net runway |
 | Alert channels | **Slack, Discord, PagerDuty, Telegram, Twilio SMS** | PagerDuty, Telegram |
 | Install | **already there with Agave** | one static binary |
 

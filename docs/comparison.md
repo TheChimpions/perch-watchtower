@@ -51,13 +51,12 @@ thresholds: Telegram at 5 minutes, a page at 20.
 |---|---|---|
 | Validator delinquent | yes ([L444–449](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L444-L449)) | yes, corroborated |
 | Vote account missing from the cluster | yes ([L450–456](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L450-L456)) | yes |
-| Vote lag / root lag (slots behind) | no | yes |
+| Vote lag (slots behind) | no | yes |
 | Vote credits not advancing | no | yes: catches "voting but not landing" |
 | Skipped leader slots | no | yes, warn then page |
-| Identity balance | yes, below 10 SOL ([L145–152](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L145-L152)) | yes, two bands (3 SOL notify, 0.5 SOL page), in epochs of voting left |
-| Vote account VAT balance (Alpenglow) | yes, once Alpenglow is active ([L346–363](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L346-L363), [L467–500](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L467-L500)) | yes, against the next boundary, with runway in epochs, and readiness shown before Alpenglow is scheduled |
+| Identity balance | yes, below 10 SOL ([L145–152](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L145-L152)) | no: under Alpenglow votes no longer cost the identity anything |
+| Vote account VAT balance (Alpenglow) | yes, once Alpenglow is active ([L346–363](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L346-L363), [L467–500](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L467-L500)) | yes, against the next boundary, with runway in epochs |
 | BLS key registered (Alpenglow) | no | yes: a vote account without one is excluded whatever its balance |
-| Identity balance under Alpenglow | still alerts below 10 SOL | stops alerting: votes no longer cost the identity anything |
 | Commission changed | no | yes, pages immediately; compared in basis points, inflation and block revenue |
 | Delegation program minimum version | no | yes, for the current and next epoch |
 | Stake pool obligations (Vault invoices, JPool bond) | no | yes, found on-chain from the identity |
@@ -124,7 +123,7 @@ The secret names are the same, so an existing `PAGERDUTY_INTEGRATION_KEY`,
 |---|---|
 | `--url` / `--urls A B C` | one `[[endpoints]]` block per URL, any number |
 | `--validator-identity PUBKEY` | `[[validators]] identity = "PUBKEY"` (also set `vote_account` and `label`) |
-| `--minimum-validator-identity-balance 10` | `[checks.identity_balance] warn_sol`, `page_sol` |
+| `--minimum-validator-identity-balance 10` | none: the vote account is watched instead, by `[checks.vote_admission]` |
 | `--monitor-active-stake` | `[checks.cluster_stake] enabled = true` |
 | `--active-stake-alert-threshold 80` | `[checks.cluster_stake] min_percent = 80.0` |
 | `--interval 60` | `[watchtower] interval = "60s"` |

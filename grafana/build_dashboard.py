@@ -24,10 +24,8 @@ V = I + ', validator=~"$validator"'
 # Default alert thresholds (src/config.rs). Drawn on the graphs so a line
 # crossing them means what perch would do; they are defaults, not your config.
 VOTE_LAG_SLOTS = 200
-ROOT_LAG_SLOTS = 400
 ENDPOINT_LAG_SLOTS = 300
 SKIP_WARN, SKIP_PAGE = 20, 45
-BALANCE_WARN, BALANCE_PAGE = 3, 0.5
 FILL_WARN_S, FILL_PAGE_S = 24 * 3600, 6 * 3600
 INODE_WARN, INODE_PAGE = 85, 95
 
@@ -321,14 +319,12 @@ L.add(table(
 # --- Validators -----------------------------------------------------------------
 L.row("Validators")
 L.add(timeseries(
-    "Vote and root distance",
-    f"Slots between the cluster tip (the most advanced endpoint) and the validator's last vote and root. "
-    f"Dashed lines are the default alert limits: {VOTE_LAG_SLOTS} for votes, {ROOT_LAG_SLOTS} for roots.",
+    "Vote distance",
+    f"Slots between the cluster tip (the most advanced endpoint) and the validator's last vote. "
+    f"The dashed line is the default alert limit, {VOTE_LAG_SLOTS} slots.",
     [target(f'max by (validator) (max by (instance) (perch_endpoint_slot{{{I}}}) - on (instance) group_right '
-            f'perch_validator_last_vote_slot{{{V}}})', "{{validator}} vote", "A"),
-     target(f'max by (validator) (max by (instance) (perch_endpoint_slot{{{I}}}) - on (instance) group_right '
-            f'perch_validator_root_slot{{{V}}})', "{{validator}} root", "B")],
-    unit="none", min_=0, thresholds=steps((None, GREEN), (VOTE_LAG_SLOTS, ORANGE), (ROOT_LAG_SLOTS, RED)),
+            f'perch_validator_last_vote_slot{{{V}}})', "{{validator}}", "A")],
+    unit="none", min_=0, thresholds=steps((None, GREEN), (VOTE_LAG_SLOTS, RED)),
     threshold_style="dashed",
 ), 12, 9)
 L.add(state_timeline(
@@ -344,7 +340,7 @@ L.add(timeseries(
     "voting-but-not-landing failure that vote_stalled pages for.",
     [target(f'max by (validator) (increase(perch_validator_credits{{{V}}}[1h]))', "{{validator}}")],
     unit="short", min_=0, decimals=0,
-), 8, 8, empty="Needs an hour of history")
+), 12, 8, empty="Needs an hour of history")
 L.add(timeseries(
     "Skip rate this epoch",
     f"Leader slots that produced no block, as a percentage of slots assigned so far this epoch. Default "
@@ -352,15 +348,7 @@ L.add(timeseries(
     [target(f'max by (validator) (perch_validator_skip_percent{{{V}}})', "{{validator}}")],
     unit="percent", min_=0, thresholds=steps((None, GREEN), (SKIP_WARN, ORANGE), (SKIP_PAGE, RED)),
     threshold_style="dashed",
-), 8, 8)
-L.add(timeseries(
-    "Identity balance",
-    f"SOL in the identity account, which pays for votes. Default limits: below {BALANCE_WARN} SOL notifies, "
-    f"below {BALANCE_PAGE} SOL pages.",
-    [target(f'max by (validator) (perch_validator_balance_sol{{{V}, account="identity"}})', "{{validator}}")],
-    unit="none", decimals=2,
-    thresholds=steps((None, RED), (BALANCE_PAGE, ORANGE), (BALANCE_WARN, GREEN)), threshold_style="dashed",
-), 8, 8)
+), 12, 8)
 L.add(table(
     "Leader slots this epoch",
     "Assigned leader slots and blocks produced so far this epoch.",
@@ -383,22 +371,17 @@ MINIMUM = f'scalar(max(perch_vote_account_minimum_sol{{{I}}}))'
 VAT = f'scalar(max(perch_vat_per_epoch_sol{{{I}}}))'
 BALANCE = f'max by (validator) (perch_validator_vote_account_balance_sol{{{V}}})'
 L.row("Alpenglow")
-L.add(stat("Alpenglow", "Whether Alpenglow is in force on this cluster. Once it is scheduled, the very next epoch "
-           "boundary already checks every vote account.",
-           f'max(perch_alpenglow_phase{{{I}}})',
-           mappings=mapping({0: ("not scheduled", BLUE), 1: ("activates next epoch", ORANGE), 2: ("active", GREEN)}),
-           thresholds=steps((None, BLUE), (0.5, ORANGE), (1.5, GREEN))), 6, 4, empty="Not reported")
 L.add(stat("VAT per epoch", "The Validator Admission Ticket burned from every admitted vote account at each epoch "
-           "boundary. It falls as slot times shorten.",
-           f'max(perch_vat_per_epoch_sol{{{I}}})', unit="none", decimals=2, color_mode="value"), 6, 4,
+           "boundary: 0.8 SOL at 200ms slots.",
+           f'max(perch_vat_per_epoch_sol{{{I}}})', unit="none", decimals=2, color_mode="value"), 8, 4,
       empty="Not reported")
 L.add(stat("Vote accounts under the minimum", "Selected validators whose vote account holds less than rent-exempt "
-           "plus one VAT. Under Alpenglow they will be excluded at the next boundary.",
-           f'count({BALANCE} < {MINIMUM}) or vector(0)', thresholds=steps((None, GREEN), (1, RED))), 6, 4)
-L.add(stat("Missing BLS keys", "Selected validators whose vote account has no BLS public key. Under Alpenglow a vote "
+           "plus one VAT. They will be excluded at the next boundary.",
+           f'count({BALANCE} < {MINIMUM}) or vector(0)', thresholds=steps((None, GREEN), (1, RED))), 8, 4)
+L.add(stat("Missing BLS keys", "Selected validators whose vote account has no BLS public key. A vote "
            "account without one cannot vote or produce blocks.",
            f'count(max by (validator) (perch_validator_bls_registered{{{V}}}) == 0) or vector(0)',
-           thresholds=steps((None, GREEN), (1, RED))), 6, 4)
+           thresholds=steps((None, GREEN), (1, RED))), 8, 4)
 L.add(timeseries(
     "Vote account balance",
     "Each vote account against the balance it must hold at the next epoch boundary (dashed): rent-exempt plus one "
@@ -417,7 +400,7 @@ L.add(table(
     "Vote accounts",
     "Balance, BLS key, and what the commission earned last epoch does against the VAT. Epochs left counts the "
     "boundaries the balance still passes at that rate; blank means the account earns more than the VAT and is "
-    "not draining. Before Alpenglow is scheduled these are what would happen.",
+    "not draining.",
     [target(BALANCE, ref="A", instant=True, fmt="table"),
      target(f'max by (validator) (perch_validator_bls_registered{{{V}}})', ref="B", instant=True, fmt="table"),
      target(f'max by (validator) (perch_validator_vote_income_sol{{{V}}})', ref="C", instant=True, fmt="table"),

@@ -207,7 +207,7 @@ fn no_alert_string_contains_a_run_of_stray_spaces() {
                     if bytes[i] == ' ' {
                         run += 1;
                     } else {
-                        if run >= 3 && i >= run + 1 {
+                        if run >= 3 && i > run {
                             let before = bytes[i - run - 1];
                             if before.is_alphanumeric() || ",.;:".contains(before) {
                                 offenders.push(format!(

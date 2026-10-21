@@ -1103,13 +1103,12 @@ mod renotify_cadence {
         assert_eq!(st.on_unhealthy(&c, INTERVAL, t0 + Duration::from_secs(1800)), Transition::Renotify);
     }
 
-    /// The identity balance default, which is what the fleet actually runs.
+    /// The vote admission default, which is what the fleet actually runs: the
+    /// deadline is the next boundary, so repeating the same message adds nothing.
     #[test]
-    fn the_identity_balance_default_is_fire_once_and_page_at_half_a_sol() {
-        let c = crate::config::Checks::default().identity_balance;
+    fn the_vote_admission_default_is_fire_once() {
+        let c = crate::config::Checks::default().vote_admission;
         assert_eq!(c.base.renotify_after, Duration::ZERO, "must not repeat");
-        assert_eq!(c.page_sol, 0.5);
-        assert_eq!(c.warn_sol, 3.0);
-        assert!(c.page_sol < c.warn_sol, "bands must not overlap");
+        assert_eq!(c.warn_epochs, 3);
     }
 }

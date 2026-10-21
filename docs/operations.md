@@ -51,7 +51,7 @@ Three deliberate properties:
   mid-restart before the next check catches up.
 
 The window starts and ends on the checks that show the validator voting:
-`vote_delinquent`, `vote_lag`, `root_lag`, `vote_stalled` and `node_behind`.
+`vote_delinquent`, `vote_lag`, `vote_stalled` and `node_behind`.
 Nothing else is caused by a restart. A JPool bond warning that has been firing
 for a day does not hold the window open, and it does not count as the work
 having started. Anything else still wrong keeps alerting once paging is back
@@ -273,7 +273,7 @@ Epoch 1036 summary
 chimpions-mainnet
   leader slots 42, produced 41, skipped 1 (2.4%)
   credits earned 5,618,429
-  identity balance 18.80 SOL
+  vote account 6.48 SOL: loses about 0.16 SOL per epoch (0.80 SOL VAT, 0.64 SOL commission income): about 35 epoch(s) left, roughly 5 weeks
   agave 4.2.2
 ```
 
@@ -295,8 +295,8 @@ skips that epoch's summary rather than sending a partial one.
 ## Severity tiers
 
 - `page` — PagerDuty **and** Telegram. Delinquency, vote/root lag, credit stall,
-  critical identity balance, unexpected commission change, read-only filesystem,
-  a machine confirmed down.
+  a vote account the next boundary will exclude, unexpected commission change,
+  read-only filesystem, a machine confirmed down.
 - `notify` — Telegram only. Warning-level balances, cluster-wide stake, cluster
   stall, endpoint reliability digests (only for a window in which an endpoint was less than perfect -- a clean window is silent), starved checks.
 - `log` — logs only.
@@ -361,7 +361,6 @@ for that:
 |---|---|---|
 | `vote_admission_critical` | the next boundary will exclude the validator: no BLS key, or less than rent-exempt plus one VAT | PagerDuty and Telegram |
 | `vote_admission_warn` | at its net drain (VAT minus commission income), the vote account passes fewer than `warn_epochs` (3) more boundaries | Telegram |
-| before Alpenglow is scheduled | nothing notifies by default; readiness is in `perch status` and Grafana. With `alert_before_scheduled = true`, `vote_admission_warn` notes a vote account that would not pass | Telegram, opt-in |
 
 **Income counts.** Commission is paid into the vote account at every boundary,
 so a validator whose commission exceeds the VAT never runs short, however low
@@ -369,9 +368,9 @@ its balance, and one that earns less drains slowly. perch reads last epoch's
 commission with `getInflationReward` and works out the net:
 
 ```
-chimps-1's vote account holds 6.4812 SOL and loses about 0.36 SOL per epoch
-(1.00 SOL VAT, 0.64 SOL commission income): about 16 epoch(s) left, roughly
-3 weeks. Top it up before it falls under 1.0198 SOL.
+chimps-1's vote account holds 6.4812 SOL and loses about 0.16 SOL per epoch
+(0.80 SOL VAT, 0.64 SOL commission income): about 35 epoch(s) left, roughly
+5 weeks. Top it up before it falls under 0.8198 SOL.
 ```
 
 At 5% commission the break-even is roughly 113k SOL of stake. Most public
@@ -391,13 +390,25 @@ register a BLS key, before the deadline; the check clears by itself on the next
 cycle. Agave logs the same verdict locally as `VAT Health Check: Currently you
 will fail the VAT check`, and `[diagnose]` picks that line up as a likely cause.
 
-When Alpenglow is scheduled on a cluster, perch enforces it at the very next
-boundary, as the runtime does. Once it is in force for the current epoch, the
-identity no longer pays for votes, so `identity_balance` stops alerting. What
-matters then is `vote_admission`: the vote account must hold the rent-exempt
-minimum plus the next epoch's VAT at every boundary.
+The identity balance is not watched at all. Under Alpenglow votes are not
+transactions, so an empty identity cannot take a validator delinquent. What
+matters is `vote_admission`: the vote account must hold the rent-exempt minimum
+plus the next epoch's VAT at every boundary.
 
-See [design.md](design.md#which-balance-matters-before-and-after-alpenglow)
+`identity_balance` and `root_lag` were removed in 1.3.0. On upgrade, any state
+an older version saved for them is retired, and an incident it opened is
+resolved. Delete `[checks.identity_balance]`, `[checks.root_lag]` and
+`alert_before_scheduled` from an older config before upgrading: unknown keys are
+a config error, so it will not load.
+
+`root_lag` went because the root slot a vote account records is no longer a
+health signal under Alpenglow. On mainnet on 2026-10-21 it sat thousands of
+slots behind on validators that were voting within 10 slots of the tip,
+finalizing locally, and earning the cluster's median credits, then jumped to
+current minutes later. `vote_lag`, `vote_stalled` and `vote_delinquent` cover a
+validator that stops voting or stops earning.
+
+See [design.md](design.md#the-vote-account-is-the-balance-that-matters)
 for the rules and where each one comes from in Agave.
 
 ## Seeing what it is doing
@@ -440,9 +451,9 @@ CHECKS
   ARMING vote_delinquent:chimps-1   page  delinquent, last vote 312869910
                                           (0s of 1m banked, fires in ~1m)
   MUTED  vote_lag:chimps-1          page  explained by vote_delinquent:chimps-1
-  MUTED  root_lag:chimps-1          page  explained by vote_delinquent:chimps-1
+  MUTED  vote_stalled:chimps-1      page  explained by vote_delinquent:chimps-1
   FROZEN disk_fill_critical:...     page  only 12m of history, need 45m
-  ok     identity_balance_warn:...  notify 2 endpoint(s) agree
+  ok     vote_admission_warn:...  notify 2 endpoint(s) agree
 
 SILENCE    ACTIVE until 2999-01-01T00:00:00Z
 STATE      /var/lib/perch/state.json (10 check(s), written 1s ago)
@@ -518,9 +529,8 @@ Both are tested against a live Grafana and Prometheus.
   age, alerting owner, silences, and the perch and validator versions.
 - **Checks**: when each check was unhealthy or could not be evaluated, how far
   unhealthy checks are toward their hold-down, and what is firing now.
-- **Validators**: vote and root distance from the cluster tip, delinquency,
-  vote credits per hour, skip rate, identity balance, and leader slots this
-  epoch.
+- **Validators**: vote distance from the cluster tip, delinquency,
+  vote credits per hour, skip rate, and leader slots this epoch.
 - **RPC endpoints**: which endpoints answered, errors by kind, and how far each
   is behind the most advanced one.
 - **Disks**: projected time to full, free space, space and inode use, and
@@ -578,13 +588,11 @@ perch_endpoint_transient_errors_total{endpoint="..."}
 perch_validator_last_vote_slot{identity="...",validator="..."}   every perch_validator_* series carries both
 perch_validator_credits{identity="..."}
 perch_validator_delinquent{identity="..."}
-perch_validator_balance_sol{identity="...",account="identity"}
 perch_validator_vote_account_balance_sol{identity="...",validator="..."}
 perch_validator_bls_registered{identity="...",validator="..."}   1, 0, or absent if no endpoint reports it
 perch_validator_vote_income_sol{...}       commission paid in for the last completed epoch
 perch_validator_vote_net_sol_per_epoch{...}   income minus VAT; negative drains
 perch_validator_vote_runway_epochs{...}    boundaries left at that rate; absent when not draining
-perch_alpenglow_phase                      0 not scheduled, 1 activates next boundary, 2 active
 perch_vat_per_epoch_sol
 perch_vote_account_minimum_sol             rent-exempt plus one VAT, at the next boundary
 perch_validator_leader_slots{identity="..."}
@@ -612,7 +620,6 @@ perch_node_version{endpoint="...",version="...",feature_set="..."}
 perch_cycle_duration_seconds
 perch_check_pending_for_seconds{check="..."}
 perch_endpoint_config_errors_total{endpoint="..."}
-perch_validator_root_slot{identity="..."}
 perch_silenced
 perch_maintenance_awaiting_work            1 while armed and work has not begun
 perch_maintenance_healthy_streak           clean cycles banked toward resuming
@@ -661,17 +668,6 @@ It checks that no peer resolves to this instance's own listen address, that the
 silence directory exists so maintenance mode can actually be declared, and
 reports the sandbox as fact rather than as whatever the unit file requested.
 `--check-config` runs the same checks.
-
-### Renaming without an outage
-
-`[metrics] compat_prefix = "old_name"` emits every metric a second time under a
-second prefix. It exists so a fleet can be renamed one box at a time: peers speak
-the metric protocol to each other, so a renamed instance and an un-renamed one
-would otherwise declare each other down in both directions at once. Dashboards
-and alert rules written against the old names keep working too.
-
-Set it during a rollout, remove it once every box is across. Leaving it on is
-harmless but doubles the exposition.
 
 ## Rules worth adding to Prometheus
 

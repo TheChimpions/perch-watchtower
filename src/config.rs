@@ -111,12 +111,6 @@ pub struct MetricsConfig {
     /// convenience link; perch never talks to Grafana itself.
     #[serde(default)]
     pub grafana_url: Option<String>,
-    /// Emit every metric a second time under this prefix. Exists only to make a
-    /// rename survivable: during a staged rollout the un-renamed half of the
-    /// fleet, and any dashboard or rule still written against the old name,
-    /// keep working. Remove it once the rollout is done.
-    #[serde(default)]
-    pub compat_prefix: Option<String>,
 }
 
 fn default_metrics_listen() -> String {
@@ -719,13 +713,6 @@ pub struct VoteAdmissionCheckConfig {
     /// epoch boundaries of VAT with no income.
     #[serde(default = "default_vote_admission_warn_epochs")]
     pub warn_epochs: u64,
-    /// Also notify about readiness before Alpenglow is scheduled on the
-    /// cluster. Off by default: until it is scheduled nothing is enforced, and
-    /// a vote account swept down to rent after a commission withdrawal is
-    /// routine treasury work, not news. Readiness stays visible in `perch
-    /// status` and Grafana either way.
-    #[serde(default)]
-    pub alert_before_scheduled: bool,
 }
 
 fn default_vote_admission_warn_epochs() -> u64 {
@@ -742,29 +729,7 @@ fn default_vote_admission() -> VoteAdmissionCheckConfig {
             ..CheckConfig::new(d(10 * 60), Severity::Page)
         },
         warn_epochs: default_vote_admission_warn_epochs(),
-        alert_before_scheduled: false,
     }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct BalanceCheckConfig {
-    #[serde(flatten)]
-    pub base: CheckConfig,
-    /// Telegram at this level...
-    pub warn_sol: f64,
-    /// ...page at this one.
-    pub page_sol: f64,
-    /// What voting costs per epoch, used to express a balance as remaining
-    /// epochs in the alert. "0.4 epochs of voting left" is actionable in a way
-    /// that "0.8 SOL" is not, and it is the mechanism by which an empty identity
-    /// takes the validator delinquent.
-    #[serde(default = "default_sol_per_epoch")]
-    pub sol_per_epoch: f64,
-}
-
-fn default_sol_per_epoch() -> f64 {
-    2.0
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -885,14 +850,10 @@ pub struct Checks {
     pub vote_account_missing: CheckConfig,
     #[serde(default = "default_vote_lag")]
     pub vote_lag: LagCheckConfig,
-    #[serde(default = "default_root_lag")]
-    pub root_lag: LagCheckConfig,
     #[serde(default = "default_vote_stalled")]
     pub vote_stalled: CheckConfig,
     #[serde(default = "default_vote_admission")]
     pub vote_admission: VoteAdmissionCheckConfig,
-    #[serde(default = "default_identity_balance")]
-    pub identity_balance: BalanceCheckConfig,
     #[serde(default = "default_commission")]
     pub commission_changed: CheckConfig,
     /// Whether the validator meets the Solana Foundation Delegation Program's
@@ -1033,36 +994,8 @@ fn default_vote_lag() -> LagCheckConfig {
         max_slots: 200,
     }
 }
-fn default_root_lag() -> LagCheckConfig {
-    LagCheckConfig {
-        base: CheckConfig::new(d(5 * 60), Severity::Page),
-        max_slots: 400,
-    }
-}
 fn default_vote_stalled() -> CheckConfig {
     CheckConfig::new(d(5 * 60), Severity::Page)
-}
-fn default_identity_balance() -> BalanceCheckConfig {
-    BalanceCheckConfig {
-        base: CheckConfig {
-            // A draining balance is measured in days, so repeating the same
-            // message every 30 minutes says nothing new and trains you to skim
-            // past it. Said once when it crosses, and once more only if it
-            // falls to the paging band. PagerDuty owns escalation from there;
-            // re-sending the same dedup key would only update the incident.
-            renotify_after: Duration::ZERO,
-            ..CheckConfig::new(d(15 * 60), Severity::Page)
-        },
-        // The identity pays for every vote transaction, at roughly 2 SOL per
-        // epoch. When it empties the validator simply stops voting and goes
-        // delinquent, so this is the one balance that is load-bearing.
-        warn_sol: 3.0,
-        // Roughly a quarter of an epoch of voting left: late enough that it has
-        // not paged for a balance that was going to be topped up anyway, early
-        // enough to act before it stops voting.
-        page_sol: 0.5,
-        sol_per_epoch: default_sol_per_epoch(),
-    }
 }
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -1254,10 +1187,8 @@ impl Default for Checks {
             vote_delinquent: default_delinquent(),
             vote_account_missing: default_missing(),
             vote_lag: default_vote_lag(),
-            root_lag: default_root_lag(),
             vote_stalled: default_vote_stalled(),
             vote_admission: default_vote_admission(),
-            identity_balance: default_identity_balance(),
             commission_changed: default_commission(),
             sfdp_version: default_sfdp_version(),
             vault_invoices: default_vault_invoices(),
@@ -1570,10 +1501,6 @@ impl Config {
             }
         }
 
-        let b = &self.checks.identity_balance;
-        if b.page_sol > b.warn_sol {
-            bail!("checks.identity_balance.page_sol must be <= warn_sol");
-        }
         let v = &self.checks.vault_invoices;
         if v.warn_unpaid == 0 || v.warn_unpaid > v.page_unpaid {
             bail!("checks.vault_invoices needs 1 <= warn_unpaid <= page_unpaid");
@@ -1664,7 +1591,7 @@ impl Config {
 
         if self.checks.node_behind.base.enabled
             && !self.endpoints.iter().any(|e| e.monitor)
-            && self.endpoints.iter().count() > 0
+            && !self.endpoints.is_empty()
         {
             tracing::debug!(
                 "checks.node_behind is enabled but no endpoint sets monitor = true, so it \
@@ -2184,11 +2111,11 @@ identity = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv"
     /// owns everything it evaluates.
     #[test]
     fn only_a_peers_hub_disowns_validator_checks() {
-        assert!(!Alerting::Peers.owns_check("identity_balance_warn:mind-main"));
+        assert!(!Alerting::Peers.owns_check("vote_admission_warn:mind-main"));
         assert!(Alerting::Peers.owns_check("peer_down:mind-main"));
         assert!(Alerting::Peers.owns_check("machine_down:mind-main"));
         for mode in [Alerting::Always, Alerting::Auto, Alerting::Never] {
-            assert!(mode.owns_check("identity_balance_warn:mind-main"));
+            assert!(mode.owns_check("vote_admission_warn:mind-main"));
         }
     }
 
@@ -2289,14 +2216,27 @@ identity = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv"
         assert!(Config::parse(&src).is_err());
     }
 
+    /// Settings removed in 1.3.0 are unknown keys now, and an unknown key is
+    /// a config error like any other typo.
     #[test]
-    fn identity_balance_pages_at_one_sol_of_runway() {
-        let c = Config::parse(MINIMAL).unwrap();
-        assert_eq!(c.checks.identity_balance.page_sol, 0.5);
-        assert_eq!(c.checks.identity_balance.warn_sol, 3.0);
+    fn settings_removed_in_1_3_are_rejected() {
+        let section = format!(
+            "{MINIMAL}\n[checks.identity_balance]\npending_for = \"15m\"\nseverity = \"page\"\n\
+             warn_sol = 3.0\npage_sol = 0.5\n"
+        );
+        assert!(Config::parse(&section).is_err());
+        let flag = format!(
+            "{MINIMAL}\n[checks.vote_admission]\npending_for = \"10m\"\nseverity = \"page\"\n\
+             alert_before_scheduled = true\n"
+        );
+        assert!(Config::parse(&flag).is_err());
+        // What the five testnet configs carried on 2026-10-21.
+        let root_lag = format!(
+            "{MINIMAL}\n[checks.root_lag]\nenabled = true\nmax_slots = 800\npending_for = \"10m\"\nseverity = \"notify\"\n"
+        );
+        assert!(Config::parse(&root_lag).is_err());
     }
 
-    /// Claims land every epoch; only the bond against the requirement alerts.
     #[test]
     fn jpool_drawdowns_are_not_announced_unless_asked() {
         let c = Config::parse(MINIMAL).unwrap();
@@ -2305,15 +2245,6 @@ identity = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv"
             "{MINIMAL}\n[checks.jpool_bond]\npending_for = \"15m\"\nseverity = \"page\"\nannounce_drawdowns = true\n"
         );
         assert!(Config::parse(&src).unwrap().checks.jpool_bond.announce_drawdowns);
-    }
-
-    #[test]
-    fn rejects_inverted_balance_thresholds() {
-        let src = format!(
-            "{MINIMAL}\n[checks.identity_balance]\npending_for = \"15m\"\nseverity = \"page\"\n\
-             warn_sol = 0.5\npage_sol = 2.0\n"
-        );
-        assert!(Config::parse(&src).is_err());
     }
 
     #[test]

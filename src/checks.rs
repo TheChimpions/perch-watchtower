@@ -46,21 +46,10 @@ pub struct CheckOutcome {
 pub struct Progress {
     validator_credits: HashMap<String, u64>,
     cluster_slot: Option<u64>,
-    /// Identity balance over time, per identity, so the runway in a low-balance
-    /// alert is measured rather than assumed. Block fees refill an identity
-    /// between votes: mind-main's swung 1.6-2.8 SOL over four days while an
-    /// assumed 2 SOL/epoch cost said "0.9 epochs left".
-    identity_history: HashMap<String, crate::fillrate::FillHistory>,
     /// JPool bond headroom over the security requirement, per identity, in
     /// lamports, so the bond warning can say how long is left.
     bond_history: HashMap<String, crate::fillrate::FillHistory>,
 }
-
-/// One identity-balance sample per this interval, over this window. A day
-/// covers the fee sawtooth; six hours is the least worth fitting a slope to.
-const IDENTITY_SAMPLE_EVERY: Duration = Duration::from_secs(10 * 60);
-const IDENTITY_WINDOW: Duration = Duration::from_secs(24 * 3600);
-const IDENTITY_MIN_SPAN: Duration = Duration::from_secs(6 * 3600);
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -110,14 +99,6 @@ impl Progress {
         self.validator_credits.clear();
     }
 
-    pub fn export_identity_history(&self) -> HashMap<String, crate::fillrate::FillHistory> {
-        self.identity_history.clone()
-    }
-
-    pub fn import_identity_history(&mut self, h: HashMap<String, crate::fillrate::FillHistory>) {
-        self.identity_history = h;
-    }
-
     pub fn export_bond_history(&self) -> HashMap<String, crate::fillrate::FillHistory> {
         self.bond_history.clone()
     }
@@ -139,21 +120,6 @@ impl Progress {
         self.bond_history
             .get(identity)
             .map(|h| h.project(BOND_MIN_SPAN, BOND_MIN_SAMPLES))
-    }
-
-    fn record_identity(&mut self, identity: &str, now_unix: u64, lamports: u64) {
-        self.identity_history.entry(identity.to_string()).or_default().record(
-            now_unix,
-            lamports,
-            IDENTITY_SAMPLE_EVERY,
-            IDENTITY_WINDOW,
-        );
-    }
-
-    fn identity_trend(&self, identity: &str) -> Option<crate::fillrate::Projection> {
-        self.identity_history
-            .get(identity)
-            .map(|h| h.project(IDENTITY_MIN_SPAN, 6))
     }
 
     /// Returns the verdict for "did this counter advance", and records the new
@@ -373,20 +339,6 @@ pub fn evaluate(
             ));
         }
 
-        if c.root_lag.base.enabled {
-            let id = identity.clone();
-            let max_slots = c.root_lag.max_slots;
-            out.push(outcome(
-                format!("root_lag:{who}"),
-                format!("{who} root slot is behind the cluster"),
-                c.root_lag.base.clone(),
-                per_endpoint(snapshots, &stale, |s| {
-                    lag_verdict(s, &id, &who, max_slots, "root slot", |i| i.root_slot)
-                }),
-                mc,
-            ));
-        }
-
         if c.vote_stalled.enabled {
             let observed = best(snapshots, |s| {
                 if stale.contains_key(&s.endpoint) {
@@ -502,7 +454,6 @@ pub fn evaluate(
 
         if c.vote_admission.base.enabled {
             let warn_epochs = c.vote_admission.warn_epochs;
-            let before_scheduled = c.vote_admission.alert_before_scheduled;
             for (suffix, severity) in [
                 ("critical", c.vote_admission.base.severity),
                 ("warn", Severity::Notify),
@@ -521,85 +472,12 @@ pub fn evaluate(
                     },
                     cfg,
                     per_endpoint(snapshots, &stale, |s| {
-                        admission_verdict(s, &id, &who2, suffix == "critical", warn_epochs, income, before_scheduled)
+                        admission_verdict(s, &id, &who2, suffix == "critical", warn_epochs, income)
                     }),
                     mc,
                 ));
             }
         }
-
-        // Balances are split into two non-overlapping bands so exactly one of
-        // them is ever active: a low-but-survivable balance nudges Telegram, and
-        // only a genuinely critical balance pages.
-        let id = identity.clone();
-        let per_epoch = c.identity_balance.sol_per_epoch;
-        // The most advanced non-stale reading, sampled for the measured runway.
-        if let Some(lamports) = snapshots
-            .iter()
-            .filter(|s| !stale.contains_key(&s.endpoint))
-            .find_map(|s| s.identity_balances.get(&identity).copied().flatten())
-        {
-            let now_unix = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            progress.record_identity(&identity, now_unix, lamports);
-        }
-        let trend = progress.identity_trend(&identity);
-        for (suffix, floor, ceiling, severity) in [
-            (
-                "critical",
-                c.identity_balance.page_sol,
-                None,
-                c.identity_balance.base.severity,
-            ),
-            (
-                "warn",
-                c.identity_balance.warn_sol,
-                Some(c.identity_balance.page_sol),
-                Severity::Notify,
-            ),
-        ] {
-            if !c.identity_balance.base.enabled {
-                break;
-            }
-            let mut cfg = c.identity_balance.base.clone();
-            cfg.severity = severity;
-            let who2 = who.clone();
-            let id2 = id.clone();
-            out.push(outcome(
-                format!("identity_balance_{suffix}:{who}"),
-                format!("{who} identity balance is low"),
-                cfg,
-                per_endpoint(snapshots, &stale, |s| {
-                    if not_voting(s, &id2) {
-                        return Verdict::Healthy;
-                    }
-                    let lamports = s.identity_balances.get(&id2).copied().flatten();
-                    // Unobserved (an endpoint that will not serve the feature
-                    // accounts) keeps today's behaviour rather than disabling
-                    // a check that works without them.
-                    match alpenglow_in_force(s).unwrap_or(false) {
-                        // Votes no longer cost the identity anything, so an
-                        // empty one cannot take the validator delinquent and
-                        // neither band says anything. The vote account is the
-                        // balance that matters then (`vote_admission`); the
-                        // identity balance stays in metrics and `perch status`.
-                        true => Verdict::Healthy,
-                        false => balance_verdict(
-                            lamports,
-                            floor,
-                            ceiling,
-                            &format!("{who2} identity"),
-                            per_epoch,
-                            trend.as_ref(),
-                        ),
-                    }
-                }),
-                mc,
-            ));
-        }
-
     }
 
     out.extend(evaluate_pools(snapshots, config, &stale, progress));
@@ -1427,8 +1305,7 @@ fn disk_check_kinds(c: &crate::config::Checks) -> Vec<(&'static str, CheckConfig
     v
 }
 
-/// Bands are non-overlapping, as with balances, so exactly one of warn/critical
-/// is ever active.
+/// Bands are non-overlapping, so exactly one of warn/critical is ever active.
 fn fill_verdict(
     projection: &Projection,
     where_: &str,
@@ -1502,8 +1379,6 @@ where
     }
 }
 
-/// Unhealthy when below `floor`; if `ceiling` is set, only within `[ceiling, floor)`
-/// so the warn and critical bands never overlap.
 /// Whether a saved check state could still be produced by this binary with
 /// this config.
 ///
@@ -1532,7 +1407,6 @@ pub fn still_configured(id: &str, config: &Config) -> bool {
         "vote_delinquent" => c.vote_delinquent.enabled && validator(subject),
         "vote_account_missing" => c.vote_account_missing.enabled && validator(subject),
         "vote_lag" => c.vote_lag.base.enabled && validator(subject),
-        "root_lag" => c.root_lag.base.enabled && validator(subject),
         "vote_stalled" => c.vote_stalled.enabled && validator(subject),
         // Only produced for validators with an expected commission set.
         "commission_changed" => {
@@ -1544,9 +1418,6 @@ pub fn still_configured(id: &str, config: &Config) -> bool {
                                 || v.expected_block_revenue_commission_bps.is_some())
                     })
                 })
-        }
-        "identity_balance_critical" | "identity_balance_warn" => {
-            c.identity_balance.base.enabled && validator(subject)
         }
         "skip_rate_critical" | "skip_rate_warn" => c.skip_rate.base.enabled && validator(subject),
         "sfdp_version_critical" | "sfdp_version_warn" => c.sfdp_version.base.enabled && validator(subject),
@@ -1592,8 +1463,8 @@ pub fn orphaned<'a>(
 }
 
 /// The cluster lists no vote account for this identity: a spare, a failover
-/// node, or anything else that is not voting. Its balance pays for nothing and
-/// admission does not apply, so neither should warn. A vote account that goes
+/// node, or anything else that is not voting. Admission does not apply, so
+/// neither band should warn. A vote account that goes
 /// missing from a voting validator is `vote_account_missing`'s page, not these.
 fn not_voting(s: &Snapshot, identity: &str) -> bool {
     matches!(s.validators.get(identity), Some(ValidatorObservation::Absent))
@@ -1606,13 +1477,6 @@ pub(crate) fn position(s: &Snapshot) -> Option<crate::alpenglow::EpochPosition> 
         slot_index: e.slot_index,
         slots_in_epoch: e.slots_in_epoch,
     })
-}
-
-/// Whether Alpenglow governs the epoch running now, per this endpoint.
-fn alpenglow_in_force(s: &Snapshot) -> Option<bool> {
-    let cluster = s.alpenglow.as_ref()?;
-    let pos = position(s)?;
-    Some(crate::alpenglow::active_this_epoch(cluster, &pos))
 }
 
 /// Commission the vote account earned last epoch, from whichever endpoint
@@ -1631,25 +1495,24 @@ fn admission_verdict(
     critical: bool,
     warn_epochs: u64,
     income: Option<u64>,
-    before_scheduled: bool,
 ) -> Verdict {
-    let (Some(cluster), Some(pos)) = (s.alpenglow.as_ref(), position(s)) else {
-        return Verdict::unknown("Alpenglow feature state not observed");
-    };
-    if pos.slots_in_epoch == 0 {
-        return Verdict::unknown("epoch length not reported");
-    }
     let Some(vote) = s.vote_states.get(identity) else {
         if not_voting(s, identity) {
             return Verdict::Healthy;
         }
         return Verdict::unknown("vote account not observed");
     };
-    let req = crate::alpenglow::requirement(cluster, &pos);
+    let (Some(rent), Some(pos)) = (s.vote_rent_lamports, position(s)) else {
+        return Verdict::unknown("rent minimum or epoch not observed");
+    };
+    if pos.slots_in_epoch == 0 {
+        return Verdict::unknown("epoch length not reported");
+    }
+    let req = crate::alpenglow::requirement(rent, &pos);
     if critical {
         crate::alpenglow::critical(who, vote, &req)
     } else {
-        crate::alpenglow::warn(who, vote, &req, income, warn_epochs, before_scheduled)
+        crate::alpenglow::warn(who, vote, &req, income, warn_epochs)
     }
 }
 
@@ -1698,70 +1561,18 @@ fn commission_verdict(
     }
 }
 
-fn balance_verdict(
-    lamports: Option<u64>,
-    floor_sol: f64,
-    ceiling_sol: Option<f64>,
-    what: &str,
-    sol_per_epoch: f64,
-    trend: Option<&crate::fillrate::Projection>,
-) -> Verdict {
-    use crate::fillrate::Projection;
-    let Some(lamports) = lamports else {
-        return Verdict::unknown(format!("{what} balance not observed"));
-    };
-    let sol = lamports_to_sol(lamports);
-    let below_floor = sol < floor_sol;
-    let above_ceiling = ceiling_sol.map(|c| sol >= c).unwrap_or(true);
-    if !(below_floor && above_ceiling) {
-        return Verdict::Healthy;
-    }
-    // How long it lasts is the actionable number: this account pays for vote
-    // transactions, and when it empties the validator goes delinquent. Measured
-    // when there is enough history -- block fees refill an identity between
-    // votes, so an assumed cost can be wildly pessimistic -- and assumed, and
-    // labelled as an assumption, until then.
-    let cost = "an empty identity cannot vote and goes delinquent";
-    let runway = match trend {
-        _ if sol_per_epoch <= 0.0 => String::new(),
-        Some(Projection::Filling { time_to_full, bytes_per_sec }) => {
-            let hours = time_to_full.as_secs() as f64 / 3600.0;
-            let left = if hours >= 48.0 {
-                format!("{:.0} days", hours / 24.0)
-            } else {
-                format!("{hours:.0} hours")
-            };
-            format!(
-                ", falling about {:.2} SOL a day over the last day: about {left} to empty -- {cost}",
-                bytes_per_sec * 86_400.0 / 1e9
-            )
-        }
-        Some(Projection::NotFilling) => {
-            ", but it is not falling: over the last day block income has kept pace with vote costs"
-                .to_string()
-        }
-        _ => format!(
-            ", about {:.1} more epoch(s) of voting at an assumed {sol_per_epoch} SOL/epoch (not yet \
-             measured) -- {cost}",
-            sol / sol_per_epoch
-        ),
-    };
-    Verdict::unhealthy(format!("{what} balance is {sol:.3} SOL (floor {floor_sol} SOL){runway}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::snapshot::{EpochInfo, VoteAccountInfo};
 
-    fn vai(node: &str, last_vote: u64, root: u64, credits: u64, commission: u8) -> VoteAccountInfo {
+    fn vai(node: &str, last_vote: u64, credits: u64, commission: u8) -> VoteAccountInfo {
         VoteAccountInfo {
             vote_pubkey: format!("vote-{node}"),
             node_pubkey: node.into(),
             activated_stake: 1,
             commission,
             last_vote,
-            root_slot: root,
             epoch_credits: vec![(10, credits, 0)],
         }
     }
@@ -1778,8 +1589,7 @@ mod tests {
                 slots_in_epoch: 432_000,
             }),
             validators: HashMap::new(),
-            identity_balances: HashMap::new(),
-            alpenglow: None,
+            vote_rent_lamports: None,
             vote_states: HashMap::new(),
             vote_income: HashMap::new(),
             vault_invoices: HashMap::new(),
@@ -1798,7 +1608,7 @@ mod tests {
         snap(
             name,
             slot,
-            ValidatorObservation::Voting(vai("val", slot - 10, slot - 42, 5, 8)),
+            ValidatorObservation::Voting(vai("val", slot - 10, 5, 8)),
         )
     }
 
@@ -1826,8 +1636,7 @@ mod tests {
                 slots_in_epoch: 432_000,
             }),
             validators: HashMap::new(),
-            identity_balances: HashMap::new(),
-            alpenglow: None,
+            vote_rent_lamports: None,
             vote_states: HashMap::new(),
             vote_income: HashMap::new(),
             vault_invoices: HashMap::new(),
@@ -2047,7 +1856,7 @@ mod tests {
         let s = snap(
             "stale",
             1000,
-            ValidatorObservation::Voting(vai("val", 1200, 1168, 5, 8)),
+            ValidatorObservation::Voting(vai("val", 1200, 5, 8)),
         );
         let v = lag_verdict(&s, "val", "val", 100, "last vote", |i| i.last_vote);
         assert!(matches!(v, Verdict::Unknown(_)), "got {v}");
@@ -2058,7 +1867,7 @@ mod tests {
         let s = snap(
             "ok",
             1000,
-            ValidatorObservation::Voting(vai("val", 950, 918, 5, 8)),
+            ValidatorObservation::Voting(vai("val", 950, 5, 8)),
         );
         assert_eq!(
             lag_verdict(&s, "val", "val", 100, "last vote", |i| i.last_vote),
@@ -2071,7 +1880,7 @@ mod tests {
         let s = snap(
             "ok",
             1000,
-            ValidatorObservation::Voting(vai("val", 500, 468, 5, 8)),
+            ValidatorObservation::Voting(vai("val", 500, 5, 8)),
         );
         assert!(matches!(
             lag_verdict(&s, "val", "val", 100, "last vote", |i| i.last_vote),
@@ -2090,88 +1899,6 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(matches!(v, Verdict::Unknown(_)));
-    }
-
-    #[test]
-    fn balance_bands_do_not_overlap() {
-        let lamports = |sol: f64| Some((sol * 1e9) as u64);
-        // 1.0 SOL: inside the warn band [0.5, 2.0), outside critical (< 0.5).
-        assert!(matches!(
-            balance_verdict(lamports(1.0), 2.0, Some(0.5), "x", 2.0, None),
-            Verdict::Unhealthy(_)
-        ));
-        assert_eq!(
-            balance_verdict(lamports(1.0), 0.5, None, "x", 2.0, None),
-            Verdict::Healthy
-        );
-        // 0.2 SOL: critical fires, warn does not.
-        assert!(matches!(
-            balance_verdict(lamports(0.2), 0.5, None, "x", 2.0, None),
-            Verdict::Unhealthy(_)
-        ));
-        assert_eq!(
-            balance_verdict(lamports(0.2), 2.0, Some(0.5), "x", 2.0, None),
-            Verdict::Healthy
-        );
-    }
-
-    #[test]
-    fn a_low_identity_balance_reports_remaining_epochs() {
-        // "0.4 epochs of voting left" is actionable; "0.8 SOL" is not, and the
-        // consequence -- delinquency -- is what the operator needs to see.
-        let v = balance_verdict(Some(800_000_000), 1.0, None, "x identity", 2.0, None);
-        let d = v.detail().expect("should be unhealthy");
-        assert!(d.contains("0.4 more epoch"), "got: {d}");
-        assert!(d.contains("goes delinquent"), "got: {d}");
-    }
-
-    /// mind-main, measured every 6h over four days: a fee-income sawtooth with
-    /// a slow net decline. The old message said "0.9 epochs left"; the fitted
-    /// trend says weeks.
-    #[test]
-    fn a_measured_trend_replaces_the_assumed_runway() {
-        use crate::fillrate::FillHistory;
-        let sol = [2.193, 2.581, 2.767, 2.545, 2.343, 2.301, 2.549, 2.328, 2.041, 2.465, 2.100, 1.732, 1.559, 1.809];
-        let mut h = FillHistory::default();
-        for (i, v) in sol.iter().enumerate() {
-            h.record(1_790_000_000 + i as u64 * 6 * 3600, (v * 1e9) as u64, Duration::from_secs(600), Duration::from_secs(5 * 86400));
-        }
-        let trend = h.project(Duration::from_secs(6 * 3600), 6);
-        let v = balance_verdict(Some(1_809_000_000), 3.0, Some(0.5), "mind-main identity", 2.0, Some(&trend));
-        let d = v.detail().expect("below the warning floor");
-        // Least squares over the four days: 0.26 SOL a day, about a week.
-        assert!(d.contains("falling about 0.26 SOL a day") && d.contains("about 7 days to empty"), "{d}");
-        assert!(!d.contains("0.9 more epoch"), "the assumption must give way to the measurement: {d}");
-    }
-
-    #[test]
-    fn an_identity_kept_level_by_block_income_says_so() {
-        let v = balance_verdict(Some(1_800_000_000), 3.0, None, "x identity", 2.0, Some(&crate::fillrate::Projection::NotFilling));
-        assert!(v.detail().unwrap().contains("not falling"), "{v:?}");
-    }
-
-    #[test]
-    fn without_enough_history_the_runway_is_labelled_an_assumption() {
-        let insufficient = crate::fillrate::Projection::Insufficient { have: Duration::from_secs(60), need: Duration::from_secs(6 * 3600) };
-        let d = balance_verdict(Some(800_000_000), 1.0, None, "x identity", 2.0, Some(&insufficient)).detail().unwrap().to_string();
-        assert!(d.contains("0.4 more epoch") && d.contains("not yet measured"), "{d}");
-    }
-
-    #[test]
-    fn a_zero_epoch_cost_omits_the_runway_rather_than_dividing_by_zero() {
-        let v = balance_verdict(Some(800_000_000), 1.0, None, "x identity", 0.0, None);
-        let d = v.detail().expect("should be unhealthy");
-        assert!(!d.contains("epoch"), "got: {d}");
-    }
-
-    #[test]
-    fn unobserved_balance_is_unknown_not_zero() {
-        // Reading a failed getBalance as 0 lamports would page for an empty
-        // identity account every time a provider rate-limited us.
-        assert!(matches!(
-            balance_verdict(None, 0.5, None, "x", 2.0, None),
-            Verdict::Unknown(_)
-        ));
     }
 
     mod orphans {
@@ -2204,7 +1931,7 @@ mod tests {
             out.extend(evaluate_peers(&[peer_status("hub", false, None)], &snaps, &c, Duration::from_secs(300), &HashMap::new(), 0));
             // Exact on purpose: a new check kind changes this count, and whoever
             // adds it must also teach still_configured about it.
-            assert_eq!(out.len(), 22, "check kinds changed: update still_configured, then this count");
+            assert_eq!(out.len(), 19, "check kinds changed: update still_configured, then this count");
             for o in &out {
                 assert!(still_configured(&o.id, &c), "{} is produced but would be retired", o.id);
             }
@@ -2222,6 +1949,24 @@ mod tests {
             let c = config("");
             let states = ["vote_balance_critical:chimps-1".to_string(), "vote_delinquent:chimps-1".to_string()];
             assert_eq!(orphaned(states.iter(), &[], &c), vec!["vote_balance_critical:chimps-1"]);
+        }
+
+        /// Identity balance and root lag checks were removed in 1.3.0. A
+        /// state saved by an older version, firing or not, must be retired so
+        /// an incident it opened is resolved rather than left open -- refi-main's
+        /// root_lag page was open when 1.3.0 was prepared.
+        #[test]
+        fn checks_removed_in_1_3_are_orphaned() {
+            let c = config("");
+            let states = [
+                "identity_balance_critical:chimps-1".to_string(),
+                "identity_balance_warn:chimps-1".to_string(),
+                "root_lag:chimps-1".to_string(),
+            ];
+            assert_eq!(
+                orphaned(states.iter(), &[], &c),
+                vec!["identity_balance_critical:chimps-1", "identity_balance_warn:chimps-1", "root_lag:chimps-1"]
+            );
         }
 
         #[test]
@@ -2258,7 +2003,7 @@ mod tests {
 
     mod alpenglow_checks {
         use super::*;
-        use crate::alpenglow::{Bls, ClusterVat, FeatureState, VoteAccountState};
+        use crate::alpenglow::{Bls, VoteAccountState};
 
         const ID: &str = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv";
 
@@ -2271,24 +2016,15 @@ mod tests {
             .unwrap()
         }
 
-        fn cluster(alpenglow: FeatureState) -> ClusterVat {
-            ClusterVat {
-                alpenglow,
-                slot_time: [FeatureState::Absent; 4],
-                rent_lamports: 20_000_000,
-            }
-        }
-
         /// Epoch 10, two endpoints that agree.
-        fn snaps(alpenglow: FeatureState, vote: Option<VoteAccountState>, identity: u64) -> Vec<Snapshot> {
+        fn snaps(vote: Option<VoteAccountState>) -> Vec<Snapshot> {
             ["a", "b"]
                 .iter()
                 .map(|n| {
                     let mut s = bare_snapshot(n, Some(4_320_100));
                     s.epoch_info.as_mut().unwrap().epoch = 10;
                     s.epoch_info.as_mut().unwrap().slot_index = 100;
-                    s.alpenglow = Some(cluster(alpenglow));
-                    s.identity_balances.insert(ID.into(), Some(identity));
+                    s.vote_rent_lamports = Some(20_000_000);
                     if let Some(v) = &vote {
                         s.vote_states.insert(ID.into(), v.clone());
                     }
@@ -2311,47 +2047,21 @@ mod tests {
         }
 
         #[test]
-        fn an_underfunded_vote_account_pages_once_alpenglow_is_active() {
+        fn an_underfunded_vote_account_pages() {
             let c = config("");
-            let out = evaluate(&snaps(FeatureState::Active(0), Some(vote(30_000_000, Bls::Registered)), 1_000_000_000_000), &c, &mut Progress::default());
+            let out = evaluate(&snaps(Some(vote(30_000_000, Bls::Registered))), &c, &mut Progress::default());
             let v = verdict(&out, "vote_admission_critical:chimps-1");
             assert!(matches!(&v, Verdict::Unhealthy(m) if m.contains("start of epoch 11") && m.contains("epoch 12")), "{v:?}");
         }
 
+        /// Under Alpenglow votes cost the identity nothing, so its balance is
+        /// not checked at all: only the vote account's.
         #[test]
-        fn nothing_notifies_before_alpenglow_is_scheduled() {
+        fn no_identity_balance_check_is_produced() {
             let c = config("");
-            let out = evaluate(&snaps(FeatureState::Absent, Some(vote(0, Bls::Missing)), 0), &c, &mut Progress::default());
-            assert_eq!(verdict(&out, "vote_admission_critical:chimps-1"), Verdict::Healthy);
-            assert_eq!(verdict(&out, "vote_admission_warn:chimps-1"), Verdict::Healthy);
-
-            // Readiness notes only when asked for.
-            let c = config("[checks.vote_admission]\nalert_before_scheduled = true\npending_for = \"10m\"\nseverity = \"page\"\n");
-            let out = evaluate(&snaps(FeatureState::Absent, Some(vote(0, Bls::Missing)), 0), &c, &mut Progress::default());
-            assert!(matches!(verdict(&out, "vote_admission_warn:chimps-1"), Verdict::Unhealthy(_)));
-        }
-
-        /// Under Alpenglow votes cost the identity nothing, so an empty one
-        /// cannot take the validator delinquent: neither band alerts.
-        #[test]
-        fn an_empty_identity_does_not_alert_under_alpenglow() {
-            let c = config("");
-            let out = evaluate(&snaps(FeatureState::Active(0), Some(vote(10_000_000_000, Bls::Registered)), 100_000_000), &c, &mut Progress::default());
-            assert_eq!(verdict(&out, "identity_balance_critical:chimps-1"), Verdict::Healthy);
-            assert_eq!(verdict(&out, "identity_balance_warn:chimps-1"), Verdict::Healthy);
-
-            // Before Alpenglow the same balance still pages, as it always has.
-            let out = evaluate(&snaps(FeatureState::Absent, Some(vote(10_000_000_000, Bls::Registered)), 100_000_000), &c, &mut Progress::default());
-            assert!(matches!(verdict(&out, "identity_balance_critical:chimps-1"), Verdict::Unhealthy(_)));
-        }
-
-        /// Scheduled is not yet in force: votes still cost the identity until
-        /// the boundary, so the identity check keeps paging until then.
-        #[test]
-        fn a_scheduled_activation_does_not_relax_the_identity_check() {
-            let c = config("");
-            let out = evaluate(&snaps(FeatureState::Pending, Some(vote(10_000_000_000, Bls::Registered)), 100_000_000), &c, &mut Progress::default());
-            assert!(matches!(verdict(&out, "identity_balance_critical:chimps-1"), Verdict::Unhealthy(_)));
+            let out = evaluate(&snaps(Some(vote(10_000_000_000, Bls::Registered))), &c, &mut Progress::default());
+            assert!(!out.iter().any(|o| o.id.starts_with("identity_balance")), "{:?}", out.iter().map(|o| &o.id).collect::<Vec<_>>());
+            assert!(out.iter().any(|o| o.id == "vote_admission_critical:chimps-1"));
         }
 
         /// 5.5% read as the whole-percent field rounds up to 6, so a change
@@ -2359,37 +2069,47 @@ mod tests {
         #[test]
         fn commission_is_compared_in_basis_points() {
             let c = config("expected_commission_bps = 550\nexpected_block_revenue_commission_bps = 10000\n");
-            let ok = evaluate(&snaps(FeatureState::Absent, Some(vote(1, Bls::Registered)), 1), &c, &mut Progress::default());
+            let ok = evaluate(&snaps(Some(vote(1, Bls::Registered))), &c, &mut Progress::default());
             assert_eq!(verdict(&ok, "commission_changed:chimps-1"), Verdict::Healthy);
 
             let mut moved = vote(1, Bls::Registered);
             moved.inflation_commission_bps = Some(590);
-            let out = evaluate(&snaps(FeatureState::Absent, Some(moved), 1), &c, &mut Progress::default());
+            let out = evaluate(&snaps(Some(moved)), &c, &mut Progress::default());
             let v = verdict(&out, "commission_changed:chimps-1");
             assert!(matches!(&v, Verdict::Unhealthy(m) if m.contains("5.9%") && m.contains("5.5%")), "{v:?}");
 
             let mut redirected = vote(1, Bls::Registered);
             redirected.block_revenue_commission_bps = Some(0);
-            let out = evaluate(&snaps(FeatureState::Absent, Some(redirected), 1), &c, &mut Progress::default());
+            let out = evaluate(&snaps(Some(redirected)), &c, &mut Progress::default());
             assert!(matches!(verdict(&out, "commission_changed:chimps-1"), Verdict::Unhealthy(m) if m.contains("block-revenue")));
         }
 
-        /// A spare or failover identity: no vote account, a low balance, and
-        /// nothing to warn about.
+        /// A spare or failover identity: no vote account, and nothing to warn
+        /// about.
         #[test]
-        fn a_non_voting_identity_raises_no_balance_or_admission_warnings() {
+        fn a_non_voting_identity_raises_no_admission_warnings() {
             let c = config("");
-            let mut snaps = snaps(FeatureState::Active(0), None, 10_000_000);
+            let mut snaps = snaps(None);
             for s in &mut snaps {
                 s.validators.insert(ID.into(), ValidatorObservation::Absent);
             }
             let out = evaluate(&snaps, &c, &mut Progress::default());
-            for id in ["identity_balance_critical:chimps-1", "identity_balance_warn:chimps-1",
-                       "vote_admission_critical:chimps-1", "vote_admission_warn:chimps-1"] {
+            for id in ["vote_admission_critical:chimps-1", "vote_admission_warn:chimps-1"] {
                 assert_eq!(verdict(&out, id), Verdict::Healthy, "{id}");
             }
             // ...while the missing vote account is still somebody's page.
             assert!(matches!(verdict(&out, "vote_account_missing:chimps-1"), Verdict::Unhealthy(_)));
+
+            // With no vote account to fetch, the rent minimum is not fetched
+            // either. A spare must still read Healthy, not Unknown: Unknown for
+            // long enough would report the check as starved.
+            for s in &mut snaps {
+                s.vote_rent_lamports = None;
+            }
+            let out = evaluate(&snaps, &c, &mut Progress::default());
+            for id in ["vote_admission_critical:chimps-1", "vote_admission_warn:chimps-1"] {
+                assert_eq!(verdict(&out, id), Verdict::Healthy, "{id} without rent");
+            }
         }
 
         #[test]
@@ -2481,7 +2201,7 @@ mod tests {
                 .iter()
                 .map(|n| {
                     let mut s = bare_snapshot(n, Some(4_320_100));
-                    s.validators.insert(ID.into(), ValidatorObservation::Voting(vai(ID, 4_320_090, 4_320_058, 5, 5)));
+                    s.validators.insert(ID.into(), ValidatorObservation::Voting(vai(ID, 4_320_090, 5, 5)));
                     if let Some(i) = &invoices {
                         s.vault_invoices.insert(ID.into(), Ok(i.clone()));
                     }

@@ -54,8 +54,6 @@ pub struct VoteAccountInfo {
     pub commission: u8,
     #[serde(default)]
     pub last_vote: u64,
-    #[serde(default)]
-    pub root_slot: u64,
     /// `[(epoch, credits, previous_credits)]`
     #[serde(default)]
     pub epoch_credits: Vec<(u64, u64, u64)>,
@@ -195,13 +193,12 @@ pub struct Snapshot {
     pub identity: Option<String>,
     pub epoch_info: Option<EpochInfo>,
     pub validators: HashMap<String, ValidatorObservation>,
-    /// Identity pubkey -> lamports.
-    pub identity_balances: HashMap<String, Option<u64>>,
     /// Identity -> leader slots and blocks produced this epoch.
     pub block_production: HashMap<String, BlockProduction>,
     pub cluster_stake: Option<ClusterStake>,
-    /// Feature accounts and rent behind the Alpenglow admission check.
-    pub alpenglow: Option<crate::alpenglow::ClusterVat>,
+    /// Rent-exempt minimum for a vote account: with the VAT, the balance the
+    /// Alpenglow admission check requires.
+    pub vote_rent_lamports: Option<u64>,
     /// Identity pubkey -> its vote account, as the vote program sees it.
     pub vote_states: HashMap<String, crate::alpenglow::VoteAccountState>,
     /// Identity pubkey -> commission paid into its vote account for the last
@@ -236,10 +233,9 @@ impl Snapshot {
             identity: None,
             epoch_info: None,
             validators: HashMap::new(),
-            identity_balances: HashMap::new(),
             block_production: HashMap::new(),
             cluster_stake: None,
-            alpenglow: None,
+            vote_rent_lamports: None,
             vote_states: HashMap::new(),
             vote_income: HashMap::new(),
             vault_invoices: HashMap::new(),
@@ -481,21 +477,19 @@ fn parse_block_production(value: &Value, identity: &str) -> Result<BlockProducti
     })
 }
 
-/// Feature accounts, vote accounts and identity balances, batched.
+/// Vote accounts, batched in `getMultipleAccounts`, and the rent minimum. An
+/// endpoint that will not serve them reads Unknown for the Alpenglow check.
 ///
-/// `getMultipleAccounts` replaces a `getBalance` per validator, so adding the
-/// Alpenglow inputs costs no extra calls for one validator, and fewer than
-/// before for most fleets. An endpoint that will not serve it falls back
-/// to `getBalance`, and the Alpenglow check reads Unknown for that endpoint.
+/// Identity balances are not fetched: under Alpenglow votes are not
+/// transactions, so the identity pays for nothing that keeps it voting.
 async fn fetch_accounts(
     endpoint: &Endpoint,
     config: &Config,
     known_vote_accounts: &HashMap<String, String>,
     snap: &mut Snapshot,
 ) {
-    use crate::alpenglow::{feature_accounts, ClusterVat, FeatureState, VoteAccountState, VOTE_STATE_V4_SIZE};
+    use crate::alpenglow::{VoteAccountState, VOTE_STATE_V4_SIZE};
 
-    let features = feature_accounts();
     // The vote pubkey the cluster just reported is the authority; the config
     // and discovery are the fallback when this endpoint did not see it.
     let votes: Vec<(String, String)> = config
@@ -509,30 +503,19 @@ async fn fetch_accounts(
                 .map(|vote| (v.identity.clone(), vote))
         })
         .collect();
-    let identities: Vec<String> = config.validators.iter().map(|v| v.identity.clone()).collect();
+    if votes.is_empty() {
+        return;
+    }
 
-    let mut keys: Vec<String> = features.iter().map(|f| f.to_string()).collect();
-    keys.extend(votes.iter().map(|(_, vote)| vote.clone()));
-    keys.extend(identities.iter().cloned());
-
+    let keys: Vec<String> = votes.iter().map(|(_, vote)| vote.clone()).collect();
     let accounts = match fetch_multiple(endpoint, &keys).await {
         Ok(a) => a,
         Err(e) => {
             snap.record(e);
-            fetch_balances_one_by_one(endpoint, &identities, snap).await;
             return;
         }
     };
-
-    let (feature_part, rest) = accounts.split_at(features.len());
-    let (vote_part, identity_part) = rest.split_at(votes.len());
-
-    for (identity, account) in identities.iter().zip(identity_part) {
-        // A missing account is an empty one: getBalance would report 0.
-        let lamports = if account.is_null() { Some(0) } else { account["lamports"].as_u64() };
-        snap.identity_balances.insert(identity.clone(), lamports);
-    }
-    for ((identity, _), account) in votes.iter().zip(vote_part) {
+    for ((identity, _), account) in votes.iter().zip(&accounts) {
         if let Some(state) = VoteAccountState::from_account(account) {
             snap.vote_states.insert(identity.clone(), state);
         }
@@ -540,8 +523,8 @@ async fn fetch_accounts(
 
     fetch_vote_income(endpoint, &votes, snap).await;
 
-    let states: Option<Vec<FeatureState>> = feature_part.iter().map(FeatureState::from_account).collect();
-    // The rent minimum moves only when a feature does; an hour is plenty fresh.
+    // The rent minimum moves only with a feature activation; an hour is
+    // plenty fresh.
     let rent = endpoint
         .call_cached(
             "getMinimumBalanceForRentExemption",
@@ -549,18 +532,12 @@ async fn fetch_accounts(
             std::time::Duration::from_secs(3600),
         )
         .await;
-    match (states, rent) {
-        (Some(states), Ok(rent)) => {
-            if let Some(rent_lamports) = rent.as_u64() {
-                snap.alpenglow = Some(ClusterVat {
-                    alpenglow: states[0],
-                    slot_time: [states[1], states[2], states[3], states[4]],
-                    rent_lamports,
-                });
-            }
-        }
-        (None, _) => snap.record(RpcError::Transient("unparseable feature account".into())),
-        (_, Err(e)) => snap.record(e),
+    match rent {
+        Ok(rent) => match rent.as_u64() {
+            Some(lamports) => snap.vote_rent_lamports = Some(lamports),
+            None => snap.record(RpcError::Transient("bad getMinimumBalanceForRentExemption payload".into())),
+        },
+        Err(e) => snap.record(e),
     }
 }
 
@@ -661,29 +638,6 @@ async fn fetch_multiple(endpoint: &Endpoint, keys: &[String]) -> Result<Vec<Valu
     Ok(out)
 }
 
-async fn fetch_balances_one_by_one(endpoint: &Endpoint, identities: &[String], snap: &mut Snapshot) {
-    for identity in identities {
-        let balance = fetch_balance(endpoint, identity).await;
-        if let Err(e) = &balance {
-            snap.record(e.clone());
-        }
-        snap.identity_balances.insert(identity.clone(), balance.ok());
-    }
-}
-
-async fn fetch_balance(endpoint: &Endpoint, pubkey: &str) -> Result<u64, RpcError> {
-    #[derive(Deserialize)]
-    struct BalanceResponse {
-        value: u64,
-    }
-    let raw = endpoint
-        .call("getBalance", json!([pubkey, commitment()]))
-        .await?;
-    serde_json::from_value::<BalanceResponse>(raw)
-        .map(|b| b.value)
-        .map_err(|e| RpcError::Transient(format!("bad getBalance payload: {e}")))
-}
-
 fn classify_one(identity: &str, va: &VoteAccounts) -> ValidatorObservation {
     if let Some(info) = va.delinquent.iter().find(|i| i.node_pubkey == identity) {
         return ValidatorObservation::Delinquent(info.clone());
@@ -750,7 +704,6 @@ mod tests {
             activated_stake: 100,
             commission: 8,
             last_vote,
-            root_slot: last_vote.saturating_sub(32),
             epoch_credits: vec![(10, credits, credits.saturating_sub(1000))],
         }
     }
@@ -945,7 +898,6 @@ mod chain_sentinels {
             activated_stake: 1,
             commission: 0,
             last_vote: 1,
-            root_slot: 1,
             epoch_credits,
         }
     }

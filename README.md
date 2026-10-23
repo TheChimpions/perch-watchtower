@@ -135,6 +135,7 @@ disk and notification channel, and a ready-made Grafana dashboard.
 | `node_behind` | page | 15m | a node *you operate* lagging or unreachable |
 | `disk_space` / `disk_fill` | notify / page | 10m / 15m | free-space floor and projected time-to-full |
 | `disk_readonly` | page | immediate | how a disk usually fails under a validator |
+| `disk_missing` | page | 2m | a host's listed mountpoint is not mounted, so writes land on the disk underneath |
 | `peer_down` / `machine_down` | notify / page | 10m / 3m | another perch went silent; paged only if its validator also stopped voting |
 | `cluster_stake` / `cluster_stalled` | notify | 10m / 3m | not yours to fix at 3am |
 

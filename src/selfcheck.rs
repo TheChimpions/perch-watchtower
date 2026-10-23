@@ -48,6 +48,11 @@ fn host_port(s: &str) -> Option<(String, String)> {
     Some((host, port.to_string()))
 }
 
+/// Whether a URL points at this machine.
+pub(crate) fn is_loopback(url: &str) -> bool {
+    host_port(url).is_some_and(|(host, _)| host == "local")
+}
+
 /// Whether a configured peer is actually this instance's own metrics endpoint.
 ///
 /// This is the check that matters most. A peer entry pointing at our own listen

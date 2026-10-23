@@ -75,14 +75,27 @@ a PagerDuty incident for each of those symptoms of that single event. Prometheus
 solves this with `inhibit_rules`; perch does the same, keyed per validator:
 
 ```
-cluster_stalled       inhibits  every validator vote/lag check
-vote_account_missing  inhibits  vote_delinquent, vote_lag, vote_stalled
-vote_delinquent       inhibits  vote_lag, vote_stalled
+cluster_stalled       inhibits  every validator vote/lag check, node_behind
+vote_account_missing  inhibits  vote_delinquent, vote_lag, vote_stalled, its own node_behind
+vote_delinquent       inhibits  vote_lag, vote_stalled, its own node_behind
 ```
 
+"Its own node_behind" is the validator's local RPC: the endpoint whose node
+answers as that validator's identity, or, when it cannot answer, a loopback
+endpoint on the host that declares the validator. On 2026-10-23
+chimpions-mainnet's local RPC was down for its whole restart and paged next to
+the delinquency it was part of.
+
 The surviving alert lists the suppressed symptoms in its body, so you lose
-nothing. Inhibition is computed from *confirmed verdicts*, never from merely
-inconclusive ones, and never crosses validators. Unrelated checks are never
+nothing. A cause counts while its verdict is *confirmed* unhealthy, never while
+merely inconclusive, and also while it is still firing: a delinquency clears
+over `clear_after` cycles, and the lag it caused stays folded until it has.
+Inhibition never crosses validators.
+
+A symptom that fired while held back pages only if it is still unhealthy once
+its cause is gone. Before 1.4.0 it was announced the cycle its cause cleared,
+healthy or not: chimpions-mainnet's vote lag and credit checks paged with "no
+detail" at both recoveries on 2026-10-23. Unrelated checks are never
 inhibited — a commission change, which may mean a compromised identity, is never
 masked by delinquency.
 
@@ -140,6 +153,19 @@ taken from the last two samples, which would alternate between "full in minutes"
 and "never". Below `min_history` the check reports **unknown**, not healthy: "we
 have not been watching long enough" is not "fine", and unknown never pages.
 
+**A one-off drop is not a fill rate.** On 2026-10-23 a validator unpacked its
+accounts database onto chimpions-mainnet's root filesystem in six minutes,
+and free space then sat flat. Fitted through, that one drop read as 115 GB an
+hour for the next six hours. A drop between two samples of more than 10 GB and
+ten times the window's typical change is a step: the fit uses only what came
+after it, and reports unknown until there is `min_history` of that. Rises are
+never steps, so the snapshot sawtooth is fitted exactly as before.
+
+**A disk that is not mounted pages.** Each mountpoint a host lists in
+`mountpoints` must be reported by node_exporter. One that is not, for two
+minutes, is `disk_missing`: whatever writes there is filling the filesystem
+underneath. That was the cause on 2026-10-23, and it is the page that names it.
+
 **The free-space floor scales with the device.** An absolute floor is right for a
 multi-terabyte ledger disk and absurd for a 1 GB `/boot`, which can never have
 40 GB free and would alert forever. The effective floor is whichever is smaller:
@@ -166,7 +192,8 @@ url = "http://10.0.0.5:9100/metrics"
 validator = "chimps-1"
 ```
 
-Now a full or read-only ledger disk explains the delinquency it causes. Measured
+Now a full, read-only or unmounted ledger disk explains the delinquency it
+causes. Measured
 against the real binary, a read-only `/mnt/ledger` on a delinquent validator
 produces exactly one page:
 

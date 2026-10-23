@@ -6,12 +6,13 @@
 //! Prometheus solves this with `inhibit_rules`; this is the same idea, keyed on
 //! the per-validator check IDs.
 //!
-//! Inhibition is computed from *this cycle's verdicts*, not from which checks
-//! happen to be firing, so it does not depend on two checks crossing their
-//! hold-downs in the same cycle.
+//! A cause counts while this cycle's verdict says it is unhealthy, so
+//! inhibition does not depend on two checks crossing their hold-downs in the
+//! same cycle. It also counts while it is still firing: a delinquency clears
+//! over `clear_after` cycles, and the lag it caused must not page in between.
 
 use crate::{checks::CheckOutcome, verdict::Verdict};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// `(cause, symptoms)`. If `cause` is confirmed unhealthy, every `symptom` for
 /// the same subject is a consequence of it rather than separate news.
@@ -27,6 +28,7 @@ const RULES: &[(&str, &[&str])] = &[
             "vote_account_missing",
             "vote_lag",
             "vote_stalled",
+            "node_behind",
         ],
     ),
     (
@@ -80,12 +82,27 @@ const CROSS_RULES: &[(&str, &[&str])] = &[
         "disk_space_critical",
         &["vote_delinquent", "vote_lag", "vote_stalled"],
     ),
+    // The ledger or accounts disk is not mounted: the validator is running on
+    // the wrong filesystem, or failing to start. The disk is the page to read.
+    (
+        "disk_missing",
+        &["vote_delinquent", "vote_lag", "vote_stalled"],
+    ),
     // The machine is gone. "chimps-1's machine is hard down" is the page worth
     // reading; "chimps-1 delinquent" is a consequence of it.
     (
         "machine_down",
         &["vote_delinquent", "vote_lag", "vote_stalled"],
     ),
+];
+
+/// Rules from a validator to the checks it owns: the symptom's owner must be
+/// the cause's subject. A validator's own RPC going unreachable is part of the
+/// same restart or crash that took it delinquent, so the delinquency page
+/// carries it.
+const OWNED_RULES: &[(&str, &[&str])] = &[
+    ("vote_account_missing", &["node_behind"]),
+    ("vote_delinquent", &["node_behind"]),
 ];
 
 /// Split a check id into its `(kind, subject)`. Cluster-wide checks have no
@@ -97,11 +114,21 @@ fn split(id: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Map of `suppressed check id -> the check id explaining it`.
+/// Map of `suppressed check id -> the check id explaining it`, from this
+/// cycle's verdicts alone.
 pub fn compute(outcomes: &[CheckOutcome]) -> HashMap<String, String> {
+    compute_with_firing(outcomes, &HashSet::new())
+}
+
+/// As `compute`, with checks that are still firing also counting as causes,
+/// whatever this cycle's verdict.
+pub fn compute_with_firing(
+    outcomes: &[CheckOutcome],
+    firing: &HashSet<String>,
+) -> HashMap<String, String> {
     let unhealthy: Vec<(&str, Option<&str>, &str, Option<&str>)> = outcomes
         .iter()
-        .filter(|o| matches!(o.verdict, Verdict::Unhealthy(_)))
+        .filter(|o| matches!(o.verdict, Verdict::Unhealthy(_)) || firing.contains(&o.id))
         .map(|o| {
             let (kind, subject) = split(&o.id);
             (kind, subject, o.id.as_str(), o.owner.as_deref())
@@ -154,6 +181,25 @@ pub fn compute(outcomes: &[CheckOutcome]) -> HashMap<String, String> {
         }
     }
 
+    // Validator-to-owned-check: the symptom's owner must be the cause's subject.
+    for (cause_kind, symptom_kinds) in OWNED_RULES {
+        for (kind, cause_subject, cause_id, _) in &unhealthy {
+            if kind != cause_kind {
+                continue;
+            }
+            let Some(subject) = cause_subject else { continue };
+            for o in outcomes {
+                let (sym_kind, _) = split(&o.id);
+                if !symptom_kinds.contains(&sym_kind) || o.owner.as_deref() != Some(*subject) {
+                    continue;
+                }
+                suppressed
+                    .entry(o.id.clone())
+                    .or_insert_with(|| cause_id.to_string());
+            }
+        }
+    }
+
     // A cause that is itself suppressed by a wider cause cannot go on to explain
     // anything: during a cluster halt the page should say "cluster halted", not
     // "delinquent". Resolving transitively keeps one root cause per subject.
@@ -161,7 +207,7 @@ pub fn compute(outcomes: &[CheckOutcome]) -> HashMap<String, String> {
     for (symptom, cause) in &suppressed {
         let mut root = cause.clone();
         // The bound guarantees termination if a cycle is ever introduced.
-        for _ in 0..RULES.len() + CROSS_RULES.len() {
+        for _ in 0..RULES.len() + CROSS_RULES.len() + OWNED_RULES.len() {
             match suppressed.get(&root) {
                 Some(next) if *next != root => root = next.clone(),
                 _ => break,
@@ -417,5 +463,58 @@ mod tests {
         let listed = symptoms_of("vote_delinquent:chimps-1", &s, &outcomes);
         assert_eq!(listed.len(), 2);
         assert!(listed.iter().any(|d| d.contains("vote_lag")));
+    }
+
+    /// chimpions-mainnet, 2026-10-23: its own RPC went unreachable in the same
+    /// restart that took it delinquent, and paged separately.
+    #[test]
+    fn delinquency_absorbs_its_own_local_rpc() {
+        let outcomes = vec![
+            bad("vote_delinquent:chimpions-mainnet"),
+            owned("node_behind:localhost", "chimpions-mainnet"),
+        ];
+        let s = compute(&outcomes);
+        assert_eq!(s.get("node_behind:localhost").map(String::as_str), Some("vote_delinquent:chimpions-mainnet"));
+    }
+
+    /// Another validator's delinquency says nothing about this RPC, and an RPC
+    /// with no known owner is never folded into anything.
+    #[test]
+    fn a_local_rpc_is_only_absorbed_by_its_own_validator() {
+        let outcomes = vec![
+            bad("vote_delinquent:refi-main"),
+            owned("node_behind:localhost", "chimpions-mainnet"),
+            bad("node_behind:spare"),
+        ];
+        assert!(compute(&outcomes).is_empty());
+    }
+
+    /// A delinquency clears over `clear_after` cycles. In between its verdict is
+    /// healthy but it is still firing, and the lag it caused must stay folded.
+    #[test]
+    fn a_firing_cause_still_inhibits_while_it_clears() {
+        let outcomes = vec![
+            outcome("vote_delinquent:chimps-1", Verdict::Healthy),
+            bad("vote_lag:chimps-1"),
+        ];
+        assert!(compute(&outcomes).is_empty(), "not from verdicts alone");
+        let firing = HashSet::from(["vote_delinquent:chimps-1".to_string()]);
+        let s = compute_with_firing(&outcomes, &firing);
+        assert_eq!(s.get("vote_lag:chimps-1").map(String::as_str), Some("vote_delinquent:chimps-1"));
+    }
+
+    /// The disk that is not mounted is the page to read; the delinquency it
+    /// causes folds into it.
+    #[test]
+    fn a_missing_disk_absorbs_the_delinquency_it_causes() {
+        let outcomes = vec![
+            owned("disk_missing:chimpions-mainnet-hw /mnt/accounts", "chimpions-mainnet"),
+            bad("vote_delinquent:chimpions-mainnet"),
+            owned("node_behind:localhost", "chimpions-mainnet"),
+        ];
+        let s = compute(&outcomes);
+        let root = "disk_missing:chimpions-mainnet-hw /mnt/accounts";
+        assert_eq!(s.get("vote_delinquent:chimpions-mainnet").map(String::as_str), Some(root));
+        assert_eq!(s.get("node_behind:localhost").map(String::as_str), Some(root), "resolved to the root cause");
     }
 }

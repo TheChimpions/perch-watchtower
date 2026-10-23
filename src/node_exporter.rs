@@ -60,6 +60,10 @@ impl Filesystem {
 }
 
 /// What one host had to say about its filesystems in one cycle.
+/// The error a scrape carries when node_exporter answered but reported none of
+/// the configured mountpoints: the exporter is fine, the mounts are not there.
+pub const NOTHING_MATCHED: &str = "no filesystem matched the configured mountpoints";
+
 #[derive(Debug, Clone)]
 pub struct HostSnapshot {
     pub host: String,
@@ -133,9 +137,7 @@ impl Host {
                         return HostSnapshot {
                             host: self.name.clone(),
                             filesystems,
-                            error: Some(
-                                "no filesystem matched the configured mountpoints".into(),
-                            ),
+                            error: Some(NOTHING_MATCHED.into()),
                         };
                     }
 

@@ -200,11 +200,16 @@ impl CheckState {
             return Transition::Quiet;
         }
 
+        // A page is said once. PagerDuty already holds the open incident and
+        // owns escalation, so repeating it only re-sends the same Telegram
+        // message: chimpions-mainnet's disk and local-RPC pages repeated every
+        // 30 minutes for hours on 2026-10-23. renotify_after applies to
+        // Telegram-only alerts.
         let due = self
             .last_notified_at
             .map(|t| now.saturating_duration_since(t) >= cfg.renotify_after)
             .unwrap_or(true);
-        if due && !cfg.renotify_after.is_zero() {
+        if due && !cfg.renotify_after.is_zero() && cfg.severity != Severity::Page {
             self.last_notified_at = Some(now);
             return Transition::Renotify;
         }
@@ -729,6 +734,7 @@ mod tests {
     fn renotify_is_rate_limited() {
         let mut c = cfg(Duration::ZERO, 2);
         c.renotify_after = Duration::from_secs(600);
+        c.severity = Severity::Notify;
         let mut s = CheckState::default();
         let t0 = Instant::now();
         assert_eq!(s.on_unhealthy(&c, INTERVAL, t0), Transition::Firing);
@@ -892,6 +898,7 @@ mod tests {
         // reboots are routine; each one should not cost the on-call a message.
         let mut c = cfg(Duration::ZERO, 2);
         c.renotify_after = Duration::from_secs(1800);
+        c.severity = Severity::Notify;
         let mut s = CheckState::default();
         let t0 = Instant::now();
         assert_eq!(s.on_unhealthy(&c, INTERVAL, t0), Transition::Firing);
@@ -1069,8 +1076,27 @@ mod renotify_cadence {
             enabled: true,
             pending_for: Duration::ZERO,
             clear_after: 1,
-            severity: Severity::Page,
+            severity: Severity::Notify,
             renotify_after: renotify,
+        }
+    }
+
+    /// chimpions-mainnet, 2026-10-23: a disk page and a local-RPC page each
+    /// repeated every 30 minutes for hours while PagerDuty already held the
+    /// incident. A page is said once, whatever renotify_after says.
+    #[test]
+    fn a_page_is_sent_once_even_with_a_renotify_interval() {
+        let mut c = cfg(Duration::from_secs(1800));
+        c.severity = Severity::Page;
+        let mut st = CheckState::default();
+        let t0 = Instant::now();
+        assert_eq!(st.on_unhealthy(&c, INTERVAL, t0), Transition::Firing);
+        for mins in [30u64, 60, 90, 180] {
+            assert_eq!(
+                st.on_unhealthy(&c, INTERVAL, t0 + Duration::from_secs(mins * 60)),
+                Transition::Quiet,
+                "a page must not repeat {mins} minutes in"
+            );
         }
     }
 

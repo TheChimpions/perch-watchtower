@@ -294,10 +294,13 @@ skips that epoch's summary rather than sending a partial one.
 
 ## Severity tiers
 
-- `page` — PagerDuty **and** Telegram. Delinquency, vote/root lag, credit stall,
+- `page` — PagerDuty **and** Telegram. Delinquency, vote lag, credit stall,
   a vote account the next boundary will exclude, unexpected commission change,
-  read-only filesystem, a machine confirmed down.
-- `notify` — Telegram only. Warning-level balances, cluster-wide stake, cluster
+  read-only or unmounted filesystem, a machine confirmed down. A page is sent
+  once when it fires and once when it resolves: PagerDuty holds the incident and
+  owns escalation, so nothing re-sends it while it stays open.
+- `notify` — Telegram only, repeated every `renotify_after` while it lasts
+  (zero means once). Warning-level balances, cluster-wide stake, cluster
   stall, endpoint reliability digests (only for a window in which an endpoint was less than perfect -- a clean window is silent), starved checks.
 - `log` — logs only.
 

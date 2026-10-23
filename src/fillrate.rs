@@ -138,6 +138,43 @@ impl FillHistory {
     }
 }
 
+impl FillHistory {
+    /// Index of the first sample after the most recent step: a drop between two
+    /// consecutive samples larger than `floor` and ten times the window's
+    /// median sample-to-sample change.
+    ///
+    /// A step is something that happened, not a rate: on 2026-10-23 a
+    /// validator unpacked its accounts database onto chimpions-mainnet's root
+    /// filesystem in six minutes, after which free space sat flat. Fitted
+    /// through, that one drop read as 115 GB an hour for the next six hours.
+    fn last_step(&self, floor: u64) -> Option<usize> {
+        let v: Vec<i128> = self.samples.iter().map(|(_, y)| *y as i128).collect();
+        if v.len() < 3 {
+            return None;
+        }
+        let mut changes: Vec<i128> = v.windows(2).map(|w| (w[0] - w[1]).abs()).collect();
+        changes.sort_unstable();
+        let median = changes[changes.len() / 2];
+        let threshold = (floor as i128).max(median.saturating_mul(10));
+        (1..v.len()).rev().find(|&i| v[i - 1] - v[i] > threshold)
+    }
+
+    /// `project`, fitted only to what came after the most recent step. Until
+    /// there is `min_span` of it, the answer is `Insufficient`: whether the
+    /// disk keeps filling after a step cannot be known yet, and the free-space
+    /// floor still guards it meanwhile. Rises are never steps, so a sawtooth
+    /// of snapshots accumulating and being purged is fitted exactly as before.
+    pub fn project_after_steps(&self, min_span: Duration, min_samples: usize, floor: u64) -> Projection {
+        match self.last_step(floor) {
+            None => self.project(min_span, min_samples),
+            Some(i) => FillHistory {
+                samples: self.samples.iter().skip(i).copied().collect(),
+            }
+            .project(min_span, min_samples),
+        }
+    }
+}
+
 /// Human-readable fill rate, e.g. "42.1 GB/hour".
 pub fn rate_per_hour(bytes_per_sec: f64) -> String {
     let gb_per_hour = bytes_per_sec * 3600.0 / crate::node_exporter::BYTES_PER_GB;
@@ -281,5 +318,70 @@ mod tests {
     fn rates_render_readably() {
         assert_eq!(rate_per_hour(10.0 * GB as f64 / 3600.0), "10.0 GB/hour");
         assert!(rate_per_hour(GB as f64 / 3600.0 / 10.0).ends_with("MB/hour"));
+    }
+
+    /// chimpions-mainnet's root filesystem on 2026-10-23, every 5 minutes:
+    /// flat at 713 GB free, 525 GB gone in two samples, flat at 189 GB.
+    fn the_accounts_unpack() -> FillHistory {
+        let mut h = FillHistory::default();
+        let mut t = 1_792_000_000u64;
+        let mut push = |gb: f64, n: usize, h: &mut FillHistory| {
+            for _ in 0..n {
+                h.record(t, (gb * GB as f64) as u64, EVERY, WINDOW);
+                t += 300;
+            }
+        };
+        push(713.0, 12, &mut h);
+        push(464.0, 1, &mut h);
+        push(189.0, 12, &mut h);
+        h
+    }
+
+    #[test]
+    fn a_one_off_drop_is_not_a_fill_rate() {
+        let h = the_accounts_unpack();
+        assert!(matches!(h.project(MIN_SPAN, 6), Projection::Filling { .. }), "fitted through, it reads as filling");
+        assert_eq!(h.project_after_steps(MIN_SPAN, 6, 10 * GB), Projection::NotFilling);
+    }
+
+    /// Right after a step there is not yet enough to say whether it goes on.
+    #[test]
+    fn just_after_a_step_the_answer_waits() {
+        let mut h = FillHistory::default();
+        for i in 0..12u64 {
+            h.record(1_792_000_000 + i * 300, 713 * GB, EVERY, WINDOW);
+        }
+        h.record(1_792_000_000 + 12 * 300, 189 * GB, EVERY, WINDOW);
+        h.record(1_792_000_000 + 13 * 300, 189 * GB, EVERY, WINDOW);
+        assert!(matches!(h.project_after_steps(MIN_SPAN, 6, 10 * GB), Projection::Insufficient { .. }));
+    }
+
+    /// A disk that keeps filling after a step is still caught, at its real rate.
+    #[test]
+    fn filling_that_continues_after_a_step_is_still_caught() {
+        let mut h = FillHistory::default();
+        let mut gb = 713.0f64;
+        for i in 0..24u64 {
+            if i == 6 {
+                gb -= 300.0;
+            }
+            h.record(1_792_000_000 + i * 300, (gb * GB as f64) as u64, EVERY, WINDOW);
+            gb -= 5.0;
+        }
+        let Projection::Filling { bytes_per_sec, .. } = h.project_after_steps(MIN_SPAN, 6, 10 * GB) else {
+            panic!("still filling");
+        };
+        let gb_per_hour = bytes_per_sec * 3600.0 / GB as f64;
+        assert!((gb_per_hour - 60.0).abs() < 1.0, "5 GB every 5 minutes is 60 GB/hour, got {gb_per_hour}");
+    }
+
+    /// Steady filling is many similar drops, none of them a step.
+    #[test]
+    fn steady_filling_has_no_step() {
+        let mut h = FillHistory::default();
+        for i in 0..24u64 {
+            h.record(1_792_000_000 + i * 300, (500 - i * 20) * GB, EVERY, WINDOW);
+        }
+        assert_eq!(h.project_after_steps(MIN_SPAN, 6, 10 * GB), h.project(MIN_SPAN, 6));
     }
 }

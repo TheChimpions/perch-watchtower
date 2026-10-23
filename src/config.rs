@@ -879,6 +879,11 @@ pub struct Checks {
     pub disk_fill: DiskFillCheckConfig,
     #[serde(default = "default_disk_readonly")]
     pub disk_readonly: CheckConfig,
+    /// A mountpoint listed in a host's `mountpoints` that node_exporter does
+    /// not report: the disk is not mounted, and whatever writes there lands
+    /// on the filesystem underneath.
+    #[serde(default = "default_disk_missing")]
+    pub disk_missing: CheckConfig,
     #[serde(default = "default_disk_inodes")]
     pub disk_inodes: DiskInodeCheckConfig,
     #[serde(default = "default_node_behind")]
@@ -965,6 +970,13 @@ fn default_disk_readonly() -> CheckConfig {
         severity: Severity::Page,
         renotify_after: d(60 * 60),
     }
+}
+fn default_disk_missing() -> CheckConfig {
+    // Two minutes clears the boot race where node_exporter starts before the
+    // last mount. chimpions-mainnet's accounts disk failed to mount on
+    // 2026-10-23 and the validator unpacked 525 GB onto the root filesystem
+    // within six minutes; this is the page that would have named it.
+    CheckConfig::new(d(2 * 60), Severity::Page)
 }
 fn default_disk_inodes() -> DiskInodeCheckConfig {
     DiskInodeCheckConfig {
@@ -1198,6 +1210,7 @@ impl Default for Checks {
             disk_space: default_disk_space(),
             disk_fill: default_disk_fill(),
             disk_readonly: default_disk_readonly(),
+            disk_missing: default_disk_missing(),
             disk_inodes: default_disk_inodes(),
             node_behind: default_node_behind(),
             skip_rate: default_skip_rate(),

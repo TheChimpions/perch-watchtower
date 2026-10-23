@@ -814,6 +814,11 @@ impl DiskHistory {
     }
 }
 
+/// The smallest sample-to-sample drop in free space treated as a one-off step
+/// rather than part of a fill rate. Ten times the typical change is the other
+/// half of the test; see `FillHistory::last_step`.
+const FILL_STEP_FLOOR: u64 = 10 * 1_073_741_824;
+
 /// Filesystem checks, evaluated from node_exporter scrapes.
 pub fn evaluate_disk(
     snapshots: &[HostSnapshot],
@@ -825,11 +830,34 @@ pub fn evaluate_disk(
     let c = &config.checks;
 
     for snap in snapshots {
-        let owner = config
-            .hosts
-            .iter()
-            .find(|h| h.name == snap.host)
-            .and_then(|h| h.validator.clone());
+        let host_cfg = config.hosts.iter().find(|h| h.name == snap.host);
+        let owner = host_cfg.and_then(|h| h.validator.clone());
+
+        // Configured mountpoints, each either reported or missing. Without a
+        // configured list every reported filesystem is watched, and none can
+        // be missing.
+        if c.disk_missing.enabled {
+            for mount in host_cfg.map(|h| h.mountpoints.as_slice()).unwrap_or(&[]) {
+                let where_ = format!("{} {mount}", snap.host);
+                let verdict = match &snap.error {
+                    Some(err) if err != crate::node_exporter::NOTHING_MATCHED => {
+                        Verdict::unknown(format!("node_exporter unreachable: {err}"))
+                    }
+                    _ if snap.filesystems.values().any(|fs| &fs.mountpoint == mount) => Verdict::Healthy,
+                    _ => Verdict::unhealthy(format!(
+                        "{where_} is not mounted: node_exporter reports no filesystem there, so anything \
+                         writing to {mount} is filling the filesystem underneath it"
+                    )),
+                };
+                out.push(single(
+                    format!("disk_missing:{where_}"),
+                    format!("{where_} is not mounted"),
+                    c.disk_missing.clone(),
+                    verdict,
+                    owner.clone(),
+                ));
+            }
+        }
 
         if let Some(err) = &snap.error {
             // Unknown for every filesystem we used to be able to see, so a
@@ -925,7 +953,7 @@ pub fn evaluate_disk(
                 let projection = {
                     let entry = history.fs.entry(key.clone()).or_default();
                     entry.record(now_unix, fs.avail_bytes, f.sample_every, f.window);
-                    entry.project(f.min_history, f.min_samples)
+                    entry.project_after_steps(f.min_history, f.min_samples, FILL_STEP_FLOOR)
                 };
                 history.projections.insert(key, projection.clone());
 
@@ -1285,10 +1313,52 @@ pub fn evaluate_nodes(snapshots: &[Snapshot], config: &Config) -> Vec<CheckOutco
             format!("{} is behind or unreachable", ep.name),
             c.base.clone(),
             verdict,
-            None,
+            node_owner(ep, snap, config),
         ));
     }
     out
+}
+
+/// The validator a monitored endpoint is the RPC of, when that can be told.
+///
+/// The node's own identity is the authority, but an unreachable node reports
+/// none, and that is exactly when it matters: chimpions-mainnet's local RPC was
+/// down for its whole restart on 2026-10-23 and paged alongside the
+/// delinquency it was part of. So a loopback endpoint also belongs to the
+/// validator its loopback host declares, or to the only validator configured.
+fn node_owner(
+    ep: &crate::config::EndpointConfig,
+    snap: Option<&Snapshot>,
+    config: &Config,
+) -> Option<String> {
+    let label_of = |identity: &str| {
+        config
+            .validators
+            .iter()
+            .find(|v| v.identity == identity)
+            .map(|v| v.display().to_string())
+    };
+    if let Some(identity) = snap.and_then(|s| s.identity.as_deref()) {
+        // A node that answers as some other identity (a spare, a failover box
+        // holding its own key) is not any configured validator's RPC.
+        return label_of(identity);
+    }
+    if !crate::selfcheck::is_loopback(&ep.url) {
+        return None;
+    }
+    let mut declared: Vec<&str> = config
+        .hosts
+        .iter()
+        .filter(|h| crate::selfcheck::is_loopback(&h.url))
+        .filter_map(|h| h.validator.as_deref())
+        .collect();
+    declared.sort_unstable();
+    declared.dedup();
+    match (declared.as_slice(), config.validators.as_slice()) {
+        ([one], _) => Some(one.to_string()),
+        ([], [only]) => Some(only.display().to_string()),
+        _ => None,
+    }
 }
 
 fn disk_check_kinds(c: &crate::config::Checks) -> Vec<(&'static str, CheckConfig)> {
@@ -1436,6 +1506,13 @@ pub fn still_configured(id: &str, config: &Config) -> bool {
         "disk_fill_critical" | "disk_fill_warn" => c.disk_fill.base.enabled && host(subject),
         "disk_inodes_critical" | "disk_inodes_warn" => c.disk_inodes.base.enabled && host(subject),
         "disk_readonly" => c.disk_readonly.enabled && host(subject),
+        // Only produced for a configured mountpoint.
+        "disk_missing" => {
+            c.disk_missing.enabled
+                && subject.and_then(|s| s.split_once(' ')).is_some_and(|(h, m)| {
+                    config.hosts.iter().any(|x| x.name == h && x.mountpoints.iter().any(|p| p == m))
+                })
+        }
         "node_behind" => {
             c.node_behind.base.enabled
                 && subject.is_some_and(|s| config.endpoints.iter().any(|e| e.name == s && e.monitor))
@@ -1937,9 +2014,11 @@ mod tests {
             }
             // Disk checks need a scrape to be produced; their ids are "<kind>:<host> <mount>".
             for kind in ["disk_space_critical", "disk_space_warn", "disk_fill_critical", "disk_fill_warn",
-                         "disk_inodes_critical", "disk_inodes_warn", "disk_readonly"] {
+                         "disk_inodes_critical", "disk_inodes_warn", "disk_readonly", "disk_missing"] {
                 assert!(still_configured(&format!("{kind}:box /"), &c), "{kind}");
             }
+            // Only a configured mountpoint can be missing.
+            assert!(!still_configured("disk_missing:box /mnt/gone", &c));
         }
 
         /// refi-main, exactly: a firing state for a check kind this version
@@ -1998,6 +2077,110 @@ mod tests {
             o.id = "custom:x".into();
             let states = ["custom:x".to_string()];
             assert!(orphaned(states.iter(), &[o], &c).is_empty());
+        }
+    }
+
+    mod disks_and_local_nodes {
+        use super::*;
+        use crate::node_exporter::{Filesystem, HostSnapshot, NOTHING_MATCHED};
+
+        const ID: &str = "2AKKnirWVZMhnzuwqpizw9SwfZjGpRFLx2zCCNtPWpbc";
+
+        /// chimpions-mainnet's layout: a local RPC, a loopback node_exporter
+        /// that declares the validator, three monitored mountpoints.
+        fn config() -> Config {
+            Config::parse(&format!(
+                "[[endpoints]]\nname = \"localhost\"\nurl = \"http://127.0.0.1:8899\"\nmonitor = true\n\
+                 [[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+                 [[validators]]\nidentity = \"{ID}\"\nlabel = \"chimpions-mainnet\"\n\
+                 [[validators]]\nidentity = \"GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv\"\nlabel = \"other\"\n\
+                 [[hosts]]\nname = \"hw\"\nurl = \"http://127.0.0.1:9100/metrics\"\n\
+                 mountpoints = [\"/\", \"/mnt/ledger\", \"/mnt/accounts\"]\nvalidator = \"chimpions-mainnet\"\n"
+            ))
+            .unwrap()
+        }
+
+        fn fs(mount: &str) -> (String, Filesystem) {
+            (
+                mount.to_string(),
+                Filesystem {
+                    device: "/dev/nvme0n1".into(),
+                    mountpoint: mount.into(),
+                    fstype: "ext4".into(),
+                    size_bytes: 1 << 40,
+                    avail_bytes: 1 << 39,
+                    inodes_total: 1000,
+                    inodes_free: 900,
+                    readonly: false,
+                },
+            )
+        }
+
+        fn missing(out: &[CheckOutcome], mount: &str) -> Verdict {
+            out.iter()
+                .find(|o| o.id == format!("disk_missing:hw {mount}"))
+                .unwrap_or_else(|| panic!("no disk_missing for {mount}"))
+                .verdict
+                .clone()
+        }
+
+        /// 2026-10-23 13:46: node_exporter answered, /mnt/accounts was not there.
+        #[test]
+        fn an_unmounted_disk_is_reported_missing() {
+            let snap = HostSnapshot {
+                host: "hw".into(),
+                filesystems: HashMap::from([fs("/"), fs("/mnt/ledger")]),
+                error: None,
+            };
+            let out = evaluate_disk(&[snap], &config(), &mut DiskHistory::default(), 1_792_000_000);
+            assert!(matches!(missing(&out, "/mnt/accounts"), Verdict::Unhealthy(m) if m.contains("not mounted")));
+            assert_eq!(missing(&out, "/mnt/ledger"), Verdict::Healthy);
+            let o = out.iter().find(|o| o.id == "disk_missing:hw /mnt/accounts").unwrap();
+            assert_eq!(o.owner.as_deref(), Some("chimpions-mainnet"));
+        }
+
+        /// The exporter answering with none of them is every disk missing; the
+        /// exporter not answering is not knowing.
+        #[test]
+        fn an_exporter_failure_is_unknown_but_nothing_matching_is_missing() {
+            let none = HostSnapshot { host: "hw".into(), filesystems: HashMap::new(), error: Some(NOTHING_MATCHED.into()) };
+            let out = evaluate_disk(&[none], &config(), &mut DiskHistory::default(), 1_792_000_000);
+            assert!(matches!(missing(&out, "/mnt/ledger"), Verdict::Unhealthy(_)));
+            let down = HostSnapshot { host: "hw".into(), filesystems: HashMap::new(), error: Some("connection refused".into()) };
+            let out = evaluate_disk(&[down], &config(), &mut DiskHistory::default(), 1_792_000_000);
+            assert!(matches!(missing(&out, "/mnt/ledger"), Verdict::Unknown(_)));
+        }
+
+        fn owner_of(snaps: &[Snapshot], c: &Config) -> Option<String> {
+            evaluate_nodes(snaps, c)
+                .into_iter()
+                .find(|o| o.id == "node_behind:localhost")
+                .unwrap()
+                .owner
+        }
+
+        /// Unreachable is when it matters: no identity to go on, so the loopback
+        /// host's declared validator owns it.
+        #[test]
+        fn an_unreachable_local_rpc_belongs_to_the_validator_on_its_host() {
+            let c = config();
+            let mut down = bare_snapshot("localhost", None);
+            down.transient_errors.push("connection failed".into());
+            let snaps = vec![down, bare_snapshot("a", Some(4_320_100))];
+            assert_eq!(owner_of(&snaps, &c).as_deref(), Some("chimpions-mainnet"));
+        }
+
+        /// A node answering as an identity that is not configured is a spare,
+        /// not the validator's RPC.
+        #[test]
+        fn a_spare_identity_owns_nothing() {
+            let c = config();
+            let mut spare = bare_snapshot("localhost", Some(4_320_100));
+            spare.identity = Some("Spare11111111111111111111111111111111111111".into());
+            assert_eq!(owner_of(&[spare, bare_snapshot("a", Some(4_320_100))], &c), None);
+            let mut own = bare_snapshot("localhost", Some(4_320_100));
+            own.identity = Some("GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv".into());
+            assert_eq!(owner_of(&[own, bare_snapshot("a", Some(4_320_100))], &c).as_deref(), Some("other"), "its identity wins");
         }
     }
 

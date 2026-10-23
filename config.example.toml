@@ -265,6 +265,10 @@ expected_commission = 8
 # severity: "page"   -> PagerDuty and Telegram
 #           "notify" -> Telegram only
 #           "log"    -> logs only
+#
+# `renotify_after` repeats a notify-severity alert while it lasts; zero means
+# once. A page is never repeated: PagerDuty holds the open incident and owns
+# escalation, so a page is sent once when it fires and once when it resolves.
 
 [checks.vote_delinquent]
 enabled = true
@@ -492,6 +496,16 @@ pending_for = "0s"
 clear_after = 2
 severity = "page"
 renotify_after = "1h"
+
+# A mountpoint listed in a host's `mountpoints` that node_exporter does not
+# report: the disk is not mounted, and anything writing there fills the
+# filesystem underneath. Only listed mountpoints are checked.
+[checks.disk_missing]
+enabled = true
+pending_for = "2m"
+clear_after = 2
+severity = "page"
+renotify_after = "30m"
 
 # A filesystem can exhaust inodes with space to spare.
 [checks.disk_inodes]

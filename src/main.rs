@@ -721,7 +721,13 @@ async fn run_cycle(
         &rt.peer_maintenance,
         unix_now(),
     ));
-    let suppressed = inhibit::compute(&outcomes);
+    let firing_now: HashSet<String> = rt
+        .states
+        .iter()
+        .filter(|(_, s)| s.is_firing())
+        .map(|(id, _)| id.clone())
+        .collect();
+    let suppressed = inhibit::compute_with_firing(&outcomes, &firing_now);
     for (symptom, cause) in &suppressed {
         debug!("suppressing {symptom}: explained by {cause}");
     }
@@ -760,10 +766,19 @@ async fn run_cycle(
         // A standby that has just been promoted must announce conditions that
         // began while it was quiet: their state machines are already firing, so
         // they would otherwise produce no transition and never be reported.
-        let unannounced_while_standby = is_owner
-            && alerting.may_report(&outcome.id)
-            && state.is_firing()
-            && !already_announced.contains(&outcome.id);
+        //
+        // Only while the condition is still there and nothing explains it. A
+        // check that fired while inhibited is also firing and unannounced, and
+        // without these two conditions it was announced the cycle its cause
+        // cleared -- as chimpions-mainnet's vote lag and credit checks were on
+        // 2026-10-23, twice, each with a healthy verdict and "no detail".
+        let unannounced_while_standby = announce_late(
+            is_owner && alerting.may_report(&outcome.id),
+            state.is_firing(),
+            already_announced.contains(&outcome.id),
+            &outcome.verdict,
+            suppressed.contains_key(&outcome.id),
+        );
         let transition = if transition == Transition::Quiet && unannounced_while_standby {
             Transition::Firing
         } else {
@@ -997,6 +1012,19 @@ fn is_recovery_signal(check_id: &str) -> bool {
     ]
     .iter()
     .any(|p| check_id.starts_with(p))
+}
+
+/// Whether a check that is already firing, but was never announced, should be
+/// announced now. That is a promoted standby's backlog, and only while the
+/// condition is still there and nothing broader explains it.
+fn announce_late(
+    may_report: bool,
+    firing: bool,
+    announced: bool,
+    verdict: &Verdict,
+    suppressed: bool,
+) -> bool {
+    may_report && firing && !announced && matches!(verdict, Verdict::Unhealthy(_)) && !suppressed
 }
 
 /// What an `auto` maintenance window should do this cycle.
@@ -2228,6 +2256,26 @@ mod tests {
     #[test]
     fn epoch_context_is_empty_when_nothing_answered() {
         assert_eq!(epoch_context(&[]), "");
+    }
+
+    /// chimpions-mainnet, 2026-10-23: vote lag and stalled credits fired while
+    /// held back by the delinquency, and were announced the cycle it cleared,
+    /// with healthy verdicts and "no detail". Twice.
+    #[test]
+    fn a_check_that_fired_while_held_back_is_not_announced_once_healthy() {
+        assert!(!announce_late(true, true, false, &Verdict::Healthy, false));
+        assert!(!announce_late(true, true, false, &Verdict::unknown("x"), false));
+        // Still held back: the cause is still firing.
+        assert!(!announce_late(true, true, false, &Verdict::unhealthy("lag"), true));
+    }
+
+    /// What the path exists for: a promoted standby reports what began while it
+    /// was quiet, and so does a symptom still broken once its cause is gone.
+    #[test]
+    fn a_promoted_standby_still_announces_its_backlog() {
+        assert!(announce_late(true, true, false, &Verdict::unhealthy("lag"), false));
+        assert!(!announce_late(true, true, true, &Verdict::unhealthy("lag"), false), "already announced");
+        assert!(!announce_late(false, true, false, &Verdict::unhealthy("lag"), false), "not ours to report");
     }
 
     #[test]

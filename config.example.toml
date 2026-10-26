@@ -15,12 +15,19 @@ name = "chimps-mainnet"
 # the validator identities. Unpinned, that surfaces as a 3am page for a
 # "missing" vote account; pinned, it fails at startup with the reason.
 cluster = "mainnet-beta"
+# Every Telegram message and PagerDuty title starts with this in brackets, so a
+# notification says which cluster it is about before you open it: "[mainnet]",
+# "[testnet]". Defaults to the pinned cluster; set it to name the fleet too, or
+# to "" to turn it off.
+# tag = "chimps/mainnet"
 # How often to probe. 60s is plenty -- every condition worth paging for lasts
 # minutes, and a tighter loop mostly buys you rate limiting.
 interval = "60s"
 # Per-endpoint reliability digest to Telegram. Only sent when an endpoint was
 # less than 100% usable or logged errors in the window; a clean window is
-# silent, because silence is the signal that everything is fine.
+# silent, because silence is the signal that everything is fine. A method an
+# endpoint does not serve, or program scans its plan refuses (publicnode's free
+# tier), is learned once and not counted.
 endpoint_report_interval = "6h"
 
 
@@ -410,20 +417,22 @@ renotify_after = "1h"
 # WARNING: this is the one check that forces the full getVoteAccounts listing
 # every cycle (several MB per endpoint per minute). On free or public endpoints,
 # leave it disabled -- it is the single fastest way to get yourself throttled.
+# Cluster-wide checks are sent by every box on the cluster, so they are said
+# once, and once more when they clear, rather than repeated.
 [checks.cluster_stake]
 enabled = false
 min_percent = 80.0
 pending_for = "10m"
 clear_after = 2
 severity = "notify"
-renotify_after = "30m"
+renotify_after = "0s"
 
 [checks.cluster_stalled]
 enabled = true
 pending_for = "3m"
 clear_after = 2
 severity = "notify"
-renotify_after = "30m"
+renotify_after = "0s"
 
 
 # --- Peer checks ---------------------------------------------------------------

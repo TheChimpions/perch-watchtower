@@ -123,6 +123,8 @@ pub struct Notifier {
     pagerduty: Option<pagerduty::PagerDuty>,
     telegram: Option<telegram::Telegram>,
     source: String,
+    /// Put in brackets at the front of every title delivered: "[testnet]".
+    tag: Option<String>,
     dry_run: bool,
     stats: Arc<NotifyStats>,
 }
@@ -157,9 +159,26 @@ impl Notifier {
             pagerduty,
             telegram,
             source,
+            tag: None,
             dry_run,
             stats: Arc::new(NotifyStats::default()),
         })
+    }
+
+    /// Tag every title delivered from now on, so a notification names its
+    /// cluster in the first line Telegram and PagerDuty show.
+    pub fn with_tag(mut self, tag: Option<String>) -> Self {
+        self.tag = tag;
+        self
+    }
+
+    /// The alert as delivered: tagged, if this notifier has a tag.
+    fn tagged(&self, alert: &Alert) -> Alert {
+        let mut out = alert.clone();
+        if let Some(tag) = &self.tag {
+            out.title = format!("[{tag}] {}", alert.title);
+        }
+        out
     }
 
     pub fn stats(&self) -> Arc<NotifyStats> {
@@ -188,6 +207,7 @@ impl Notifier {
             info!("dry run: not delivering {:?} to any channel", alert.kind);
             return;
         }
+        let alert = &self.tagged(alert);
 
         // Telegram gets everything. A page that PagerDuty drops is still visible.
         if let Some(tg) = &self.telegram {
@@ -416,5 +436,36 @@ mod stats_tests {
         assert_eq!(n.pagerduty.failed, 1);
         assert_eq!(n.telegram.failed, 0);
         assert_eq!(n.telegram.delivered, 1);
+    }
+}
+
+#[cfg(test)]
+mod tags {
+    use super::*;
+
+    fn alert() -> Alert {
+        Alert {
+            kind: AlertKind::Trigger,
+            severity: Severity::Notify,
+            key: "cluster_stalled".into(),
+            title: "Cluster slot is not advancing".into(),
+            body: "b".into(),
+        }
+    }
+
+    #[test]
+    fn a_tagged_notifier_names_the_cluster_first() {
+        let n = Notifier::new(&NotifyConfig::default(), "perch/refi-test".into(), true)
+            .unwrap()
+            .with_tag(Some("testnet".into()));
+        let t = n.tagged(&alert());
+        assert_eq!(t.title, "[testnet] Cluster slot is not advancing");
+        assert_eq!(t.key, "cluster_stalled", "the dedup key must not change");
+    }
+
+    #[test]
+    fn without_a_tag_the_title_is_unchanged() {
+        let n = Notifier::new(&NotifyConfig::default(), "perch/x".into(), true).unwrap();
+        assert_eq!(n.tagged(&alert()).title, "Cluster slot is not advancing");
     }
 }

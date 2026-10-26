@@ -146,6 +146,78 @@ pub fn run(silence_file: Option<&str>, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The `--config` a perch command line was started with: `--config PATH`,
+/// `--config=PATH`, `-c PATH` or `-cPATH`.
+pub fn config_arg(argv: &[String]) -> Option<std::path::PathBuf> {
+    let mut it = argv.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--config" || a == "-c" {
+            return it.next().map(std::path::PathBuf::from);
+        }
+        if let Some(p) = a.strip_prefix("--config=") {
+            return Some(p.into());
+        }
+        if let Some(p) = a.strip_prefix("-c").filter(|p| !p.is_empty() && !a.starts_with("--")) {
+            return Some(p.into());
+        }
+    }
+    None
+}
+
+/// The config every running perch agrees on, if they do. Two watchtowers on
+/// one box with different configs leave the choice to `--config`.
+pub fn agreed_config(found: Vec<std::path::PathBuf>) -> Result<Option<std::path::PathBuf>> {
+    let mut found = found;
+    found.sort();
+    found.dedup();
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop()),
+        _ => bail!(
+            "several perch instances are running with different configs ({}); say which with --config",
+            found.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// The config of the perch already running on this machine, read from its
+/// command line, so `perch maint` and `perch status` need no `--config`. The
+/// live boxes run `/home/sol/bin/perch --config /home/sol/perch/config.toml`,
+/// where the install default does not apply. Linux only; elsewhere, nothing.
+pub fn running_config() -> Result<Option<std::path::PathBuf>> {
+    let me = std::process::id().to_string();
+    let Ok(entries) = std::fs::read_dir("/proc") else { return Ok(None) };
+    let mut found = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.chars().all(|c| c.is_ascii_digit()) || name == me {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(e.path().join("cmdline")) else { continue };
+        let argv: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).to_string())
+            .collect();
+        let is_perch = argv
+            .first()
+            .and_then(|a| std::path::Path::new(a).file_name())
+            .is_some_and(|n| n == "perch");
+        // A `perch maint` or `perch status` someone else is running is not the
+        // watchtower; only one with no subcommand is.
+        let is_daemon = !argv.iter().skip(1).any(|a| matches!(a.as_str(), "maint" | "status" | "test-notify"));
+        if !is_perch || !is_daemon {
+            continue;
+        }
+        if let Some(p) = config_arg(&argv) {
+            if p.exists() {
+                found.push(p);
+            }
+        }
+    }
+    agreed_config(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +314,30 @@ mod tests {
     fn refuses_to_pretend_without_a_silence_path() {
         let err = run(None, &args(&["restart"])).unwrap_err().to_string();
         assert!(err.contains("[silence] file is not set"), "{err}");
+    }
+
+    fn argv(s: &str) -> Vec<String> {
+        s.split(' ').map(str::to_string).collect()
+    }
+
+    /// How the live boxes start it, and the other spellings clap accepts.
+    #[test]
+    fn the_config_is_read_from_a_command_line() {
+        use std::path::PathBuf;
+        let want = Some(PathBuf::from("/home/sol/perch/config.toml"));
+        assert_eq!(config_arg(&argv("/home/sol/bin/perch --config /home/sol/perch/config.toml")), want);
+        assert_eq!(config_arg(&argv("perch --config=/home/sol/perch/config.toml")), want);
+        assert_eq!(config_arg(&argv("perch -c /home/sol/perch/config.toml")), want);
+        assert_eq!(config_arg(&argv("perch -c/home/sol/perch/config.toml")), want);
+        assert_eq!(config_arg(&argv("perch --dry-run")), None);
+    }
+
+    #[test]
+    fn one_running_config_is_used_and_two_are_refused() {
+        use std::path::PathBuf;
+        let a = PathBuf::from("/home/sol/perch/config.toml");
+        assert_eq!(agreed_config(vec![]).unwrap(), None);
+        assert_eq!(agreed_config(vec![a.clone(), a.clone()]).unwrap(), Some(a.clone()), "same config twice is one");
+        assert!(agreed_config(vec![a, PathBuf::from("/etc/perch/config.toml")]).is_err());
     }
 }

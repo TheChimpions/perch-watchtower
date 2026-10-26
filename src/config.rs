@@ -215,6 +215,12 @@ pub struct Watchtower {
     /// with it, it fails at startup with the reason.
     #[serde(default)]
     pub cluster: Option<String>,
+    /// Put at the front of every Telegram message and PagerDuty title, in
+    /// brackets, so a notification says which cluster it is about before it is
+    /// opened. Defaults to the pinned cluster ("mainnet", "testnet"); an empty
+    /// string turns it off.
+    #[serde(default)]
+    pub tag: Option<String>,
 }
 
 /// One Telegram message per finished epoch: leader slots, skips, credits,
@@ -285,6 +291,26 @@ impl Watchtower {
     /// mainnet only; asking a testnet endpoint for them would be wasted calls
     /// that always answer "nothing owed". Unpinned is given the benefit of the
     /// doubt.
+    /// What notifications are tagged with: `tag` if set (empty turns it off),
+    /// otherwise the short name of the cluster, from the pin or else from the
+    /// genesis hash the endpoints reported at startup.
+    pub fn notification_tag(&self, detected_genesis: Option<&str>) -> Option<String> {
+        if let Some(tag) = &self.tag {
+            return (!tag.trim().is_empty()).then(|| tag.trim().to_string());
+        }
+        let genesis = self
+            .cluster
+            .as_deref()
+            .and_then(|c| resolve_cluster(c).ok())
+            .or_else(|| detected_genesis.map(str::to_string))?;
+        match genesis.as_str() {
+            "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d" => Some("mainnet".into()),
+            "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY" => Some("testnet".into()),
+            "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG" => Some("devnet".into()),
+            _ => None,
+        }
+    }
+
     pub fn may_be_mainnet(&self) -> bool {
         self.cluster.is_none() || self.sfdp_cluster() == Some("mainnet-beta")
     }
@@ -313,6 +339,7 @@ impl Default for Watchtower {
             interval: default_interval(),
             endpoint_report_interval: default_endpoint_report(),
             cluster: None,
+            tag: None,
         }
     }
 }
@@ -1184,13 +1211,22 @@ fn default_cluster_stake() -> StakeCheckConfig {
     // default now agrees with them.
     let mut base = CheckConfig::new(d(10 * 60), Severity::Notify);
     base.enabled = false;
+    // Cluster-wide: every box on the cluster sends it, so repeating it
+    // multiplies by the fleet. Said once, and once more when it clears.
+    base.renotify_after = Duration::ZERO;
     StakeCheckConfig {
         base,
         min_percent: 80.0,
     }
 }
 fn default_cluster_stalled() -> CheckConfig {
-    CheckConfig::new(d(3 * 60), Severity::Notify)
+    // A halt lasts as long as the cluster restart does, often hours, and every
+    // box on the cluster reports it: the testnet halt of 2026-10-26 sent the
+    // same message from five boxes, then all five again 30 minutes later.
+    CheckConfig {
+        renotify_after: Duration::ZERO,
+        ..CheckConfig::new(d(3 * 60), Severity::Notify)
+    }
 }
 
 impl Default for Checks {
@@ -2382,4 +2418,44 @@ identity = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv"
         let src = format!("{MINIMAL}\n[checks.vote_delinquint]\npending_for = \"1m\"\n");
         assert!(Config::parse(&src).is_err());
     }
+
+#[cfg(test)]
+mod notification_tags {
+    use super::*;
+
+    fn w(cluster: Option<&str>, tag: Option<&str>) -> Watchtower {
+        Watchtower { cluster: cluster.map(str::to_string), tag: tag.map(str::to_string), ..Default::default() }
+    }
+
+    #[test]
+    fn the_pinned_cluster_is_the_tag() {
+        assert_eq!(w(Some("mainnet-beta"), None).notification_tag(None).as_deref(), Some("mainnet"));
+        assert_eq!(w(Some("testnet"), None).notification_tag(None).as_deref(), Some("testnet"));
+        assert_eq!(
+            w(Some("4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY"), None).notification_tag(None).as_deref(),
+            Some("testnet")
+        );
+    }
+
+    #[test]
+    fn an_unpinned_watchtower_is_tagged_from_what_its_endpoints_said() {
+        let unpinned = w(None, None);
+        assert_eq!(unpinned.notification_tag(Some("5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d")).as_deref(), Some("mainnet"));
+        assert_eq!(unpinned.notification_tag(None), None, "nothing known, no tag");
+        assert_eq!(unpinned.notification_tag(Some("SomeLocalClusterGenesis1111111111111111111")), None);
+    }
+
+    #[test]
+    fn a_set_tag_wins_and_an_empty_one_turns_it_off() {
+        assert_eq!(w(Some("testnet"), Some("chimps/testnet")).notification_tag(None).as_deref(), Some("chimps/testnet"));
+        assert_eq!(w(Some("testnet"), Some("")).notification_tag(None), None);
+    }
+
+    #[test]
+    fn cluster_wide_checks_are_said_once() {
+        let c = Checks::default();
+        assert_eq!(c.cluster_stalled.renotify_after, Duration::ZERO);
+        assert_eq!(c.cluster_stake.base.renotify_after, Duration::ZERO);
+    }
+}
 }

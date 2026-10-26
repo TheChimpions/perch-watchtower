@@ -166,19 +166,26 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    // Where install.sh puts it, so `perch maint restart` and `perch status`
-    // work without restating the path every time.
+    // So `perch maint` and `perch status` work without restating the path:
+    // `--config` or PERCH_CONFIG, else the config of the perch already running
+    // here, else where install.sh puts it.
     const DEFAULT_CONFIG: &str = "/etc/perch/config.toml";
+    let running = match (&args.config, &args.command) {
+        (None, Some(Command::Maint { .. } | Command::Status { .. })) => perch::maint::running_config()?,
+        _ => None,
+    };
     let config_path = args
         .config
         .clone()
+        .or(running)
         .or_else(|| {
             let p = PathBuf::from(DEFAULT_CONFIG);
             p.exists().then_some(p)
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "--config <PATH> is required (or set PERCH_CONFIG); {DEFAULT_CONFIG} does not exist"
+                "--config <PATH> is required (or set PERCH_CONFIG): no perch is running here to \
+                 take it from, and {DEFAULT_CONFIG} does not exist"
             )
         })?;
     // Before the full load: that resolves secrets, and the operator declaring
@@ -195,7 +202,8 @@ async fn main() -> Result<()> {
             &config.notify,
             format!("perch/{}", config.watchtower.name),
             false,
-        )?;
+        )?
+        .with_tag(config.watchtower.notification_tag(None));
         let source = format!("perch/{}", config.watchtower.name);
         let mode = if quiet { SelfTestMode::Quiet } else { SelfTestMode::Loud };
         match mode {
@@ -285,13 +293,14 @@ async fn main() -> Result<()> {
 
     let endpoints = build_endpoints(&config)?;
 
-    preflight(&endpoints, config.watchtower.expected_genesis_hash().as_deref()).await?;
+    let genesis = preflight(&endpoints, config.watchtower.expected_genesis_hash().as_deref()).await?;
 
     let notifier = Notifier::new(
         &config.notify,
         format!("perch/{}", config.watchtower.name),
         args.dry_run,
-    )?;
+    )?
+    .with_tag(config.watchtower.notification_tag(genesis.as_deref()));
 
     let heartbeat = match config.heartbeat.as_ref().filter(|h| h.enabled) {
         Some(h) => Some(heartbeat::Heartbeat::new(
@@ -508,7 +517,8 @@ struct Runtime {
 /// genuine genesis-hash disagreement -- proof of a misconfiguration that no
 /// amount of waiting will fix -- is fatal. Unreachable endpoints are a warning;
 /// the blindness alert covers them if they stay down.
-async fn preflight(endpoints: &[rpc::Endpoint], expected_genesis: Option<&str>) -> Result<()> {
+/// Returns the genesis hash the endpoints agreed on, when any answered.
+async fn preflight(endpoints: &[rpc::Endpoint], expected_genesis: Option<&str>) -> Result<Option<String>> {
     use serde_json::json;
 
     let results = futures::future::join_all(
@@ -565,7 +575,7 @@ async fn preflight(endpoints: &[rpc::Endpoint], expected_genesis: Option<&str>) 
              alert rather than crash-looping"
         );
     }
-    Ok(())
+    Ok(seen.into_values().next())
 }
 
 /// One check's resolved state after its state machine ran, captured so the

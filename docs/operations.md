@@ -71,6 +71,10 @@ box on that cluster before the restart begins:
 perch maint cluster-restart        # or: perch maint cluster-restart 8h (default 12h)
 ```
 
+`perch maint` and `perch status` need no `--config` on a box where perch is
+running: they use the config the running perch was started with, then
+`/etc/perch/config.toml`.
+
 ```
 CLUSTER RESTART: waiting for the cluster to halt (deadline 2026-10-21T04:00:00Z)
 Every alert is held. Telegram says when the cluster halts and when it produces
@@ -301,7 +305,7 @@ skips that epoch's summary rather than sending a partial one.
   owns escalation, so nothing re-sends it while it stays open.
 - `notify` — Telegram only, repeated every `renotify_after` while it lasts
   (zero means once). Warning-level balances, cluster-wide stake, cluster
-  stall, endpoint reliability digests (only for a window in which an endpoint was less than perfect -- a clean window is silent), starved checks.
+  stall, endpoint reliability digests (only for a window in which an endpoint was less than perfect -- a clean window is silent; a method or program scan an endpoint refuses is learned once and never counted), starved checks.
 - `log` — logs only.
 
 Every threshold and severity is per-check in the config.

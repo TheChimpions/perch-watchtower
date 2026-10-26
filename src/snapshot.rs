@@ -246,7 +246,7 @@ impl Snapshot {
         }
     }
 
-    fn record(&mut self, err: RpcError) {
+    pub(crate) fn record(&mut self, err: RpcError) {
         match err {
             RpcError::Transient(m) => self.transient_errors.push(m),
             RpcError::Config(m) => self.config_errors.push(m),
@@ -570,7 +570,7 @@ async fn fetch_pools(
             if let Some(vote) = &vote {
                 let r = fetch_invoices(endpoint, vote, vault.poll_interval.max(floor)).await;
                 if let Err(FetchError::Rpc(e)) = &r {
-                    snap.pools_refused |= matches!(e, crate::rpc::RpcError::Config(_));
+                    snap.pools_refused |= refuses_pools(e);
                     snap.record(e.clone());
                 }
                 snap.vault_invoices.insert(v.identity.clone(), r.map_err(|e| e.to_string()));
@@ -579,12 +579,20 @@ async fn fetch_pools(
         if jpool.base.enabled {
             let r = fetch_jpool(endpoint, &v.identity, vote.as_deref(), jpool.poll_interval.max(floor)).await;
             if let Err(FetchError::Rpc(e)) = &r {
-                snap.pools_refused |= matches!(e, crate::rpc::RpcError::Config(_));
+                snap.pools_refused |= refuses_pools(e);
                 snap.record(e.clone());
             }
             snap.jpool.insert(v.identity.clone(), r.map_err(|e| e.to_string()));
         }
     }
+}
+
+/// An endpoint that will not run the pool checks' scans: it cannot vote on
+/// them, so it is left out of their quorum. A refused scan arrives as
+/// `Unsupported` and is never counted (see `pools::scan`); a config error from
+/// the pools' other reads still is.
+pub(crate) fn refuses_pools(e: &RpcError) -> bool {
+    matches!(e, RpcError::Config(_) | RpcError::Unsupported(_))
 }
 
 /// Commission each vote account earned in the last completed epoch, which is

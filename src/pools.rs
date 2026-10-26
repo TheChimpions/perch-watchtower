@@ -352,6 +352,32 @@ impl std::fmt::Display for FetchError {
     }
 }
 
+/// A program scan, or the fact that this endpoint will not run them.
+///
+/// publicnode's free tier answers every scan with a 403, "Indexed requests
+/// require a personal token". That is a fact about the endpoint, like a method
+/// it does not serve, not a fault to count every cycle: as a config error it
+/// was two per validator per cycle, which kept the endpoint reliability report
+/// from ever being clean and sent it from every mainnet box every six hours.
+/// So the first refusal is logged, the endpoint is not asked again, and it is
+/// reported as `Unsupported` from then on, which is never counted. The pool
+/// checks leave such an endpoint out of their quorum either way.
+async fn scan(endpoint: &Endpoint, params: Value, ttl: Duration) -> Result<Value, RpcError> {
+    match endpoint.call_cached("getProgramAccounts", params, ttl).await {
+        Err(RpcError::Config(m)) => {
+            if endpoint.mark_unsupported("getProgramAccounts") {
+                tracing::warn!(
+                    endpoint = %endpoint.name,
+                    "refuses the program scans the stake pool checks need; they will run on the \
+                     other endpoints, and it will not be asked again until perch restarts ({m})"
+                );
+            }
+            Err(RpcError::Unsupported(m))
+        }
+        other => other,
+    }
+}
+
 /// Every invoice the Vault has issued to this vote account.
 pub async fn fetch_invoices(endpoint: &Endpoint, vote: &str, ttl: Duration) -> Result<Vec<Invoice>, FetchError> {
     let params = json!([VAULT_PROGRAM, {
@@ -363,7 +389,7 @@ pub async fn fetch_invoices(endpoint: &Endpoint, vote: &str, ttl: Duration) -> R
             { "memcmp": { "offset": INVOICE_VOTE_OFFSET, "bytes": vote } },
         ],
     }]);
-    let raw = endpoint.call_cached("getProgramAccounts", params, ttl).await?;
+    let raw = scan(endpoint, params, ttl).await?;
     let accounts = raw
         .as_array()
         .ok_or_else(|| FetchError::Unreadable("Vault invoice listing was not an array".into()))?;
@@ -420,7 +446,7 @@ async fn fetch_bonds(
             { "memcmp": { "offset": VALIDATOR_BOND_IDENTITY_OFFSET, "bytes": identity } },
         ],
     }]);
-    let raw = endpoint.call_cached("getProgramAccounts", params, ttl).await?;
+    let raw = scan(endpoint, params, ttl).await?;
     let slot = raw["context"]["slot"].as_u64().unwrap_or(0);
     let accounts = raw["value"]
         .as_array()
@@ -778,5 +804,73 @@ mod tests {
         l.observe(&[jsol(1_000, 1_400, 1)]);
         assert!(l.observe(&[jsol(1_000, 1_380, 2)]).is_empty(), "rate moved, tokens did not");
         assert_eq!(l.observe(&[jsol(900, 1_250, 3)]).len(), 1);
+    }
+
+    /// publicnode, verbatim: every program scan refused with a 403.
+    mod refused_scans {
+        use super::super::*;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        const PUBLICNODE: &str = r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Indexed requests require a personal token. Get yours at https://publicnode.com"},"id":1}"#;
+
+        /// A mock that refuses everything the way publicnode refuses scans,
+        /// counting the requests it was sent.
+        async fn publicnode() -> (Endpoint, Arc<AtomicUsize>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let asked = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&asked);
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = vec![0u8; 65536];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PUBLICNODE}",
+                        PUBLICNODE.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            });
+            let ep = Endpoint::new("publicnode".into(), format!("http://{addr}"), Duration::from_secs(2), 1).unwrap();
+            (ep, asked)
+        }
+
+        #[tokio::test]
+        async fn a_refused_scan_is_asked_once_and_never_counted() {
+            let (ep, asked) = publicnode().await;
+            for _ in 0..3 {
+                let r = fetch_invoices(&ep, "CHiaohVV2SQCFhiYP73iQzWT6HxnZqnAZJJqAYTeLAo", Duration::ZERO).await;
+                assert!(matches!(r, Err(FetchError::Rpc(RpcError::Unsupported(_)))), "{r:?}");
+                let r = fetch_jpool(&ep, "2AKKnirWVZMhnzuwqpizw9SwfZjGpRFLx2zCCNtPWpbc", None, Duration::ZERO).await;
+                assert!(matches!(r, Err(FetchError::Rpc(RpcError::Unsupported(_)))), "{r:?}");
+            }
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "one refusal is enough to know");
+            assert!(ep.is_unsupported("getProgramAccounts"));
+        }
+
+        /// What a cycle records about it: nothing an endpoint report counts,
+        /// while the pool checks still know to leave it out of their quorum.
+        #[tokio::test]
+        async fn a_refused_scan_leaves_no_error_in_the_snapshot() {
+            let (ep, _) = publicnode().await;
+            let mut snap = crate::snapshot::Snapshot::empty_for_test("publicnode");
+            for _ in 0..2 {
+                if let Err(FetchError::Rpc(e)) = fetch_invoices(&ep, "CHiaohVV2SQCFhiYP73iQzWT6HxnZqnAZJJqAYTeLAo", Duration::ZERO).await {
+                    snap.pools_refused |= crate::snapshot::refuses_pools(&e);
+                    snap.record(e);
+                }
+            }
+            assert!(snap.pools_refused);
+            assert!(snap.config_errors.is_empty(), "{:?}", snap.config_errors);
+            assert!(snap.transient_errors.is_empty());
+        }
     }
 }

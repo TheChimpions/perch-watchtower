@@ -2,7 +2,7 @@
 //!
 //! "chimpions-mainnet is delinquent" says what; the validator's own log usually says
 //! why. On 2026-09-30 it said `no route for peer` 231,000 times in four minutes
-//! and then `must be routed through 5.187.38.22 which has no known MAC
+//! and then `must be routed through 203.0.113.22 which has no known MAC
 //! address` -- the uplink had dropped and taken the default route with it. That
 //! answer was sitting on disk the whole time the page was going out without it.
 //!
@@ -442,7 +442,7 @@ mod tests {
                 s
             ));
         }
-        lines.push("[2026-09-30T06:07:11.000000000Z WARN  agave_xdp::tx_loop] dropping packet: peer 1.2.3.4:8009 must be routed through 5.187.38.22 which has no known MAC address".into());
+        lines.push("[2026-09-30T06:07:11.000000000Z WARN  agave_xdp::tx_loop] dropping packet: peer 1.2.3.4:8009 must be routed through 203.0.113.22 which has no known MAC address".into());
         let path = write_log("outage", &lines);
 
         let found = scan_log(&path, t("2026-09-30T05:50:00Z"), 1 << 30).unwrap();

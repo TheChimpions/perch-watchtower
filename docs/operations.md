@@ -175,6 +175,11 @@ the peer disappears. An undeclared disappearance still pages; suppression
 requires a declaration. The cache is persisted, because a hub restarting
 mid-window would otherwise forget and page for a box that is deliberately down.
 
+While a peer's window is open, the hub's checks on it are frozen, not
+inconclusive: a long window, such as a cluster restart, is never reported as
+"cannot be evaluated". Alerts the hub sends about a peer are tagged with the
+peer's cluster, so a testnet box's alert from a mainnet hub says `[testnet]`.
+
 Plain timed silences work too: `perch maint 30m`, `perch maint off`, and `perch maint` to show state.
 While a box is silenced its own checks go to the journal only -- nothing to
 PagerDuty, nothing to Telegram. A 🚨 about a validator you just took down reads

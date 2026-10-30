@@ -16,7 +16,7 @@ vulnerability reporting). Please do not open a public issue.
 | | |
 |---|---|
 | Holds a keypair | **No.** It has no code to load one, and `/home` is hidden from it. |
-| Signs or sends transactions | **No.** It calls ten read-only RPC methods, listed below. |
+| Signs or sends transactions | **No.** It calls twelve read-only RPC methods, listed below. |
 | Runs other programs | **No**, and the kernel enforces it (`NoExecPaths=/`). |
 | Writes to the system | **One directory**, `/var/lib/perch`. Everything else is read-only. |
 | Runs as root | **No.** A dedicated `perch` user with no shell, no home and no capabilities. |
@@ -33,7 +33,8 @@ Every outbound connection perch makes, and nothing else:
 
 | Destination | When | What is sent |
 |---|---|---|
-| Your `[[endpoints]]` | every cycle | JSON-RPC `getEpochInfo`; per validator `getVoteAccounts` (filtered to your vote account) and `getBlockProduction` (identity); `getMultipleAccounts`, in batches of 10, for every validator's vote account and identity plus five public feature accounts (Alpenglow and the slot-time reductions). Hourly, `getMinimumBalanceForRentExemption`, and `getInflationReward` for your vote accounts' commission in the last completed epoch. Once at startup, `getGenesisHash`. Local endpoints only: `getVersion`, `getIdentity`. If an endpoint will not serve `getMultipleAccounts`, `getBalance` per identity instead. When an alert fires: one unfiltered `getVoteAccounts`, for cluster context. All public pubkeys; no secrets. |
+| Your `[[endpoints]]` | every cycle | JSON-RPC `getEpochInfo`; per validator `getVoteAccounts` (filtered to your vote account) and `getBlockProduction` (identity); `getMultipleAccounts` for the vote accounts, ten per call. Hourly, `getMinimumBalanceForRentExemption`, and `getInflationReward` for your vote accounts' commission in the last completed epoch. Once at startup, `getGenesisHash`. Local endpoints only: `getVersion`, `getIdentity`. When an alert fires: one unfiltered `getVoteAccounts`, for cluster context. All public pubkeys; no secrets. |
+| Your remote `[[endpoints]]`, on mainnet | every 15 minutes, for the stake-pool checks | `getProgramAccounts` on The Vault's and JPool's bond programs, filtered to your vote account and identity; `getAccountInfo` on JPool's pool, validator-list and bond-state accounts; `getTokenAccountsByOwner` for a bond's JSOL balance. Never asked of a local node, which would scan its own accounts database to answer. An endpoint that refuses program scans (publicnode's free tier) is asked once. |
 | Your `[[hosts]]` | every cycle | `GET /metrics` on node_exporter. |
 | Your `[[peers]]` | every cycle | `GET /metrics` on another perch. |
 | `api.telegram.org` | when alerting; weekly self-test | The alert text. The bot token is part of the URL, as Telegram requires. |
@@ -64,7 +65,11 @@ One TCP listener, `[metrics] listen`, default **`127.0.0.1:9469`**:
 - `GET /`: the same state as a small HTML page.
 
 It has no authentication, accepts no input beyond the request path, and has no
-endpoint that changes anything. It does reveal things: validator pubkeys,
+endpoint that changes anything. A connection that sends nothing is dropped
+after five seconds. In the other direction, a response body from an endpoint,
+host or peer is refused past a fixed size (64 MiB for RPC, 8 MiB for a
+scrape) rather than buffered, so a hostile endpoint cannot push perch into its
+memory cap. It does reveal things: validator pubkeys,
 balances, endpoint *names* (never URLs), peer names, software versions, and
 whether a maintenance window is active. **Keep it on localhost or a private
 interface.** For a hub to reach it, use a private network (WireGuard,
@@ -77,7 +82,8 @@ Tailscale) or an SSH tunnel, never `0.0.0.0` on a public address.
 | `/etc/perch/config.toml` | read | Configuration. Mode 0640, `root:perch`. |
 | `/etc/perch/env` | **none** | Secrets. Mode 0600, `root:root`. systemd reads it as root and passes the values in as environment variables; the perch process cannot open the file. |
 | `/var/lib/perch/state.json` | read, write | Alert state, so a restart does not orphan an open incident. Written atomically, mode 0640 so `perch status` works for the `perch` group. Holds check states and incident keys, no secrets. |
-| `/var/lib/perch/maint/silence` | read, delete | Maintenance windows. Written by `perch maint`; perch deletes it when a window ends. |
+| `/var/lib/perch/maint/silence` | read, write, delete | Maintenance windows. Written by `perch maint`, rewritten by perch to record a cluster restart's stage, deleted when a window ends. Written without following a symlink, so a link planted in the group-writable directory cannot redirect the write. |
+| `/proc/*/cmdline` | read | `perch maint` and `perch status` only, run without `--config`: to find the running perch's config. A config found this way is used only if root or the invoking user owns it and nobody else can write it. |
 | `/proc/self/{status,mountinfo}` | read | The startup sandbox self-report. |
 | `/sys/class/net/*/carrier_down_count` | read | Only with `[diagnose]`: link-flap counts. |
 | The validator log | read | Only with `[diagnose]`, and only after you bind-mount its directory in. |
@@ -195,11 +201,15 @@ startup line then reports `home=empty` instead of `home=hidden`.
 
 ## Supply chain
 
-- **Dependencies.** 143 crates in the Linux build graph, every one under a
-  permissive license (MIT, Apache-2.0, ISC, BSD, Zlib, Unicode-3.0,
-  CDLA-Permissive-2.0 for the bundled CA roots), none copyleft. `Cargo.lock` is
-  committed, and builds use `--locked`, so a release builds against exactly
-  the reviewed versions.
+- **Dependencies.** 126 crates in the Linux release build
+  (`cargo tree --target x86_64-unknown-linux-musl -e normal --prefix none`),
+  every one under a permissive license (MIT, Apache-2.0, ISC, BSD, Zlib,
+  Unicode-3.0, CDLA-Permissive-2.0 for the bundled CA roots), none copyleft.
+  `Cargo.lock` is committed, and builds use `--locked`, so a release builds
+  against exactly the reviewed versions. The lockfile is checked against the
+  RustSec advisory database before a release (`cargo audit`); 1.4.2 updated
+  rustls, rustls-webpki, webpki-roots and tokio for advisories published in
+  October 2026.
 - **TLS** is rustls. There is no OpenSSL and no system TLS library.
 - **Release binaries** are statically linked (musl) and built by
   [`.github/workflows/release.yml`](.github/workflows/release.yml) from the

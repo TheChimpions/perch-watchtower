@@ -120,7 +120,7 @@ pub fn run(silence_file: Option<&str>, args: &[String]) -> Result<()> {
         },
         Action::Restart(_) | Action::For(_) | Action::ClusterRestart(_) => {
             let body = contents(&action, now).unwrap_or_default();
-            std::fs::write(path, body)
+            write_silence(path, &body)
                 .with_context(|| format!("writing {path} (is this user in the perch group?)"))?;
         }
     }
@@ -144,6 +144,48 @@ pub fn run(silence_file: Option<&str>, args: &[String]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Write the silence file without following a symlink at its path.
+///
+/// The maintenance directory is group-writable so operators can declare
+/// windows, and perch itself rewrites the file to record a cluster restart's
+/// stage. A link planted there must not turn either write into a write
+/// somewhere else. Removing first and creating exclusively never follows a
+/// link, and the mode is set explicitly so the daemon's umask does not leave
+/// a file the operators' `perch maint` cannot read.
+pub fn write_silence(path: &str, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o660))?;
+    f.write_all(body.as_bytes())
+}
+
+/// Whether a config found on another process's command line may be trusted:
+/// owned by root or by the user running this command, and not world-writable.
+/// Anyone with an account on the box can run something called
+/// `perch --config /tmp/theirs.toml`; this is what keeps that from choosing
+/// where an operator's `perch maint` writes.
+fn trusted_config(path: &std::path::Path, my_uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .map(|m| (m.uid() == 0 || m.uid() == my_uid) && m.mode() & 0o002 == 0)
+        .unwrap_or(false)
+}
+
+/// The uid this process runs as, read from `/proc/self`.
+fn my_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
 }
 
 /// The `--config` a perch command line was started with: `--config PATH`,
@@ -187,6 +229,7 @@ pub fn agreed_config(found: Vec<std::path::PathBuf>) -> Result<Option<std::path:
 pub fn running_config() -> Result<Option<std::path::PathBuf>> {
     let me = std::process::id().to_string();
     let Ok(entries) = std::fs::read_dir("/proc") else { return Ok(None) };
+    let Some(uid) = my_uid() else { return Ok(None) };
     let mut found = Vec::new();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
@@ -210,7 +253,7 @@ pub fn running_config() -> Result<Option<std::path::PathBuf>> {
             continue;
         }
         if let Some(p) = config_arg(&argv) {
-            if p.exists() {
+            if trusted_config(&p, uid) {
                 found.push(p);
             }
         }
@@ -339,5 +382,57 @@ mod tests {
         assert_eq!(agreed_config(vec![]).unwrap(), None);
         assert_eq!(agreed_config(vec![a.clone(), a.clone()]).unwrap(), Some(a.clone()), "same config twice is one");
         assert!(agreed_config(vec![a, PathBuf::from("/etc/perch/config.toml")]).is_err());
+    }
+
+    fn tmpdir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("perch-maint-{}-{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn rand_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
+    /// A link planted at the silence path is replaced, never followed.
+    #[test]
+    fn writing_the_silence_file_does_not_follow_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmpdir();
+        let target = d.join("state.json");
+        std::fs::write(&target, "precious").unwrap();
+        let link = d.join("silence");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_silence(link.to_str().unwrap(), "cluster 2099-01-01T00:00:00Z\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "precious", "the link target is untouched");
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_file(), "a regular file now stands where the link was");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o660);
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "cluster 2099-01-01T00:00:00Z\n");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A config is trusted when it belongs to root or to the caller and nobody
+    /// else can write it; a stranger's file, or a world-writable one, is not.
+    #[test]
+    fn only_a_config_the_caller_or_root_owns_is_trusted() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let d = tmpdir();
+        let cfg = d.join("config.toml");
+        std::fs::write(&cfg, "[watchtower]\n").unwrap();
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let mine = std::fs::metadata(&cfg).unwrap().uid();
+
+        assert!(trusted_config(&cfg, mine));
+        assert!(!trusted_config(&cfg, mine.wrapping_add(1)), "someone else's file");
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(!trusted_config(&cfg, mine), "world-writable");
+        assert!(!trusted_config(&d.join("missing.toml"), mine));
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

@@ -1092,7 +1092,11 @@ pub fn evaluate_peers(
             out.push(CheckOutcome {
                 id: format!("machine_down:{}", p.name),
                 title: format!("{} appears to be hard down", p.name),
-                warming_up: false,
+                // A declared window is deliberate and has a deadline: frozen,
+                // never reported as a check that cannot be evaluated. The hub
+                // reported every testnet box's peer checks as starved two
+                // hours into the 2026-10-26 cluster restart.
+                warming_up: in_maintenance,
                 cfg: c.machine_down.clone(),
                 verdict: if in_maintenance {
                     Verdict::unknown(format!(
@@ -1134,7 +1138,7 @@ pub fn evaluate_peers(
             out.push(CheckOutcome {
                 id: format!("peer_down:{}", p.name),
                 title: format!("Peer {} is not reporting", p.name),
-                warming_up: false,
+                warming_up: in_maintenance,
                 cfg: c.peer_down.clone(),
                 verdict: if in_maintenance {
                     Verdict::unknown(format!(
@@ -1737,6 +1741,7 @@ mod tests {
             version: Some("0.1.0".into()),
             uptime: Some(Duration::from_secs(3600)),
             maintenance_until: maint,
+            cluster: None,
             error: (!reachable).then(|| "unreachable".to_string()),
         }
     }
@@ -1773,6 +1778,24 @@ mod tests {
                 o.verdict
             );
         }
+    }
+
+    /// The hub reported every testnet box's peer checks as "cannot be
+    /// evaluated" two hours into the 2026-10-26 cluster restart. A declared
+    /// window is deliberate and has a deadline: waiting, not blindness.
+    #[test]
+    fn a_declared_maintenance_window_is_waiting_not_starved() {
+        let c = peer_cfg();
+        let now = 1_700_000_000;
+        let out = evaluate_peers(&[peer_status("hub", false, Some(now + 3600))], &[], &c, Duration::from_secs(300), &HashMap::new(), now);
+        for id in ["machine_down:hub", "peer_down:hub"] {
+            let o = out.iter().find(|o| o.id == id).unwrap();
+            assert!(matches!(o.verdict, Verdict::Unknown(_)), "{id} is frozen");
+            assert!(o.warming_up, "{id} must not count toward starvation");
+        }
+        // Without a window, an unknown peer is still one that cannot be judged.
+        let out = evaluate_peers(&[peer_status("hub", true, None)], &[], &c, Duration::from_secs(300), &HashMap::new(), now);
+        assert!(out.iter().all(|o| !o.warming_up));
     }
 
     #[test]

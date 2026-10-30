@@ -138,39 +138,72 @@ impl FillHistory {
     }
 }
 
+/// Samples that must follow a sharp drop before it counts as a step rather
+/// than the start of a snapshot write still in progress.
+const STEP_SETTLE_SAMPLES: usize = 2;
+
 impl FillHistory {
-    /// Index of the first sample after the most recent step: a drop between two
-    /// consecutive samples larger than `floor` and ten times the window's
-    /// median sample-to-sample change.
+    /// Index of the first sample after the most recent step, if there is one.
     ///
-    /// A step is something that happened, not a rate: on 2026-10-23 a
-    /// validator unpacked its accounts database onto chimpions-mainnet's root
-    /// filesystem in six minutes, after which free space sat flat. Fitted
-    /// through, that one drop read as 115 GB an hour for the next six hours.
-    fn last_step(&self, floor: u64) -> Option<usize> {
+    /// A step is a drop between two consecutive samples larger than `floor` and
+    /// ten times the window's median sample-to-sample change, that free space
+    /// has not come back from. On 2026-10-23 a validator unpacked its accounts
+    /// database onto chimpions-mainnet's root filesystem in six minutes, after
+    /// which free space sat flat; fitted through, that one drop read as 115 GB
+    /// an hour for the next six hours.
+    ///
+    /// A drop that *is* come back from is the ledger disk's own sawtooth: a
+    /// full snapshot is written (about 120 GB over ten minutes on mainnet,
+    /// every six hours) and the previous one is purged a minute later. Treating
+    /// those as steps, as 1.4.0 did, left the fill checks in warm-up for 45
+    /// minutes after every snapshot on every mainnet box. Such a drop is part
+    /// of the pattern the least-squares fit already handles.
+    ///
+    /// `Err(())` is a drop too recent to tell apart: fewer than
+    /// `STEP_SETTLE_SAMPLES` samples since, and no recovery yet.
+    fn last_step(&self, floor: u64) -> Result<Option<usize>, ()> {
         let v: Vec<i128> = self.samples.iter().map(|(_, y)| *y as i128).collect();
         if v.len() < 3 {
-            return None;
+            return Ok(None);
         }
         let mut changes: Vec<i128> = v.windows(2).map(|w| (w[0] - w[1]).abs()).collect();
         changes.sort_unstable();
         let median = changes[changes.len() / 2];
         let threshold = (floor as i128).max(median.saturating_mul(10));
-        (1..v.len()).rev().find(|&i| v[i - 1] - v[i] > threshold)
+        let Some(i) = (1..v.len()).rev().find(|&i| v[i - 1] - v[i] > threshold) else {
+            return Ok(None);
+        };
+        let drop = v[i - 1] - v[i];
+        // Recovered since: the largest rise from the post-drop low covers at
+        // least half the drop, so the drop was one half of a sawtooth.
+        let low = v[i..].iter().copied().min().unwrap_or(v[i]);
+        let high_after = v[i..].iter().copied().max().unwrap_or(v[i]);
+        if high_after - low >= drop / 2 {
+            return Ok(None);
+        }
+        if v.len() - i < STEP_SETTLE_SAMPLES {
+            return Err(());
+        }
+        Ok(Some(i))
     }
 
     /// `project`, fitted only to what came after the most recent step. Until
     /// there is `min_span` of it, the answer is `Insufficient`: whether the
     /// disk keeps filling after a step cannot be known yet, and the free-space
-    /// floor still guards it meanwhile. Rises are never steps, so a sawtooth
-    /// of snapshots accumulating and being purged is fitted exactly as before.
+    /// floor still guards it meanwhile. A drop too recent to tell from a
+    /// snapshot write in progress is also `Insufficient`, for the few minutes
+    /// until the purge arrives or does not.
     pub fn project_after_steps(&self, min_span: Duration, min_samples: usize, floor: u64) -> Projection {
         match self.last_step(floor) {
-            None => self.project(min_span, min_samples),
-            Some(i) => FillHistory {
+            Ok(None) => self.project(min_span, min_samples),
+            Ok(Some(i)) => FillHistory {
                 samples: self.samples.iter().skip(i).copied().collect(),
             }
             .project(min_span, min_samples),
+            Err(()) => Projection::Insufficient {
+                have: Duration::ZERO,
+                need: Duration::from_secs(STEP_SETTLE_SAMPLES as u64 * 300),
+            },
         }
     }
 }
@@ -373,6 +406,42 @@ mod tests {
         };
         let gb_per_hour = bytes_per_sec * 3600.0 / GB as f64;
         assert!((gb_per_hour - 60.0).abs() < 1.0, "5 GB every 5 minutes is 60 GB/hour, got {gb_per_hour}");
+    }
+
+    /// chimpions-mainnet's ledger disk on 2026-10-30, every 5 minutes: flat
+    /// at 1048 GB, a full snapshot written over ten minutes, the previous one
+    /// purged, flat again. 1.4.0 read the write as a step and left the check
+    /// in warm-up for 45 minutes after every snapshot.
+    #[test]
+    fn a_snapshot_sawtooth_is_not_a_step() {
+        let mut h = FillHistory::default();
+        let mut t = 1_793_000_000u64;
+        let mut push = |gb: f64, h: &mut FillHistory| {
+            h.record(t, (gb * GB as f64) as u64, EVERY, WINDOW);
+            t += 300;
+        };
+        for _ in 0..24 {
+            push(1048.0, &mut h);
+        }
+        for gb in [1019.2, 977.0, 940.4] {
+            push(gb, &mut h);
+        }
+        // Mid-write: too recent to tell from a one-off drop, so it waits.
+        assert!(matches!(h.project_after_steps(MIN_SPAN, 6, 10 * GB), Projection::Insufficient { .. }));
+        push(1048.1, &mut h); // the purge
+        // A recovered drop is fitted like any other sample: the same answer the
+        // plain fit gives, which reads the sawtooth as flat or as a fill days
+        // away, never as a drain measured in hours.
+        let quiet = |p: &Projection| match p {
+            Projection::NotFilling => true,
+            Projection::Filling { time_to_full, .. } => *time_to_full > Duration::from_secs(48 * 3600),
+            Projection::Insufficient { .. } => false,
+        };
+        let after = h.project_after_steps(MIN_SPAN, 6, 10 * GB);
+        assert_eq!(after, h.project(MIN_SPAN, 6));
+        assert!(quiet(&after), "{after:?}");
+        push(1047.2, &mut h);
+        assert!(quiet(&h.project_after_steps(MIN_SPAN, 6, 10 * GB)));
     }
 
     /// Steady filling is many similar drops, none of them a step.

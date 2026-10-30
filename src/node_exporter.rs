@@ -185,11 +185,9 @@ impl Host {
         if !status.is_success() {
             return Err(RpcError::Transient(format!("node_exporter returned {status}")));
         }
-        resp.text()
+        crate::rpc::body_capped(resp, crate::rpc::MAX_SCRAPE_BODY)
             .await
-            .map_err(|e| {
-                RpcError::Transient(format!("unreadable scrape body: {}", crate::rpc::scrub(e)))
-            })
+            .map_err(|e| RpcError::Transient(format!("unreadable scrape body: {e}")))
     }
 }
 

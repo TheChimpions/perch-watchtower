@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "17 6 * * 1"   # weekly, for the audit job
 
 # Read-only by default; nothing here publishes anything.
 permissions:
@@ -23,6 +25,29 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - run: cargo test --locked
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Known vulnerabilities in the locked dependency tree. Runs on every change
+  # and weekly, so an advisory published after a release still surfaces
+  # (October 2026 brought four, in rustls, webpki and tokio, between releases).
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
 
   installer:
     runs-on: ubuntu-latest

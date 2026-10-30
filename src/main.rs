@@ -359,6 +359,7 @@ async fn main() -> Result<()> {
         maintenance_saw_trouble: false,
         cluster_watch: None,
         peer_maintenance: restored.peer_maintenance.clone(),
+        peer_clusters: HashMap::new(),
         states: restored.states,
         announced: restored.announced,
         blindness,
@@ -473,6 +474,9 @@ struct Runtime {
     cluster_watch: Option<ClusterWatch>,
     /// Peer name -> unix deadline of a maintenance window it declared.
     peer_maintenance: HashMap<String, u64>,
+    /// Peer name -> the cluster it last said it watches. Remembered, because a
+    /// peer that has gone silent is the one whose alerts need tagging.
+    peer_clusters: HashMap<String, String>,
     states: HashMap<String, CheckState>,
     /// Checks we actually sent a trigger for. An inhibited check never gets a
     /// trigger, so it must never get a resolve either.
@@ -709,6 +713,9 @@ async fn run_cycle(
     }
     // Remember what each peer declared while we could still reach it.
     for p in &peer_statuses {
+        if let Some(c) = &p.cluster {
+            rt.peer_clusters.insert(p.name.clone(), c.clone());
+        }
         match p.maintenance_until {
             Some(until) => {
                 rt.peer_maintenance.insert(p.name.clone(), until);
@@ -1035,6 +1042,16 @@ fn announce_late(
     suppressed: bool,
 ) -> bool {
     may_report && firing && !announced && matches!(verdict, Verdict::Unhealthy(_)) && !suppressed
+}
+
+/// The tag for a cluster as perch reports it in `perch_watchtower_info`.
+fn cluster_tag(solana_cluster: &str) -> Option<&'static str> {
+    match solana_cluster {
+        "mainnet-beta" | "mainnet" => Some("mainnet"),
+        "testnet" => Some("testnet"),
+        "devnet" => Some("devnet"),
+        _ => None,
+    }
 }
 
 /// What an `auto` maintenance window should do this cycle.
@@ -1388,7 +1405,7 @@ async fn resolve_cluster_restart(
 
     if next != previous {
         // The phase lives in the file so a perch restart keeps its place.
-        if let Err(e) = std::fs::write(path, state::cluster_restart_contents(deadline, next)) {
+        if let Err(e) = perch::maint::write_silence(path, &state::cluster_restart_contents(deadline, next)) {
             warn!("could not record cluster restart phase in {path}: {e}");
         }
     }
@@ -1539,11 +1556,18 @@ async fn dispatch_check(
     endpoint_count: usize,
     now: Instant,
 ) {
+    // An alert about a peer names the peer's cluster: the hub's own tag would
+    // call a testnet box's alert [mainnet].
+    let peer_tag = config::is_peer_check(&outcome.id)
+        .then(|| outcome.id.split_once(':').map(|(_, peer)| peer))
+        .flatten()
+        .and_then(|peer| rt.peer_clusters.get(peer))
+        .and_then(|c| cluster_tag(c));
     // A starved check is a watchtower problem, not a validator problem, so it
     // reports at notify level whatever the check's own severity is.
     if p.transition == Transition::Starved {
         notifier
-            .dispatch(&Alert {
+            .dispatch_with_tag(&Alert {
                 kind: AlertKind::Info,
                 severity: Severity::Notify,
                 key: format!("starved/{}", outcome.id),
@@ -1555,7 +1579,7 @@ async fn dispatch_check(
                     humantime::format_duration(round_secs(p.inconclusive_for)),
                     outcome.verdict
                 ),
-            })
+            }, peer_tag)
             .await;
         return;
     }
@@ -1582,13 +1606,13 @@ async fn dispatch_check(
     if let Some(cause) = suppressed.get(&outcome.id) {
         if rt.announced.remove(&outcome.id) {
             notifier
-                .dispatch(&Alert {
+                .dispatch_with_tag(&Alert {
                     kind: AlertKind::Resolve,
                     severity,
                     key,
                     title: format!("Superseded: {}", outcome.title),
                     body: format!("Folded into the alert for {cause}, which explains it."),
-                })
+                }, peer_tag)
                 .await;
         } else {
             debug!(check = %outcome.id, "not alerting: explained by {cause}");
@@ -1655,7 +1679,7 @@ async fn dispatch_check(
             }
 
             notifier
-                .dispatch(&Alert {
+                .dispatch_with_tag(&Alert {
                     kind: AlertKind::Trigger,
                     severity,
                     key,
@@ -1665,7 +1689,7 @@ async fn dispatch_check(
                         outcome.title.clone()
                     },
                     body,
-                })
+                }, peer_tag)
                 .await;
             rt.announced.insert(outcome.id.clone());
         }
@@ -1678,7 +1702,7 @@ async fn dispatch_check(
                 return;
             }
             notifier
-                .dispatch(&Alert {
+                .dispatch_with_tag(&Alert {
                     kind: AlertKind::Resolve,
                     severity,
                     key,
@@ -1687,7 +1711,7 @@ async fn dispatch_check(
                         "Recovered after {}.",
                         humantime::format_duration(round_secs(p.incident_duration))
                     ),
-                })
+                }, peer_tag)
                 .await;
         }
         Transition::Quiet | Transition::Starved => unreachable!("handled above"),
@@ -2266,6 +2290,13 @@ mod tests {
     #[test]
     fn epoch_context_is_empty_when_nothing_answered() {
         assert_eq!(epoch_context(&[]), "");
+    }
+
+    #[test]
+    fn a_peers_reported_cluster_becomes_its_tag() {
+        assert_eq!(cluster_tag("mainnet-beta"), Some("mainnet"));
+        assert_eq!(cluster_tag("testnet"), Some("testnet"));
+        assert_eq!(cluster_tag("unpinned"), None, "no tag rather than a wrong one");
     }
 
     /// chimpions-mainnet, 2026-10-23: vote lag and stalled credits fired while

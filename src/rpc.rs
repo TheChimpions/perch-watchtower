@@ -76,6 +76,40 @@ pub fn scrub(mut err: reqwest::Error) -> reqwest::Error {
     err
 }
 
+/// The most perch will read of one RPC response. reqwest buffers a whole body
+/// in memory, and under the unit's 192 MB cap a hostile or broken endpoint
+/// answering with gigabytes is an OOM kill and a restart every cycle, which is
+/// a monitoring outage. An unfiltered mainnet `getVoteAccounts`, the largest
+/// answer perch asks for, is a few MB.
+pub const MAX_RPC_BODY: usize = 64 << 20;
+/// The same for a node_exporter or peer scrape, which are a few KB.
+pub const MAX_SCRAPE_BODY: usize = 8 << 20;
+
+/// Read a response body, refusing one over `max` bytes before buffering it.
+/// A declared length over the cap is refused without reading; an undeclared
+/// one is refused the moment it crosses it.
+pub async fn body_capped(mut resp: reqwest::Response, max: usize) -> RpcResult<String> {
+    let too_big = |n: usize| {
+        RpcError::Transient(format!(
+            "response body over {} MiB ({n} bytes); refusing to buffer it",
+            max >> 20
+        ))
+    };
+    if let Some(n) = resp.content_length() {
+        if n > max as u64 {
+            return Err(too_big(n as usize));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| classify_reqwest(&scrub(e)))? {
+        if buf.len() + chunk.len() > max {
+            return Err(too_big(buf.len() + chunk.len()));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Classify a reqwest failure. Every transport-level outcome is transient --
 /// there is no such thing as an HTTP error that proves a validator is delinquent.
 fn classify_reqwest(err: &reqwest::Error) -> RpcError {
@@ -354,7 +388,7 @@ impl Endpoint {
             .map_err(|e| classify_reqwest(&scrub(e)))?;
 
         let status = resp.status();
-        let text = resp.text().await.map_err(|e| classify_reqwest(&scrub(e)))?;
+        let text = body_capped(resp, MAX_RPC_BODY).await?;
 
         if !status.is_success() {
             return Err(classify_status(status, &text));
@@ -553,3 +587,66 @@ mod scrub_tests {
     }
 }
 
+#[cfg(test)]
+mod body_limits {
+    use super::*;
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+    /// A server that answers every request with `body_len` bytes, declaring
+    /// the length or not.
+    async fn serve(body_len: usize, declare: bool) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut req = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut req).await;
+                    let head = if declare {
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n")
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n".to_string()
+                    };
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let chunk = vec![b'x'; 64 << 10];
+                    let mut sent = 0;
+                    while sent < body_len {
+                        let n = chunk.len().min(body_len - sent);
+                        if socket.write_all(&chunk[..n]).await.is_err() {
+                            break;
+                        }
+                        sent += n;
+                    }
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    async fn get(url: &str, max: usize) -> RpcResult<String> {
+        let resp = reqwest::Client::new().get(url).send().await.unwrap();
+        body_capped(resp, max).await
+    }
+
+    /// Both ways an endpoint can hand back more than perch will hold: with a
+    /// Content-Length that says so, and without one.
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_refused_declared_or_not() {
+        let cap = 1 << 20;
+        let declared = serve(3 << 20, true).await;
+        let r = get(&declared, cap).await;
+        assert!(matches!(&r, Err(RpcError::Transient(m)) if m.contains("over 1 MiB")), "{r:?}");
+
+        let undeclared = serve(3 << 20, false).await;
+        let r = get(&undeclared, cap).await;
+        assert!(matches!(&r, Err(RpcError::Transient(m)) if m.contains("over 1 MiB")), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn a_body_under_the_cap_is_read_whole() {
+        let url = serve(300 << 10, false).await;
+        let body = get(&url, 1 << 20).await.unwrap();
+        assert_eq!(body.len(), 300 << 10);
+    }
+}

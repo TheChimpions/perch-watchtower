@@ -19,12 +19,13 @@ ExecStart=/usr/local/bin/perch --config /etc/perch/config.toml
 # the state file itself stays 0600 (UMask below).
 StateDirectory=perch
 StateDirectoryMode=0750
-# Secrets live here, mode 0600, owned by the service user.
+# Secrets live here, mode 0600, root only. systemd reads it as root and passes
+# the values in as environment variables; the perch process cannot open it.
 EnvironmentFile=/etc/perch/env
 Restart=always
 RestartSec=30s
 
-# Perch never executes a process, never opens a keypair, and calls seven
+# Perch never executes a process, never opens a keypair, and calls twelve
 # read-only RPC methods. The sandbox below is what makes that structural rather
 # than a promise -- a compromised dependency must not be able to do what the
 # source does not.

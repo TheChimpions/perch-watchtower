@@ -161,7 +161,7 @@ impl Fetcher {
     }
 
     pub async fn fetch(&self, cluster: &str) -> Result<Requirements> {
-        let body = self
+        let resp = self
             .client
             .get(ENDPOINT)
             .query(&[("cluster", cluster)])
@@ -169,10 +169,11 @@ impl Fetcher {
             .await
             .context("requesting SFDP required versions")?
             .error_for_status()
-            .context("SFDP API returned an error")?
-            .text()
+            .context("SFDP API returned an error")?;
+        // The schedule is a few KB; a megabyte is already wrong.
+        let body = crate::rpc::body_capped(resp, 1 << 20)
             .await
-            .context("reading SFDP response")?;
+            .map_err(|e| anyhow::anyhow!("reading SFDP response: {e}"))?;
         parse(cluster, &body)
     }
 }

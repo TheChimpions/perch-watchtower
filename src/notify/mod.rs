@@ -172,10 +172,11 @@ impl Notifier {
         self
     }
 
-    /// The alert as delivered: tagged, if this notifier has a tag.
-    fn tagged(&self, alert: &Alert) -> Alert {
+    /// The alert as delivered: tagged with `tag` if given, otherwise with this
+    /// notifier's own tag, if it has one.
+    fn tagged(&self, alert: &Alert, tag: Option<&str>) -> Alert {
         let mut out = alert.clone();
-        if let Some(tag) = &self.tag {
+        if let Some(tag) = tag.or(self.tag.as_deref()) {
             out.title = format!("[{tag}] {}", alert.title);
         }
         out
@@ -186,6 +187,12 @@ impl Notifier {
     }
 
     pub async fn dispatch(&self, alert: &Alert) {
+        self.dispatch_with_tag(alert, None).await
+    }
+
+    /// `dispatch`, tagged with `tag` instead of this notifier's own: an alert
+    /// about a peer names the peer's cluster, not the hub's.
+    pub async fn dispatch_with_tag(&self, alert: &Alert, tag: Option<&str>) {
         // The tier belongs in the log line: "something fired" and "someone was
         // woken up" are very different events to find in a postmortem.
         let tier = match alert.severity {
@@ -207,7 +214,7 @@ impl Notifier {
             info!("dry run: not delivering {:?} to any channel", alert.kind);
             return;
         }
-        let alert = &self.tagged(alert);
+        let alert = &self.tagged(alert, tag);
 
         // Telegram gets everything. A page that PagerDuty drops is still visible.
         if let Some(tg) = &self.telegram {
@@ -458,14 +465,25 @@ mod tags {
         let n = Notifier::new(&NotifyConfig::default(), "perch/refi-test".into(), true)
             .unwrap()
             .with_tag(Some("testnet".into()));
-        let t = n.tagged(&alert());
+        let t = n.tagged(&alert(), None);
         assert_eq!(t.title, "[testnet] Cluster slot is not advancing");
         assert_eq!(t.key, "cluster_stalled", "the dedup key must not change");
+    }
+
+    /// The hub's alerts about a testnet box carried [mainnet], the hub's own
+    /// cluster. An alert about a peer is tagged with the peer's.
+    #[test]
+    fn a_given_tag_replaces_the_notifiers_own() {
+        let hub = Notifier::new(&NotifyConfig::default(), "perch/failover-hub".into(), true)
+            .unwrap()
+            .with_tag(Some("mainnet".into()));
+        assert_eq!(hub.tagged(&alert(), Some("testnet")).title, "[testnet] Cluster slot is not advancing");
+        assert_eq!(hub.tagged(&alert(), None).title, "[mainnet] Cluster slot is not advancing");
     }
 
     #[test]
     fn without_a_tag_the_title_is_unchanged() {
         let n = Notifier::new(&NotifyConfig::default(), "perch/x".into(), true).unwrap();
-        assert_eq!(n.tagged(&alert()).title, "Cluster slot is not advancing");
+        assert_eq!(n.tagged(&alert(), None).title, "Cluster slot is not advancing");
     }
 }

@@ -115,7 +115,10 @@ impl Metrics {
                 let body = body.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 2048];
-                    let Ok(n) = socket.read(&mut buf).await else {
+                    // A client that connects and sends nothing must not hold a
+                    // task and a descriptor forever.
+                    let read = tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut buf)).await;
+                    let Ok(Ok(n)) = read else {
                         return;
                     };
                     let request = String::from_utf8_lossy(&buf[..n]);

@@ -52,6 +52,9 @@ pub struct PeerStatus {
     pub uptime: Option<Duration>,
     /// Unix deadline of a maintenance window the peer declared, if any.
     pub maintenance_until: Option<u64>,
+    /// The cluster the peer watches, as it reports it ("mainnet-beta",
+    /// "testnet"). Alerts about the peer are tagged with it, not with ours.
+    pub cluster: Option<String>,
     pub error: Option<String>,
 }
 
@@ -159,6 +162,9 @@ fn absorb_exposition(status: &mut PeerStatus, text: &str, now_unix: f64) {
             "build_info" => {
                 status.version = labels.get("version").cloned();
             }
+            "watchtower_info" => {
+                status.cluster = labels.get("solana_cluster").cloned();
+            }
             _ => {}
         }
     }
@@ -196,6 +202,7 @@ impl Peer {
             version: None,
             uptime: None,
             maintenance_until: None,
+            cluster: None,
             error: None,
         };
 
@@ -235,7 +242,9 @@ impl Peer {
         if !resp.status().is_success() {
             return Err(format!("http {}", resp.status()));
         }
-        resp.text().await.map_err(|e| crate::rpc::scrub(e).to_string())
+        crate::rpc::body_capped(resp, crate::rpc::MAX_SCRAPE_BODY)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -352,6 +361,7 @@ mod tests {
             version: Some("0.1.0".into()),
             uptime: age_secs.map(|a| Duration::from_secs(a + 60)),
             maintenance_until: None,
+            cluster: None,
             error: None,
         }
     }
@@ -368,6 +378,7 @@ mod tests {
             version: Some("0.1.0".into()),
             uptime: Some(Duration::from_secs(up_secs)),
             maintenance_until: None,
+            cluster: None,
             error: None,
         }
     }
@@ -579,6 +590,7 @@ mod exposition_parsing {
             version: None,
             uptime: None,
             maintenance_until: None,
+            cluster: None,
             error: None,
         }
     }
@@ -607,6 +619,18 @@ mod exposition_parsing {
         assert_eq!(st.version.as_deref(), Some("0.1.0"));
         assert!(st.last_cycle_age.unwrap().as_secs() <= 11);
         assert!(st.uptime.unwrap().as_secs() >= 3599);
+    }
+
+    /// A peer says which cluster it watches; alerts about it are tagged so.
+    #[test]
+    fn a_peer_reports_its_cluster() {
+        let mut st = blank();
+        absorb_exposition(
+            &mut st,
+            "perch_watchtower_info{name=\"refi-test\",solana_cluster=\"testnet\"} 1\n",
+            1_700_000_000.0,
+        );
+        assert_eq!(st.cluster.as_deref(), Some("testnet"));
     }
 
     /// An unrelated exporter on the same port must not be mistaken for a peer.

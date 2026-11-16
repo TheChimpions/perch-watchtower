@@ -1365,6 +1365,71 @@ fn node_owner(
     }
 }
 
+/// The configured `[[advisories]]` against every host: three checks per pair,
+/// or one for an advisory with no mitigation. Always emitted, so a host whose
+/// exporter stops answering reads Unknown rather than dropping off the list.
+pub fn evaluate_advisories(
+    snapshots: &[HostSnapshot],
+    config: &Config,
+    tracked: &crate::advisory::Tracked,
+) -> Vec<CheckOutcome> {
+    let base = &config.checks.host_advisory;
+    if !base.enabled {
+        return Vec::new();
+    }
+    let follow_up = CheckConfig {
+        severity: Severity::Notify,
+        ..base.clone()
+    };
+
+    let mut out = Vec::new();
+    for snap in snapshots {
+        for adv in &config.advisories {
+            let label = adv.label();
+            let subject = format!("{} {}", snap.host, adv.id);
+            let a = match &snap.error {
+                // The kernel and sysctl collectors are independent of the
+                // filesystem one, so "no mountpoint matched" still has facts.
+                Some(err) if err != crate::node_exporter::NOTHING_MATCHED => {
+                    let v = Verdict::unknown(format!("node_exporter unreachable: {err}"));
+                    crate::advisory::Assessment {
+                        exposed: v.clone(),
+                        upgrade: adv.mitigation.as_ref().map(|_| v.clone()),
+                        restore: adv.mitigation.as_ref().map(|_| v),
+                    }
+                }
+                _ => crate::advisory::assess(&snap.host, adv, &snap.facts, tracked),
+            };
+            out.push(single(
+                format!("advisory_exposed:{subject}"),
+                format!("{} is exposed to {label}", snap.host),
+                base.clone(),
+                a.exposed,
+                None,
+            ));
+            if let Some(v) = a.upgrade {
+                out.push(single(
+                    format!("advisory_upgrade:{subject}"),
+                    format!("{} can boot a kernel patched for {label}", snap.host),
+                    follow_up.clone(),
+                    v,
+                    None,
+                ));
+            }
+            if let Some(v) = a.restore {
+                out.push(single(
+                    format!("advisory_restore:{subject}"),
+                    format!("{} still has the {label} mitigation applied", snap.host),
+                    follow_up.clone(),
+                    v,
+                    None,
+                ));
+            }
+        }
+    }
+    out
+}
+
 fn disk_check_kinds(c: &crate::config::Checks) -> Vec<(&'static str, CheckConfig)> {
     let mut v = Vec::new();
     if c.disk_readonly.enabled {
@@ -1515,6 +1580,18 @@ pub fn still_configured(id: &str, config: &Config) -> bool {
             c.disk_missing.enabled
                 && subject.and_then(|s| s.split_once(' ')).is_some_and(|(h, m)| {
                     config.hosts.iter().any(|x| x.name == h && x.mountpoints.iter().any(|p| p == m))
+                })
+        }
+        // Subjects are "<host> <advisory id>". The follow-ups only exist for an
+        // advisory that declares a mitigation.
+        "advisory_exposed" | "advisory_upgrade" | "advisory_restore" => {
+            c.host_advisory.enabled
+                && subject.and_then(|s| s.split_once(' ')).is_some_and(|(h, id)| {
+                    config.hosts.iter().any(|x| x.name == h)
+                        && config
+                            .advisories
+                            .iter()
+                            .any(|a| a.id == id && (kind == "advisory_exposed" || a.mitigation.is_some()))
                 })
         }
         "node_behind" => {
@@ -2103,6 +2180,134 @@ mod tests {
         }
     }
 
+    mod advisories {
+        use super::*;
+        use crate::node_exporter::{HostFacts, HostSnapshot, NOTHING_MATCHED};
+
+        const ADVISORY: &str = "[[advisories]]\nid = \"CVE-2026-99288\"\nname = \"NoisyTCP\"\n\
+             fixed_in = [\"6.8.0-151\"]\n\
+             [advisories.mitigation]\nsysctl = \"net.ipv4.tcp_syncookies\"\nvalue = 0\n";
+
+        fn config(extra: &str) -> Config {
+            Config::parse(&format!(
+                "[[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+                 [[endpoints]]\nname = \"b\"\nurl = \"https://b.example\"\n\
+                 [[validators]]\nidentity = \"2AKKnirWVZMhnzuwqpizw9SwfZjGpRFLx2zCCNtPWpbc\"\nlabel = \"v\"\n\
+                 [[hosts]]\nname = \"hw\"\nurl = \"http://127.0.0.1:9100/metrics\"\n{extra}"
+            ))
+            .unwrap()
+        }
+
+        fn snap(release: &str, syncookies: f64, error: Option<&str>) -> HostSnapshot {
+            HostSnapshot {
+                host: "hw".into(),
+                filesystems: HashMap::new(),
+                error: error.map(str::to_string),
+                facts: HostFacts {
+                    kernel_release: Some(release.into()),
+                    kernel_version: Some("#1-Ubuntu SMP".into()),
+                    sysctls: HashMap::from([("net_ipv4_tcp_syncookies".to_string(), syncookies)]),
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn verdicts(s: HostSnapshot, c: &Config) -> Vec<(String, Verdict, Severity)> {
+            evaluate_advisories(&[s], c, &Default::default())
+                .into_iter()
+                .map(|o| (o.id, o.verdict, o.cfg.severity))
+                .collect()
+        }
+
+        #[test]
+        fn each_state_fires_exactly_one_check() {
+            let c = config(ADVISORY);
+            let firing = |s: HostSnapshot| -> Vec<String> {
+                verdicts(s, &c)
+                    .into_iter()
+                    .filter(|(_, v, _)| matches!(v, Verdict::Unhealthy(_)))
+                    .map(|(id, _, _)| id)
+                    .collect()
+            };
+            assert_eq!(firing(snap("6.8.0-54-generic", 1.0, None)), ["advisory_exposed:hw CVE-2026-99288"]);
+            assert_eq!(firing(snap("6.8.0-54-generic", 0.0, None)), ["advisory_upgrade:hw CVE-2026-99288"]);
+            assert_eq!(firing(snap("6.8.0-151-generic", 0.0, None)), ["advisory_restore:hw CVE-2026-99288"]);
+            assert!(firing(snap("6.8.0-151-generic", 1.0, None)).is_empty());
+        }
+
+        /// An exporter that cannot be reached must not read as exposed, and
+        /// must not read as fine; one that answered with no matching
+        /// mountpoint still told us the kernel.
+        #[test]
+        fn an_unreachable_exporter_is_unknown() {
+            let c = config(ADVISORY);
+            let out = verdicts(snap("6.8.0-54-generic", 1.0, Some("connection refused")), &c);
+            assert_eq!(out.len(), 3);
+            assert!(out.iter().all(|(_, v, _)| matches!(v, Verdict::Unknown(m) if m.contains("unreachable"))));
+
+            let out = verdicts(snap("6.8.0-54-generic", 1.0, Some(NOTHING_MATCHED)), &c);
+            assert!(matches!(&out[0].1, Verdict::Unhealthy(_)));
+        }
+
+        #[test]
+        fn only_exposure_takes_the_configured_severity() {
+            let c = config(&format!("{ADVISORY}[checks.host_advisory]\npending_for = \"1m\"\nseverity = \"page\"\n"));
+            let out = verdicts(snap("6.8.0-54-generic", 1.0, None), &c);
+            let sev = |kind: &str| out.iter().find(|(id, _, _)| id.starts_with(kind)).unwrap().2;
+            assert_eq!(sev("advisory_exposed"), Severity::Page);
+            assert_eq!(sev("advisory_upgrade"), Severity::Notify);
+            assert_eq!(sev("advisory_restore"), Severity::Notify);
+        }
+
+        #[test]
+        fn disabled_or_unconfigured_produces_nothing() {
+            let s = || snap("6.8.0-54-generic", 1.0, None);
+            assert!(verdicts(s(), &config("")).is_empty());
+            let off = config(&format!("{ADVISORY}[checks.host_advisory]\nenabled = false\npending_for = \"1m\"\nseverity = \"notify\"\n"));
+            assert!(verdicts(s(), &off).is_empty());
+        }
+
+        /// Deleting an advisory from the config, once the fleet is patched,
+        /// has to close whatever it left open.
+        #[test]
+        fn a_removed_advisory_orphans_its_states() {
+            let with = config(ADVISORY);
+            let without = config("");
+            for kind in ["advisory_exposed", "advisory_upgrade", "advisory_restore"] {
+                let id = format!("{kind}:hw CVE-2026-99288");
+                assert!(still_configured(&id, &with), "{id}");
+                assert!(!still_configured(&id, &without), "{id}");
+                assert!(!still_configured(&format!("{kind}:gone CVE-2026-99288"), &with));
+            }
+            // Dropping only the mitigation leaves exposure and retires the follow-ups.
+            let bare = config("[[advisories]]\nid = \"CVE-2026-99288\"\nfixed_in = [\"6.8.0-151\"]\n");
+            assert!(still_configured("advisory_exposed:hw CVE-2026-99288", &bare));
+            assert!(!still_configured("advisory_restore:hw CVE-2026-99288", &bare));
+        }
+
+        #[test]
+        fn malformed_advisories_are_config_errors() {
+            let bad = |adv: &str| {
+                Config::parse(&format!(
+                    "[[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+                 [[endpoints]]\nname = \"b\"\nurl = \"https://b.example\"\n\
+                     [[validators]]\nidentity = \"2AKKnirWVZMhnzuwqpizw9SwfZjGpRFLx2zCCNtPWpbc\"\n{adv}"
+                ))
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"))
+                .unwrap_err()
+            };
+            assert!(bad("[[advisories]]\nid = \"x\"\n").contains("exposed forever"));
+            assert!(bad("[[advisories]]\nid = \"a b\"\nfixed_in = [\"6.1.5\"]\n").contains("must be letters"));
+            assert!(bad("[[advisories]]\nid = \"x\"\nfixed_in = [\"soon\"]\n").contains("not a kernel version"));
+            assert!(bad("[[advisories]]\nid = \"NoisyTCP\"\ntracker = \"ubuntu\"\n").contains("needs a CVE id"));
+            assert!(bad("[[advisories]]\nid = \"../x\"\ntracker = \"ubuntu\"\n").contains("must be letters"));
+            assert!(bad(&format!("{ADVISORY}{ADVISORY}")).contains("duplicate advisory"));
+            assert!(bad("[[advisories]]\nid = \"x\"\n[advisories.mitigation]\nsysctl = \"a b\"\nvalue = 0\n")
+                .contains("not a sysctl name"));
+        }
+    }
+
     mod disks_and_local_nodes {
         use super::*;
         use crate::node_exporter::{Filesystem, HostSnapshot, NOTHING_MATCHED};
@@ -2154,6 +2359,7 @@ mod tests {
                 host: "hw".into(),
                 filesystems: HashMap::from([fs("/"), fs("/mnt/ledger")]),
                 error: None,
+                facts: Default::default(),
             };
             let out = evaluate_disk(&[snap], &config(), &mut DiskHistory::default(), 1_792_000_000);
             assert!(matches!(missing(&out, "/mnt/accounts"), Verdict::Unhealthy(m) if m.contains("not mounted")));
@@ -2166,10 +2372,10 @@ mod tests {
         /// exporter not answering is not knowing.
         #[test]
         fn an_exporter_failure_is_unknown_but_nothing_matching_is_missing() {
-            let none = HostSnapshot { host: "hw".into(), filesystems: HashMap::new(), error: Some(NOTHING_MATCHED.into()) };
+            let none = HostSnapshot { host: "hw".into(), filesystems: HashMap::new(), error: Some(NOTHING_MATCHED.into()), facts: Default::default() };
             let out = evaluate_disk(&[none], &config(), &mut DiskHistory::default(), 1_792_000_000);
             assert!(matches!(missing(&out, "/mnt/ledger"), Verdict::Unhealthy(_)));
-            let down = HostSnapshot { host: "hw".into(), filesystems: HashMap::new(), error: Some("connection refused".into()) };
+            let down = HostSnapshot { host: "hw".into(), filesystems: HashMap::new(), error: Some("connection refused".into()), facts: Default::default() };
             let out = evaluate_disk(&[down], &config(), &mut DiskHistory::default(), 1_792_000_000);
             assert!(matches!(missing(&out, "/mnt/ledger"), Verdict::Unknown(_)));
         }

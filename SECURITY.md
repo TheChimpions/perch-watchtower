@@ -41,6 +41,7 @@ Every outbound connection perch makes, and nothing else:
 | `events.pagerduty.com` | page-tier alerts; weekly self-test | The alert, and the integration key, in the request body. |
 | Your `[heartbeat] url` | every cycle, if configured | A bare `GET`. |
 | `api.solana.org` | hourly, if the cluster is pinned to mainnet-beta or testnet | `?cluster=<name>`, to fetch the delegation program's minimum version. Turn it off with `[checks.sfdp_version] enabled = false`. |
+| `ubuntu.com` | hourly, only for an `[[advisories]]` entry with `tracker = "ubuntu"` | `GET /security/cves/<CVE id>.json`, to learn which kernel package carries the fix. The request names the CVE and nothing about your hosts. |
 
 **What alerts contain.** Telegram and PagerDuty are third parties, so it is
 worth knowing what reaches them: validator labels and pubkeys, slot numbers,

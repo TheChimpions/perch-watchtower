@@ -237,6 +237,61 @@ for the validator's local RPC. A scrape that fails is `Unknown` — it freezes t
 disk checks and never pages — and an exporter that stays unreachable is
 eventually reported as a starved check.
 
+## Kernel advisories
+
+Some kernel bugs need every validator operator to act the same day, in three
+steps: apply a sysctl as a stopgap, boot the patched kernel once the
+distribution ships it, undo the stopgap. CVE-2026-99288 (NoisyTCP) was one.
+Declare the advisory and perch tracks each `[[hosts]]` entry through all three:
+
+```toml
+[[advisories]]
+id = "CVE-2026-99288"
+name = "NoisyTCP"
+fixed_in = ["6.12.117", "6.18.63", "7.3.4"]   # upstream stable releases
+tracker = "ubuntu"                             # and whatever Ubuntu ships
+
+[advisories.mitigation]
+sysctl = "net.ipv4.tcp_syncookies"
+value = 0
+```
+
+| check | fires when | do |
+| --- | --- | --- |
+| `advisory_exposed` | the running kernel lacks the fix and the sysctl is not at the mitigating value | apply the mitigation, or upgrade if a fix exists |
+| `advisory_upgrade` | mitigated, and a fixed kernel exists that is not the one running | upgrade and reboot |
+| `advisory_restore` | the fixed kernel is running and the sysctl is still at the mitigating value | put the sysctl back |
+
+All three are Telegram notes by default; `[checks.host_advisory] severity =
+"page"` makes the first one page. Delete the advisory once every box is done
+and anything it left open is closed.
+
+The kernel and the sysctl come from the scrape perch already makes, so
+node_exporter needs the collectors that report them:
+
+```
+  --collector.uname --collector.os \
+  --collector.sysctl --collector.sysctl.include=net.ipv4.tcp_syncookies
+```
+
+Without one of them the check is `Unknown` and `perch status` names the flag
+to add. A host is never assumed patched or mitigated because perch could not
+see.
+
+`fixed_in` is compared against `uname -r`, one entry per kernel series. A
+series newer than every entry counts as fixed; a series that is not listed
+does not. With `tracker = "ubuntu"`, perch also reads Ubuntu's record for the
+CVE once an hour and uses the fixed package version for the release each host
+runs, which is what makes `advisory_upgrade` arrive on the day the kernel
+ships. That lookup covers Ubuntu's stock kernels (`generic`, `aws`,
+`lowlatency` and the like); for an HWE or other backport kernel, add its fixed
+version to `fixed_in`, which takes precedence for its series.
+
+perch does not find advisories for you. A feed was considered: Ubuntu lists
+over three thousand high-priority kernel CVEs for 24.04 and rated NoisyTCP
+"medium", so a feed would have been ignored within a week and would have
+missed the one that mattered.
+
 ## Sandboxing
 
 The shipped unit is a system unit with a strict sandbox, and the directives are

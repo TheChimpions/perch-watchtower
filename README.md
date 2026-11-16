@@ -88,7 +88,7 @@ perch runs next to validators, so the question that matters is what it could do 
 - **It never holds a keypair and never signs or sends a transaction.** It calls twelve read-only RPC methods, all listed in SECURITY.md.
 - **The kernel enforces the rest.** It runs as an unprivileged user with no capabilities, `/home` hidden, other processes invisible, a read-only filesystem apart from its own state directory, and no ability to start another program. `systemd-analyze security` rates the unit 1.2 out of 10.
 - **It listens on one port**, `127.0.0.1:9469`, read-only metrics. Keep it on localhost or a private network.
-- **It talks only to what you configure**: your RPC endpoints, node_exporter hosts, peers, alert channels and heartbeat, plus an hourly read of the Solana Foundation's public minimum-version schedule.
+- **It talks only to what you configure**: your RPC endpoints, node_exporter hosts, peers, alert channels and heartbeat, plus an hourly read of the Solana Foundation's public minimum-version schedule and, for an advisory you ask it to track, Ubuntu's public CVE record.
 - **Secrets stay out of logs and alerts.** Request URLs are cut to the host before an error is written anywhere, and there is a test that sends secrets in the query, path and userinfo and asserts none reach the error text.
 - **Releases are verifiable.** Static binaries built from the tagged commit by a public workflow, with checksums and signed build provenance: `gh attestation verify perch-x86_64-unknown-linux-musl.tar.gz -R TheChimpions/perch-watchtower`.
 
@@ -110,6 +110,7 @@ Report vulnerabilities privately through the repository's Security tab.
 | `node_behind`                       | page          | 15m            | a node _you operate_ lagging or unreachable                                |
 | `disk_space` / `disk_fill`          | notify / page | 10m / 15m      | free-space floor and projected time-to-full                                |
 | `disk_readonly` / `disk_missing`    | page          | immediate / 2m | how disks fail under a validator                                           |
+| `advisory_exposed`                  | notify / page | 10m            | a declared kernel CVE: unpatched and unmitigated, then fix-ready, then undo |
 | `peer_down` / `machine_down`        | notify / page | 10m / 3m       | another perch went silent; paged only if its validator also stopped voting |
 | `cluster_stake` / `cluster_stalled` | notify        | 10m / 3m       | not yours to fix at 3am                                                    |
 

@@ -70,6 +70,34 @@ pub struct HostSnapshot {
     /// Mountpoint -> filesystem. Empty with `error` set means we could not tell.
     pub filesystems: HashMap<String, Filesystem>,
     pub error: Option<String>,
+    /// What the host said about its kernel and settings. Empty when the scrape
+    /// failed; filled even when no filesystem matched, because the two are
+    /// independent collectors.
+    pub facts: HostFacts,
+}
+
+/// The running kernel and the sysctls node_exporter was asked to export. Used
+/// by the advisory checks. Every field is optional because each comes from a
+/// collector the operator may not have enabled, and absent is never "fine".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HostFacts {
+    /// `uname -r`, from `--collector.uname`: "6.8.0-54-generic".
+    pub kernel_release: Option<String>,
+    /// `uname -v`, which on Ubuntu carries the package upload: "#56-Ubuntu ...".
+    pub kernel_version: Option<String>,
+    /// `/etc/os-release` ID and VERSION_CODENAME, from `--collector.os`.
+    pub os_id: Option<String>,
+    pub os_codename: Option<String>,
+    /// Keyed as node_exporter names them, dots as underscores:
+    /// "net_ipv4_tcp_syncookies". From `--collector.sysctl`.
+    pub sysctls: HashMap<String, f64>,
+}
+
+impl HostFacts {
+    /// A sysctl by its usual dotted name.
+    pub fn sysctl(&self, dotted: &str) -> Option<f64> {
+        self.sysctls.get(&dotted.replace('.', "_")).copied()
+    }
 }
 
 impl HostSnapshot {
@@ -118,6 +146,7 @@ impl Host {
             }
             match self.scrape_once().await {
                 Ok(text) => {
+                    let facts = parse_facts(&text);
                     let all = parse_filesystems(&text);
                     let filesystems = all
                         .into_iter()
@@ -138,6 +167,7 @@ impl Host {
                             host: self.name.clone(),
                             filesystems,
                             error: Some(NOTHING_MATCHED.into()),
+                            facts,
                         };
                     }
 
@@ -146,6 +176,7 @@ impl Host {
                         host: self.name.clone(),
                         filesystems,
                         error: None,
+                        facts,
                     };
                 }
                 Err(e) => last = e.to_string(),
@@ -157,6 +188,7 @@ impl Host {
             host: self.name.clone(),
             filesystems: HashMap::new(),
             error: Some(last),
+            facts: HostFacts::default(),
         }
     }
 
@@ -259,6 +291,41 @@ pub(crate) fn parse_line(line: &str) -> Option<(String, HashMap<String, String>,
         }
     };
     rest.parse::<f64>().ok().map(|v| (name, HashMap::new(), v))
+}
+
+/// The kernel, distribution and exported sysctls from one scrape.
+pub fn parse_facts(text: &str) -> HostFacts {
+    let mut facts = HostFacts::default();
+    let nonempty = |v: Option<&String>| v.filter(|s| !s.is_empty()).cloned();
+    for line in text.lines() {
+        // Cheap reject: a scrape is thousands of lines and these are three.
+        if !line.starts_with("node_uname_info") && !line.starts_with("node_os_info") && !line.starts_with("node_sysctl_")
+        {
+            continue;
+        }
+        let Some((name, labels, value)) = parse_line(line) else {
+            continue;
+        };
+        match name.as_str() {
+            "node_uname_info" => {
+                facts.kernel_release = nonempty(labels.get("release"));
+                facts.kernel_version = nonempty(labels.get("version"));
+            }
+            "node_os_info" => {
+                facts.os_id = nonempty(labels.get("id"));
+                facts.os_codename = nonempty(labels.get("version_codename"));
+            }
+            // Numeric sysctls only. `node_sysctl_info` carries string values
+            // as labels and is not something a threshold can be read from.
+            n if n != "node_sysctl_info" && labels.is_empty() => {
+                if let Some(key) = n.strip_prefix("node_sysctl_") {
+                    facts.sysctls.insert(key.to_string(), value);
+                }
+            }
+            _ => {}
+        }
+    }
+    facts
 }
 
 pub fn parse_filesystems(text: &str) -> Vec<Filesystem> {
@@ -455,6 +522,40 @@ node_cpu_seconds_total{cpu="0",mode="idle"} 12345.67
         );
         let fs = parse_filesystems(text);
         assert_eq!(fs[0].avail_bytes, 0);
+    }
+
+    /// chimp_test's uname line, with the os and sysctl collectors added.
+    #[test]
+    fn kernel_distribution_and_sysctls_are_read() {
+        let text = concat!(
+            "# TYPE node_uname_info gauge\n",
+            "node_uname_info{domainname=\"(none)\",machine=\"x86_64\",nodename=\"box\",release=\"6.8.0-54-generic\",",
+            "sysname=\"Linux\",version=\"#56-Ubuntu SMP PREEMPT_DYNAMIC Sat Feb  8 00:37:57 UTC 2025\"} 1\n",
+            "node_os_info{build_id=\"\",id=\"ubuntu\",id_like=\"debian\",name=\"Ubuntu\",pretty_name=\"Ubuntu 24.04.2 LTS\",",
+            "version=\"24.04.2 LTS (Noble Numbat)\",version_codename=\"noble\",version_id=\"24.04\"} 1\n",
+            "node_os_version{id=\"ubuntu\",id_like=\"debian\",name=\"Ubuntu\"} 24.04\n",
+            "node_sysctl_net_ipv4_tcp_syncookies 1\n",
+            "node_sysctl_net_ipv4_tcp_rmem{index=\"0\"} 4096\n",
+            "node_sysctl_info{index=\"0\",name=\"kernel.osrelease\",value=\"6.8.0-54-generic\"} 1\n",
+            "node_filesystem_size_bytes{mountpoint=\"/\",fstype=\"ext4\"} 1000\n",
+        );
+        let f = parse_facts(text);
+        assert_eq!(f.kernel_release.as_deref(), Some("6.8.0-54-generic"));
+        assert!(f.kernel_version.as_deref().unwrap().starts_with("#56-Ubuntu"));
+        assert_eq!(f.os_id.as_deref(), Some("ubuntu"));
+        assert_eq!(f.os_codename.as_deref(), Some("noble"));
+        assert_eq!(f.sysctl("net.ipv4.tcp_syncookies"), Some(1.0));
+        // A multi-value sysctl is one series per field; none of them is "the" value.
+        assert_eq!(f.sysctl("net.ipv4.tcp_rmem"), None);
+        assert_eq!(f.sysctls.len(), 1);
+    }
+
+    /// The mainnet boxes on 2026-11-16: filesystem collector only. Absent
+    /// must stay absent rather than default to something that reads as fine.
+    #[test]
+    fn collectors_that_are_off_leave_the_facts_empty() {
+        assert_eq!(parse_facts(SAMPLE), HostFacts::default());
+        assert_eq!(parse_facts("node_uname_info{release=\"\"} 1\n").kernel_release, None);
     }
 
     #[test]

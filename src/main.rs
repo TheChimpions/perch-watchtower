@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use perch::{
-    checks, config, diagnose, digest, enrich, heartbeat, inhibit, metrics, node_exporter, notify, peer, persist,
+    advisory, checks, config, diagnose, digest, enrich, heartbeat, inhibit, metrics, node_exporter, notify, peer, persist,
     pools, rpc, selfcheck, sfdp, snapshot, state, status, verdict, web,
 };
 use clap::{Parser, Subcommand};
@@ -391,6 +391,7 @@ async fn main() -> Result<()> {
                 None
             }
         },
+        advisories: advisory::Tracker::new(),
         last_self_test_unix: restored.last_self_test_unix,
         epoch_tails: HashMap::new(),
         last_digest_epoch: restored.last_digest_epoch,
@@ -498,6 +499,8 @@ struct Runtime {
     sfdp: Option<sfdp::Requirements>,
     sfdp_last_fetch: Option<Instant>,
     sfdp_fetcher: Option<sfdp::Fetcher>,
+    /// Distribution tracker records for `[[advisories]]` that ask for them.
+    advisories: advisory::Tracker,
     /// Scheduler clock for the notification self-test: the unix time the
     /// interval last restarted, whether because a test ran or because this is
     /// the first boot. Distinct from the exported
@@ -706,6 +709,14 @@ async fn run_cycle(
         &mut rt.disk,
         unix_now(),
     ));
+    if !config.advisories.is_empty() && config.checks.host_advisory.enabled && !hosts.is_empty() {
+        rt.advisories.refresh(&config.advisories, now).await;
+        outcomes.extend(checks::evaluate_advisories(
+            &host_snapshots,
+            config,
+            rt.advisories.tracked(),
+        ));
+    }
     if run_cluster {
         outcomes.extend(checks::evaluate_nodes(&snapshots, config));
         maybe_refresh_sfdp(config, notifier, rt, now).await;

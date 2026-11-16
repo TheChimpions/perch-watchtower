@@ -113,6 +113,13 @@ pub async fn run(
         &mut disk,
         now_unix,
     ));
+    if !config.advisories.is_empty() && !host_snapshots.is_empty() {
+        // One-shot, like the SFDP schedule below: fetched fresh, and Unknown
+        // if the tracker cannot be reached.
+        let mut tracker = crate::advisory::Tracker::new();
+        tracker.refresh(&config.advisories, std::time::Instant::now()).await;
+        outcomes.extend(checks::evaluate_advisories(&host_snapshots, config, tracker.tracked()));
+    }
     outcomes.extend(checks::evaluate_nodes(&snapshots, config));
     // One-shot, so a fresh fetch is what the daemon would have cached.
     // Unreachable means the check reads Unknown here too, never absent.

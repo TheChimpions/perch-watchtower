@@ -2,6 +2,7 @@
 //! drive the real pipeline (HTTP -> snapshot -> checks -> state machine) rather
 //! than a reimplementation of it.
 
+pub mod advisory;
 pub mod alpenglow;
 pub mod checks;
 pub mod config;

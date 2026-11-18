@@ -24,6 +24,11 @@ pub struct Config {
     /// none configured, the disk checks simply do not run.
     #[serde(default)]
     pub hosts: Vec<HostConfig>,
+    /// Kernel advisories to track on every host. After loading this holds the
+    /// effective list: perch's built-in advisories, then the ones declared
+    /// here, a declared id replacing the built-in of the same name.
+    #[serde(default)]
+    pub advisories: Vec<AdvisoryConfig>,
     /// Other perch instances to watch. Optional.
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
@@ -392,6 +397,106 @@ pub struct HostConfig {
     pub timeout: Duration,
     #[serde(default = "default_host_attempts")]
     pub attempts: u32,
+}
+
+/// A kernel vulnerability the operator wants every `[[hosts]]` entry tracked
+/// against until it is patched. See `advisory.rs`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AdvisoryConfig {
+    /// "CVE-2026-99288". Any short identifier, unless `tracker` is set, which
+    /// looks it up as a CVE.
+    pub id: String,
+    /// What people call it: "NoisyTCP".
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Kernel versions carrying the fix, one per series, compared against
+    /// `uname -r`: "6.12.117", or for a distribution kernel "6.8.0-151". A
+    /// series newer than all of them is taken as fixed; one not listed is not.
+    #[serde(default)]
+    pub fixed_in: Vec<String>,
+    /// Ask the distribution's tracker where the fix landed for hosts it
+    /// covers, so `fixed_in` need not be filled in by hand when it ships.
+    #[serde(default)]
+    pub tracker: Option<AdvisoryTracker>,
+    /// Operator instructions, appended to the alert.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// What to do until the fix is running, where perch cannot check it
+    /// itself: a firewall rule, say. A sentence, appended to the alert while
+    /// the host is unpatched. Something perch can check belongs in
+    /// `mitigation` instead.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// The temporary measure for kernels without the fix.
+    #[serde(default)]
+    pub mitigation: Option<AdvisoryMitigation>,
+}
+
+impl AdvisoryConfig {
+    pub fn validate(&self) -> Result<()> {
+        let a = self;
+        // The id becomes part of a check id ("<host> <id>") and, with a
+        // tracker, of a URL path.
+        if a.id.is_empty() || !a.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            bail!("advisory id {:?} must be letters, digits, '-', '_' or '.'", a.id);
+        }
+        if a.tracker.is_some() {
+            let cve = a.id.strip_prefix("CVE-").and_then(|r| r.split_once('-'));
+            let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+            if !cve.is_some_and(|(y, n)| digits(y) && digits(n)) {
+                bail!("advisory {:?} sets a tracker, which needs a CVE id like CVE-2026-99288", a.id);
+            }
+        }
+        for f in &a.fixed_in {
+            if crate::advisory::components(f).len() < 3 {
+                bail!(
+                    "advisory {:?}: fixed_in entry {f:?} is not a kernel version like \"6.12.117\" \
+                     or \"6.8.0-151\"",
+                    a.id
+                );
+            }
+        }
+        if a.fixed_in.is_empty() && a.tracker.is_none() && a.mitigation.is_none() {
+            bail!(
+                "advisory {:?} has no fixed_in, tracker or mitigation, so every host would \
+                 read as exposed forever",
+                a.id
+            );
+        }
+        if let Some(m) = &a.mitigation {
+            let ok = !m.sysctl.is_empty()
+                && m.sysctl.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-');
+            if !ok {
+                bail!("advisory {:?}: mitigation sysctl {:?} is not a sysctl name", a.id, m.sysctl);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn label(&self) -> String {
+        match &self.name {
+            Some(n) => format!("{} ({n})", self.id),
+            None => self.id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AdvisoryTracker {
+    /// ubuntu.com/security/cves/<id>.json, hourly.
+    Ubuntu,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct AdvisoryMitigation {
+    /// Dotted name: "net.ipv4.tcp_syncookies". node_exporter must export it
+    /// (`--collector.sysctl --collector.sysctl.include=<name>`).
+    pub sysctl: String,
+    /// The value that mitigates.
+    pub value: i64,
 }
 
 fn default_host_timeout() -> Duration {
@@ -913,6 +1018,11 @@ pub struct Checks {
     pub disk_missing: CheckConfig,
     #[serde(default = "default_disk_inodes")]
     pub disk_inodes: DiskInodeCheckConfig,
+    /// A host exposed to one of the configured `[[advisories]]`. `severity`
+    /// is for a box that is neither patched nor mitigated; the follow-ups
+    /// (a fix to boot, a mitigation to undo) are always `notify`.
+    #[serde(default = "default_host_advisory")]
+    pub host_advisory: HostAdvisoryCheckConfig,
     #[serde(default = "default_node_behind")]
     pub node_behind: LagCheckConfig,
     #[serde(default = "default_skip_rate")]
@@ -1004,6 +1114,37 @@ fn default_disk_missing() -> CheckConfig {
     // 2026-10-23 and the validator unpacked 525 GB onto the root filesystem
     // within six minutes; this is the page that would have named it.
     CheckConfig::new(d(2 * 60), Severity::Page)
+}
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HostAdvisoryCheckConfig {
+    #[serde(flatten)]
+    pub base: CheckConfig,
+    /// Track the advisories that ship inside perch (`advisories.toml`), as
+    /// well as any `[[advisories]]` declared in this file.
+    #[serde(default = "yes")]
+    pub builtin: bool,
+    /// Built-in advisory ids to leave out.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+}
+
+fn default_host_advisory() -> HostAdvisoryCheckConfig {
+    HostAdvisoryCheckConfig {
+        base: CheckConfig {
+            enabled: true,
+            // A sysctl and a kernel version do not flap; ten minutes only keeps
+            // a box that is mid-reboot from announcing itself.
+            pending_for: d(10 * 60),
+            clear_after: 2,
+            // Something to do today, not at 3am. An operator who wants a
+            // remote crash bug to page sets `severity = "page"`.
+            severity: Severity::Notify,
+            renotify_after: d(24 * 60 * 60),
+        },
+        builtin: true,
+        ignore: Vec::new(),
+    }
 }
 fn default_disk_inodes() -> DiskInodeCheckConfig {
     DiskInodeCheckConfig {
@@ -1248,6 +1389,7 @@ impl Default for Checks {
             disk_readonly: default_disk_readonly(),
             disk_missing: default_disk_missing(),
             disk_inodes: default_disk_inodes(),
+            host_advisory: default_host_advisory(),
             node_behind: default_node_behind(),
             skip_rate: default_skip_rate(),
             peer_down: default_peer_down(),
@@ -1411,6 +1553,31 @@ impl Config {
         (warmup.saturating_mul(2)).max(Duration::from_secs(2 * 3600))
     }
 
+    /// Puts perch's built-in advisories in front of the declared ones. A
+    /// declared advisory with a built-in's id replaces it, which is how an
+    /// operator corrects or extends an entry without waiting for a release.
+    fn merge_builtin_advisories(&mut self) -> Result<()> {
+        let ha = &self.checks.host_advisory;
+        if !ha.builtin {
+            return Ok(());
+        }
+        let builtin = crate::advisory::builtin()?;
+        for id in &ha.ignore {
+            // Not an error: an entry is retired from the list eventually, and
+            // a config that ignored it must keep loading after the upgrade.
+            if !builtin.iter().any(|b| &b.id == id) {
+                tracing::info!("checks.host_advisory.ignore names {id:?}, which is not a built-in advisory");
+            }
+        }
+        let declared = std::mem::take(&mut self.advisories);
+        self.advisories = builtin
+            .into_iter()
+            .filter(|b| !ha.ignore.contains(&b.id) && !declared.iter().any(|d| d.id == b.id))
+            .collect();
+        self.advisories.extend(declared);
+        Ok(())
+    }
+
     /// Parse and validate configuration from a TOML string.
     pub fn parse(raw: &str) -> Result<Self> {
         let mut cfg: Config = toml::from_str(raw).context("parsing config")?;
@@ -1428,6 +1595,7 @@ impl Config {
     }
 
     fn resolve_and_validate(&mut self) -> Result<()> {
+        self.merge_builtin_advisories()?;
         // A spoke that only reports local state and never notifies has no use
         // for RPC endpoints; requiring them would mean carrying dead config to
         // every validator.
@@ -1672,6 +1840,13 @@ impl Config {
         }
         if df.window <= df.min_history {
             bail!("checks.disk_fill.window must be greater than min_history");
+        }
+        let mut advisory_ids = std::collections::HashSet::new();
+        for a in &self.advisories {
+            a.validate()?;
+            if !advisory_ids.insert(a.id.as_str()) {
+                bail!("duplicate advisory id {:?}", a.id);
+            }
         }
         if df.min_samples < 2 {
             bail!("checks.disk_fill.min_samples must be >= 2 to fit a slope");

@@ -108,7 +108,12 @@ attempts = 3
 #
 #   ExecStart=/usr/local/bin/node_exporter \
 #     --web.listen-address=10.0.0.5:9100 \
-#     --collector.filesystem
+#     --collector.filesystem \
+#     --collector.uname --collector.os \
+#     --collector.sysctl --collector.sysctl.include=net.ipv4.tcp_syncookies
+#
+# The last two lines are for the kernel advisories below; the disk checks need
+# only --collector.filesystem.
 #
 # Then reach it from the monitoring host over WireGuard/Tailscale, the same
 # private path you use for the validator's local RPC.
@@ -127,6 +132,55 @@ mountpoints = ["/", "/mnt/ledger", "/mnt/accounts"]
 validator = "chimps-1"
 timeout = "10s"
 attempts = 2
+
+
+# --- Kernel advisories ---------------------------------------------------------
+#
+# For the kernel bug that needs every operator to act the same day: apply a
+# sysctl as a stopgap, boot a patched kernel once your distribution ships one,
+# then undo the stopgap. Declare it here and every [[hosts]] entry is tracked
+# through those three steps, one Telegram note each:
+#
+#   exposed   the running kernel lacks the fix and the mitigation is not applied
+#   upgrade   mitigated, and a fixed kernel now exists that is not the one running
+#   restore   the fix is running and the mitigation is still applied
+#
+# perch ships with a short list of these (advisories.toml in the repository:
+# the kernel bugs every validator operator was asked to act on), compiled into
+# the binary, so upgrading perch is all it takes to be tracked against a new
+# one. [[advisories]] here adds your own. Declaring an id that is built in
+# replaces that entry; `ignore` under [checks.host_advisory] drops one.
+#
+# Nothing is discovered or downloaded to build the list, and nothing new runs
+# on the host: perch reads the kernel and the sysctl from the node_exporter
+# scrape it already makes, so node_exporter needs three more collectors:
+#
+#   --collector.uname --collector.os \
+#   --collector.sysctl --collector.sysctl.include=net.ipv4.tcp_syncookies
+#
+# A collector that is missing reads as unknown and names the flag, never as fine.
+#
+# [[advisories]]
+# id = "CVE-2026-99288"
+# name = "NoisyTCP"
+# # Kernels carrying the fix, one per series, compared against `uname -r`. A
+# # series newer than all of them counts as fixed; one not listed does not. For
+# # a distribution kernel use its own numbering, e.g. "6.8.0-151".
+# fixed_in = ["6.12.117", "6.18.63", "7.3.4"]
+# # Ask Ubuntu's tracker (ubuntu.com/security/cves/<id>.json, hourly) where the
+# # fix landed for the release each Ubuntu host runs, so the `upgrade` note
+# # arrives when the patched kernel ships. Needs a CVE id. Stock kernels only:
+# # for an HWE or other backport kernel, put its fixed version in fixed_in.
+# tracker = "ubuntu"
+# # Appended to the alert.
+# url = "https://example.com/operator-instructions"
+# # A stopgap perch cannot check, such as a firewall rule: a sentence appended
+# # to the alert while the host is unpatched.
+# note = "Until then, block X at the firewall."
+# # The temporary measure. Omit it and only `exposed` is reported.
+# [advisories.mitigation]
+# sysctl = "net.ipv4.tcp_syncookies"
+# value = 0
 
 
 # --- Peering (multi-machine) ---------------------------------------------------
@@ -515,6 +569,20 @@ pending_for = "2m"
 clear_after = 2
 severity = "page"
 renotify_after = "30m"
+
+# A host exposed to one of the [[advisories]] above. `severity` applies to a box
+# that is neither patched nor mitigated; set it to "page" for a bug you would
+# get out of bed for. The upgrade and restore follow-ups are always "notify".
+[checks.host_advisory]
+enabled = true
+# Track the advisories that ship with perch. false leaves only [[advisories]].
+builtin = true
+# Built-in ids to leave out, e.g. ["CVE-2026-99288"].
+ignore = []
+pending_for = "10m"
+clear_after = 2
+severity = "notify"
+renotify_after = "24h"
 
 # A filesystem can exhaust inodes with space to spare.
 [checks.disk_inodes]

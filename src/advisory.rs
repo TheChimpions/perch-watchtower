@@ -7,10 +7,17 @@
 //! eleven boxes never got the sysctl, which have had the fix sitting on disk
 //! unbooted, and which are still running the stopgap on a fixed kernel is.
 //!
-//! Advisories are declared by the operator, never discovered. Discovery was
-//! considered and does not work: Ubuntu's tracker lists over three thousand
-//! high-priority kernel CVEs for 24.04, and rated NoisyTCP itself "medium". A
-//! feed would have buried the one that mattered and then missed it.
+//! Advisories are listed, never discovered. Discovery was considered and
+//! does not work: Ubuntu's tracker lists over three thousand high-priority
+//! kernel CVEs for 24.04, and rated NoisyTCP itself "medium". A feed would
+//! have buried the one that mattered and then missed it.
+//!
+//! The list has two parts. `advisories.toml` is compiled into the binary: the
+//! few kernel bugs every validator operator was asked to act on, so a box is
+//! tracked against them by upgrading perch and nothing else. `[[advisories]]`
+//! in the config adds to it, and replaces a built-in entry of the same id.
+//! Nothing is fetched to build the list, and nothing on the host is given
+//! more access to produce it: perch still only reads a node_exporter scrape.
 //!
 //! For a declared advisory, each host is in one of three actionable states,
 //! one check each:
@@ -40,6 +47,21 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{info, warn};
+
+/// The advisories that ship with perch.
+const BUILTIN: &str = include_str!("../advisories.toml");
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuiltinFile {
+    #[serde(default)]
+    advisories: Vec<AdvisoryConfig>,
+}
+
+pub fn builtin() -> Result<Vec<AdvisoryConfig>> {
+    let file: BuiltinFile = toml::from_str(BUILTIN).context("parsing the built-in advisory list")?;
+    Ok(file.advisories)
+}
 
 /// The leading numeric components of a kernel or package version, split on
 /// `.` and `-`, stopping at the first thing that is not a number:
@@ -342,21 +364,12 @@ pub struct Assessment {
     pub restore: Option<Verdict>,
 }
 
-impl Assessment {
-    fn all(v: Verdict, mitigated: bool) -> Self {
-        Self {
-            exposed: v.clone(),
-            upgrade: mitigated.then(|| v.clone()),
-            restore: mitigated.then_some(v),
-        }
-    }
-}
-
 pub fn assess(host: &str, adv: &AdvisoryConfig, facts: &HostFacts, tracked: &Tracked) -> Assessment {
     let label = adv.label();
-    let has_mitigation = adv.mitigation.is_some();
     let release = facts.kernel_release.as_deref().unwrap_or("?");
     let see = adv.url.as_ref().map(|u| format!(" See {u}")).unwrap_or_default();
+    // What to do meanwhile only matters while the fix is not running.
+    let more = format!("{}{see}", adv.note.as_ref().map(|n| format!(" {n}")).unwrap_or_default());
     let (name, want) = adv
         .mitigation
         .as_ref()
@@ -370,11 +383,19 @@ pub fn assess(host: &str, adv: &AdvisoryConfig, facts: &HostFacts, tracked: &Tra
     };
 
     match (patch_state(adv, facts, tracked), mitigation_state(adv, facts)) {
-        (Patch::Unknown(why), _) => Assessment::all(Verdict::unknown(why), has_mitigation),
+        // Only `exposed` carries it. Three checks reporting the same missing
+        // collector would be three "cannot be evaluated" notes for one flag.
+        (Patch::Unknown(why), _) => Assessment {
+            exposed: Verdict::unknown(why),
+            upgrade: None,
+            restore: None,
+        },
 
-        (Patch::Fixed(_) | Patch::NotAffected, Mitigation::NotDeclared) => {
-            Assessment::all(Verdict::Healthy, false)
-        }
+        (Patch::Fixed(_) | Patch::NotAffected, Mitigation::NotDeclared) => Assessment {
+            exposed: Verdict::Healthy,
+            upgrade: None,
+            restore: None,
+        },
         (patch @ (Patch::Fixed(_) | Patch::NotAffected), m) => {
             let why = match patch {
                 Patch::Fixed(by) => format!("has the fix for {label} ({by})"),
@@ -398,11 +419,11 @@ pub fn assess(host: &str, adv: &AdvisoryConfig, facts: &HostFacts, tracked: &Tra
             exposed: Verdict::unhealthy(match fix {
                 Some(fix) => format!(
                     "{host} runs kernel {release}, which is affected by {label}. The fix is in {fix}: \
-                     upgrade and reboot.{see}"
+                     upgrade and reboot.{more}"
                 ),
                 None => format!(
                     "{host} runs kernel {release}, which is affected by {label}, and no patched \
-                     kernel is listed for it yet.{see}"
+                     kernel is listed for it yet.{more}"
                 ),
             }),
             upgrade: None,
@@ -412,12 +433,12 @@ pub fn assess(host: &str, adv: &AdvisoryConfig, facts: &HostFacts, tracked: &Tra
             exposed: Verdict::unhealthy(match fix {
                 Some(fix) => format!(
                     "{host} runs kernel {release}, which is affected by {label}, and {name} is {cur}. \
-                     The fix is in {fix}: upgrade and reboot, or set {name} = {want} until you can.{see}"
+                     The fix is in {fix}: upgrade and reboot, or set {name} = {want} until you can.{more}"
                 ),
                 None => format!(
                     "{host} runs kernel {release}, which is affected by {label}, and no patched \
                      kernel is listed for it yet. {name} is {cur}; set it to {want} as the temporary \
-                     mitigation.{see}"
+                     mitigation.{more}"
                 ),
             }),
             upgrade: Some(Verdict::Healthy),
@@ -432,11 +453,11 @@ pub fn assess(host: &str, adv: &AdvisoryConfig, facts: &HostFacts, tracked: &Tra
             upgrade: Some(match fix {
                 Some(fix) if m == Mitigation::Applied => Verdict::unhealthy(format!(
                     "{host} is mitigated against {label} ({name} = {want}) and a patched kernel now \
-                     exists: {fix}. It runs {release}. Upgrade and reboot, then restore {name}.{see}"
+                     exists: {fix}. It runs {release}. Upgrade and reboot, then restore {name}.{more}"
                 )),
                 Some(fix) => Verdict::unhealthy(format!(
                     "{host} runs kernel {release}, which is affected by {label}. The fix is in {fix}: \
-                     upgrade and reboot.{see}"
+                     upgrade and reboot.{more}"
                 )),
                 None => Verdict::Healthy,
             }),
@@ -483,32 +504,47 @@ impl Tracker {
         &self.tracked
     }
 
-    pub async fn refresh(&mut self, advisories: &[AdvisoryConfig], now: Instant) {
+    /// `hosts` are the facts scraped this cycle. The tracker is only asked
+    /// when one of them is an Ubuntu box: a built-in advisory must not make a
+    /// perch watching Debian hosts start talking to ubuntu.com.
+    pub async fn refresh(&mut self, advisories: &[AdvisoryConfig], hosts: &[&HostFacts], now: Instant) {
+        if !hosts.iter().any(|f| f.is_ubuntu()) {
+            return;
+        }
         let Some(client) = self.client.clone() else {
             return;
         };
-        for adv in advisories.iter().filter(|a| a.tracker == Some(AdvisoryTracker::Ubuntu)) {
-            let every = if self.tracked.contains_key(&adv.id) {
-                TRACKER_REFRESH
-            } else {
-                TRACKER_RETRY
-            };
-            if self
-                .last_attempt
-                .get(&adv.id)
-                .is_some_and(|t| now.saturating_duration_since(*t) < every)
-            {
-                continue;
-            }
-            self.last_attempt.insert(adv.id.clone(), now);
-            match fetch_ubuntu(&client, &adv.id).await {
+        let due: Vec<&str> = advisories
+            .iter()
+            .filter(|a| a.tracker == Some(AdvisoryTracker::Ubuntu))
+            .filter(|a| {
+                let every = if self.tracked.contains_key(&a.id) {
+                    TRACKER_REFRESH
+                } else {
+                    TRACKER_RETRY
+                };
+                self.last_attempt
+                    .get(&a.id)
+                    .is_none_or(|t| now.saturating_duration_since(*t) >= every)
+            })
+            .map(|a| a.id.as_str())
+            .collect();
+        for id in &due {
+            self.last_attempt.insert((*id).to_string(), now);
+        }
+        // Together, not in turn: Ubuntu's API can take over twenty seconds on
+        // a record it has not served lately, and the check cycle waits on
+        // this. One slow record must cost one timeout, not one per advisory.
+        let fetched = futures::future::join_all(due.iter().map(|id| fetch_ubuntu(&client, id))).await;
+        for (id, result) in due.into_iter().zip(fetched) {
+            match result {
                 Ok(fresh) => {
-                    if self.tracked.get(&adv.id) != Some(&fresh) {
-                        info!(advisory = %adv.id, "Ubuntu tracker record fetched: {}", fresh.summary());
+                    if self.tracked.get(id) != Some(&fresh) {
+                        info!(advisory = %id, "Ubuntu tracker record fetched: {}", fresh.summary());
                     }
-                    self.tracked.insert(adv.id.clone(), fresh);
+                    self.tracked.insert(id.to_string(), fresh);
                 }
-                Err(e) => warn!(advisory = %adv.id, "could not fetch Ubuntu's tracker record: {e:#}"),
+                Err(e) => warn!(advisory = %id, "could not fetch Ubuntu's tracker record: {e:#}"),
             }
         }
     }
@@ -561,6 +597,7 @@ mod tests {
             fixed_in: vec!["6.12.117".into(), "6.18.63".into(), "7.3.4".into()],
             tracker: Some(AdvisoryTracker::Ubuntu),
             url: None,
+            note: None,
             mitigation: Some(AdvisoryMitigation {
                 sysctl: "net.ipv4.tcp_syncookies".into(),
                 value: 0,
@@ -609,6 +646,20 @@ mod tests {
         match v {
             Verdict::Unhealthy(m) => m,
             other => panic!("expected unhealthy, got {other:?}"),
+        }
+    }
+
+    /// The list ships inside the binary, so a mistake in it would stop every
+    /// perch from loading its config.
+    #[test]
+    fn the_built_in_list_is_valid() {
+        let list = builtin().unwrap();
+        assert!(list.iter().any(|a| a.id == "CVE-2026-99288"));
+        let mut ids = std::collections::HashSet::new();
+        for a in &list {
+            a.validate().unwrap();
+            assert!(ids.insert(a.id.clone()), "{} is listed twice", a.id);
+            assert!(a.name.is_some() && a.url.is_some(), "{} needs a name and a reference", a.id);
         }
     }
 
@@ -728,7 +779,9 @@ mod tests {
         // No uname collector: fox_main and the other mainnet boxes today.
         let a = assess("fox", &noisytcp(), &HostFacts::default(), &untriaged());
         assert!(unknown(&a.exposed).contains("--collector.uname"));
-        assert!(matches!(a.restore, Some(Verdict::Unknown(_))));
+        // One check says so, not three: each would become its own "cannot
+        // be evaluated" note about the same missing flag.
+        assert_eq!((a.upgrade, a.restore), (None, None));
 
         // No sysctl collector.
         let a = assess("fox", &noisytcp(), &facts(NOBLE_54, None), &untriaged());
@@ -769,6 +822,43 @@ mod tests {
 
         let a = assess("deb", &adv, &facts(("6.12.117-amd64", "#1 SMP"), None), &Tracked::new());
         assert_eq!(a.exposed, Verdict::Healthy);
+    }
+
+    /// CVE-2026-98432: the stopgap is a firewall rule, which a node_exporter
+    /// scrape cannot show. perch must not call a box mitigated on a guess, so
+    /// the advisory declares no mitigation and carries the steps as a note.
+    #[test]
+    fn a_stopgap_perch_cannot_see_is_a_note_not_a_mitigation() {
+        let adv = builtin().unwrap().into_iter().find(|a| a.id == "CVE-2026-98432").unwrap();
+        assert!(adv.mitigation.is_none());
+        let fixed = |codename: &str, v: &str| {
+            let body = format!(
+                r#"{{"packages":[{{"name":"linux","statuses":[
+                    {{"release_codename":"{codename}","status":"released","description":"{v}"}}]}}]}}"#
+            );
+            HashMap::from([(adv.id.clone(), UbuntuCve::parse(&body).unwrap())])
+        };
+        // fox_test on 2026-11-18: 6.8.0-85, with the fix in 6.8.0-149.149.
+        let old = ("6.8.0-85-generic", "#85-Ubuntu SMP PREEMPT_DYNAMIC");
+        let a = assess("fox", &adv, &facts(old, None), &fixed("noble", "6.8.0-149.149"));
+        let msg = unhealthy(&a.exposed);
+        assert!(msg.contains("The fix is in linux 6.8.0-149.149: upgrade and reboot."), "{msg}");
+        assert!(msg.contains("IPv4 options") && msg.contains("perch cannot see"), "{msg}");
+        assert_eq!((a.upgrade, a.restore), (None, None));
+
+        // failover, on the fixed build, and mind_test on 26.04.
+        let new = ("6.8.0-149-generic", "#149-Ubuntu SMP PREEMPT_DYNAMIC");
+        assert_eq!(assess("failover", &adv, &facts(new, None), &fixed("noble", "6.8.0-149.149")).exposed, Verdict::Healthy);
+        let mut resolute = facts(("7.0.0-43-generic", "#43-Ubuntu SMP PREEMPT_DYNAMIC"), None);
+        resolute.os_codename = Some("resolute".into());
+        assert_eq!(assess("mind", &adv, &resolute, &fixed("resolute", "7.0.0-43.43")).exposed, Verdict::Healthy);
+
+        // Upstream numbering, from fixed_in alone.
+        let adv = AdvisoryConfig { tracker: None, ..adv };
+        let stable = |rel: &str| assess("deb", &adv, &facts((rel, "#1 SMP"), None), &Tracked::new()).exposed;
+        assert!(matches!(stable("6.12.112"), Verdict::Unhealthy(_)));
+        assert_eq!(stable("6.12.113"), Verdict::Healthy);
+        assert_eq!(stable("7.3.0"), Verdict::Healthy);
     }
 
     #[test]

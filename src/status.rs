@@ -117,7 +117,8 @@ pub async fn run(
         // One-shot, like the SFDP schedule below: fetched fresh, and Unknown
         // if the tracker cannot be reached.
         let mut tracker = crate::advisory::Tracker::new();
-        tracker.refresh(&config.advisories, std::time::Instant::now()).await;
+        let facts: Vec<_> = host_snapshots.iter().map(|h| &h.facts).collect();
+        tracker.refresh(&config.advisories, &facts, std::time::Instant::now()).await;
         outcomes.extend(checks::evaluate_advisories(&host_snapshots, config, tracker.tracked()));
     }
     outcomes.extend(checks::evaluate_nodes(&snapshots, config));

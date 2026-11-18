@@ -1373,7 +1373,7 @@ pub fn evaluate_advisories(
     config: &Config,
     tracked: &crate::advisory::Tracked,
 ) -> Vec<CheckOutcome> {
-    let base = &config.checks.host_advisory;
+    let base = &config.checks.host_advisory.base;
     if !base.enabled {
         return Vec::new();
     }
@@ -1390,14 +1390,11 @@ pub fn evaluate_advisories(
             let a = match &snap.error {
                 // The kernel and sysctl collectors are independent of the
                 // filesystem one, so "no mountpoint matched" still has facts.
-                Some(err) if err != crate::node_exporter::NOTHING_MATCHED => {
-                    let v = Verdict::unknown(format!("node_exporter unreachable: {err}"));
-                    crate::advisory::Assessment {
-                        exposed: v.clone(),
-                        upgrade: adv.mitigation.as_ref().map(|_| v.clone()),
-                        restore: adv.mitigation.as_ref().map(|_| v),
-                    }
-                }
+                Some(err) if err != crate::node_exporter::NOTHING_MATCHED => crate::advisory::Assessment {
+                    exposed: Verdict::unknown(format!("node_exporter unreachable: {err}")),
+                    upgrade: None,
+                    restore: None,
+                },
                 _ => crate::advisory::assess(&snap.host, adv, &snap.facts, tracked),
             };
             out.push(single(
@@ -1585,7 +1582,7 @@ pub fn still_configured(id: &str, config: &Config) -> bool {
         // Subjects are "<host> <advisory id>". The follow-ups only exist for an
         // advisory that declares a mitigation.
         "advisory_exposed" | "advisory_upgrade" | "advisory_restore" => {
-            c.host_advisory.enabled
+            c.host_advisory.base.enabled
                 && subject.and_then(|s| s.split_once(' ')).is_some_and(|(h, id)| {
                     config.hosts.iter().any(|x| x.name == h)
                         && config
@@ -2242,11 +2239,15 @@ mod tests {
         fn an_unreachable_exporter_is_unknown() {
             let c = config(ADVISORY);
             let out = verdicts(snap("6.8.0-54-generic", 1.0, Some("connection refused")), &c);
-            assert_eq!(out.len(), 3);
-            assert!(out.iter().all(|(_, v, _)| matches!(v, Verdict::Unknown(m) if m.contains("unreachable"))));
+            // One check per advisory, so a dead exporter is one "cannot be
+            // evaluated" note for each rather than three.
+            assert_eq!(out.len(), c.advisories.len());
+            assert!(out.iter().all(|(id, v, _)| id.starts_with("advisory_exposed:")
+                && matches!(v, Verdict::Unknown(m) if m.contains("unreachable"))));
 
             let out = verdicts(snap("6.8.0-54-generic", 1.0, Some(NOTHING_MATCHED)), &c);
-            assert!(matches!(&out[0].1, Verdict::Unhealthy(_)));
+            let noisy = out.iter().find(|(id, _, _)| id == "advisory_exposed:hw CVE-2026-99288").unwrap();
+            assert!(matches!(&noisy.1, Verdict::Unhealthy(_)));
         }
 
         #[test]
@@ -2259,20 +2260,59 @@ mod tests {
             assert_eq!(sev("advisory_restore"), Severity::Notify);
         }
 
+        const NO_BUILTIN: &str = "[checks.host_advisory]\nbuiltin = false\npending_for = \"1m\"\nseverity = \"notify\"\n";
+
         #[test]
-        fn disabled_or_unconfigured_produces_nothing() {
+        fn disabled_or_empty_produces_nothing() {
             let s = || snap("6.8.0-54-generic", 1.0, None);
-            assert!(verdicts(s(), &config("")).is_empty());
+            assert!(verdicts(s(), &config(NO_BUILTIN)).is_empty());
             let off = config(&format!("{ADVISORY}[checks.host_advisory]\nenabled = false\npending_for = \"1m\"\nseverity = \"notify\"\n"));
             assert!(verdicts(s(), &off).is_empty());
+        }
+
+        /// A config that says nothing about advisories still tracks the ones
+        /// perch ships with: that is the point of shipping them.
+        #[test]
+        fn the_built_in_list_applies_without_being_configured() {
+            let c = config("");
+            assert!(c.advisories.iter().any(|a| a.id == "CVE-2026-99288" && a.name.as_deref() == Some("NoisyTCP")));
+            let out = verdicts(snap("6.8.0-54-generic", 1.0, None), &c);
+            assert!(out.iter().any(|(id, _, _)| id == "advisory_exposed:hw CVE-2026-99288"));
+        }
+
+        #[test]
+        fn the_config_extends_replaces_and_ignores_built_ins() {
+            let builtin = config("").advisories.len();
+            let ids = |c: &Config| c.advisories.iter().map(|a| a.id.clone()).collect::<Vec<_>>();
+
+            // Extends: a new id is added after the built-ins.
+            let c = config("[[advisories]]\nid = \"OURS-1\"\nfixed_in = [\"6.8.0-200\"]\n");
+            assert_eq!(c.advisories.len(), builtin + 1);
+            assert_eq!(ids(&c).last().map(String::as_str), Some("OURS-1"));
+
+            // Replaces: ADVISORY reuses a built-in id with its own fixed_in.
+            let c = config(ADVISORY);
+            assert_eq!(c.advisories.len(), builtin);
+            let a = c.advisories.iter().find(|a| a.id == "CVE-2026-99288").unwrap();
+            assert_eq!(a.fixed_in, ["6.8.0-151"]);
+            assert_eq!(a.tracker, None);
+
+            // Ignores: by id, and an id that is no longer built in is not an
+            // error, or retiring an entry would break configs that ignored it.
+            let c = config("[checks.host_advisory]\nignore = [\"CVE-2026-99288\", \"CVE-2001-0001\"]\npending_for = \"1m\"\nseverity = \"notify\"\n");
+            assert!(!ids(&c).contains(&"CVE-2026-99288".to_string()));
+
+            // builtin = false leaves exactly what was declared.
+            let c = config(&format!("[[advisories]]\nid = \"OURS-1\"\nfixed_in = [\"6.8.0-200\"]\n{NO_BUILTIN}"));
+            assert_eq!(ids(&c), ["OURS-1"]);
         }
 
         /// Deleting an advisory from the config, once the fleet is patched,
         /// has to close whatever it left open.
         #[test]
         fn a_removed_advisory_orphans_its_states() {
-            let with = config(ADVISORY);
-            let without = config("");
+            let with = config(&format!("{ADVISORY}{NO_BUILTIN}"));
+            let without = config(NO_BUILTIN);
             for kind in ["advisory_exposed", "advisory_upgrade", "advisory_restore"] {
                 let id = format!("{kind}:hw CVE-2026-99288");
                 assert!(still_configured(&id, &with), "{id}");
@@ -2280,7 +2320,7 @@ mod tests {
                 assert!(!still_configured(&format!("{kind}:gone CVE-2026-99288"), &with));
             }
             // Dropping only the mitigation leaves exposure and retires the follow-ups.
-            let bare = config("[[advisories]]\nid = \"CVE-2026-99288\"\nfixed_in = [\"6.8.0-151\"]\n");
+            let bare = config(&format!("[[advisories]]\nid = \"CVE-2026-99288\"\nfixed_in = [\"6.8.0-151\"]\n{NO_BUILTIN}"));
             assert!(still_configured("advisory_exposed:hw CVE-2026-99288", &bare));
             assert!(!still_configured("advisory_restore:hw CVE-2026-99288", &bare));
         }

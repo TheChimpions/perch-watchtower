@@ -181,6 +181,22 @@ Also checked: a filesystem remounted **read-only** (how a disk usually fails
 under a validator — immediate page, no hold-down), and **inode exhaustion**,
 which can happen with space to spare.
 
+### Kernel advisories are listed, not discovered
+
+A few times a year a kernel bug needs every operator to act the same day, and
+the hard part is not hearing about it but knowing a week later which box never
+got the stopgap and which has had the fix sitting unbooted. perch tracks each
+host through that, from the node_exporter scrape it already makes.
+
+Which bugs is a curated list, compiled into the binary and extended from the
+config, rather than a CVE feed. Ubuntu's tracker lists over three thousand
+high-priority kernel CVEs for 24.04 and rated NoisyTCP "medium": a feed would
+be ignored within a week and would have missed the one that mattered. And
+perch only claims what it can see. A stopgap it cannot observe, such as a
+firewall rule, is carried as text in the alert, and the box stays "exposed"
+until the fixed kernel is running. Details in
+[deployment.md](deployment.md#kernel-advisories).
+
 ### One page, even across layers
 
 Link a host to the validator it runs:

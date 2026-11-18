@@ -709,8 +709,9 @@ async fn run_cycle(
         &mut rt.disk,
         unix_now(),
     ));
-    if !config.advisories.is_empty() && config.checks.host_advisory.enabled && !hosts.is_empty() {
-        rt.advisories.refresh(&config.advisories, now).await;
+    if !config.advisories.is_empty() && config.checks.host_advisory.base.enabled && !hosts.is_empty() {
+        let facts: Vec<_> = host_snapshots.iter().map(|h| &h.facts).collect();
+        rt.advisories.refresh(&config.advisories, &facts, now).await;
         outcomes.extend(checks::evaluate_advisories(
             &host_snapshots,
             config,

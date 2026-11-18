@@ -229,8 +229,13 @@ unauthenticated and leaks a great deal about the host:
 ```
 ExecStart=/usr/local/bin/node_exporter \
   --web.listen-address=10.0.0.5:9100 \
-  --collector.filesystem
+  --collector.filesystem \
+  --collector.uname --collector.os \
+  --collector.sysctl --collector.sysctl.include=net.ipv4.tcp_syncookies
 ```
+
+The last two lines are for the [kernel advisories](#kernel-advisories) below;
+the disk checks need only `--collector.filesystem`.
 
 Reach it from the monitoring host over the same WireGuard/Tailscale path you use
 for the validator's local RPC. A scrape that fails is `Unknown` — it freezes the
@@ -242,7 +247,31 @@ eventually reported as a starved check.
 Some kernel bugs need every validator operator to act the same day, in three
 steps: apply a sysctl as a stopgap, boot the patched kernel once the
 distribution ships it, undo the stopgap. CVE-2026-99288 (NoisyTCP) was one.
-Declare the advisory and perch tracks each `[[hosts]]` entry through all three:
+perch tracks each `[[hosts]]` entry through all three.
+
+Not every stopgap is a sysctl. CVE-2026-98432's was a firewall rule, which a
+node_exporter scrape cannot show, so that advisory declares no `mitigation`:
+perch reports the box as exposed until the fixed kernel is running, and the
+alert carries the stopgap as a `note`. perch never calls a box mitigated on
+the strength of something it cannot see.
+
+The advisories it tracks come from two places:
+
+- **Built in.** [`advisories.toml`](../advisories.toml) is compiled into the
+  binary: the kernel bugs every validator operator was asked to act on.
+  Upgrading perch is all it takes to be tracked against a new one, and `perch
+  status` shows them.
+- **Your config.** `[[advisories]]` adds your own. Declaring an id that is
+  built in replaces that entry, so you can correct or extend one without
+  waiting for a release.
+
+```toml
+[checks.host_advisory]
+ignore = ["CVE-2026-99288"]   # drop one built-in
+builtin = false               # or all of them
+```
+
+An advisory looks like this, in either place:
 
 ```toml
 [[advisories]]
@@ -263,8 +292,9 @@ value = 0
 | `advisory_restore` | the fixed kernel is running and the sysctl is still at the mitigating value | put the sysctl back |
 
 All three are Telegram notes by default; `[checks.host_advisory] severity =
-"page"` makes the first one page. Delete the advisory once every box is done
-and anything it left open is closed.
+"page"` makes the first one page. Delete or ignore an advisory and anything it
+left open is closed; a built-in one is retired from the list once the fix is in
+every kernel a supported distribution still ships.
 
 The kernel and the sysctl come from the scrape perch already makes, so
 node_exporter needs the collectors that report them:
@@ -276,21 +306,28 @@ node_exporter needs the collectors that report them:
 
 Without one of them the check is `Unknown` and `perch status` names the flag
 to add. A host is never assumed patched or mitigated because perch could not
-see.
+see. Because the built-in list is on by default, a perch with `[[hosts]]` and
+without these collectors reports one "cannot be evaluated" note per advisory
+after two hours: add the collectors, or set `builtin = false`.
+
+This is the whole footprint. Nothing is installed on the host, nothing runs as
+root, and perch gains no permission it did not have: it reads the same
+unprivileged node_exporter scrape as the disk checks.
 
 `fixed_in` is compared against `uname -r`, one entry per kernel series. A
 series newer than every entry counts as fixed; a series that is not listed
-does not. With `tracker = "ubuntu"`, perch also reads Ubuntu's record for the
-CVE once an hour and uses the fixed package version for the release each host
+does not. With `tracker = "ubuntu"`, and only while one of the scraped hosts
+is an Ubuntu box, perch also reads Ubuntu's record for the CVE once an hour and uses the fixed package version for the release each host
 runs, which is what makes `advisory_upgrade` arrive on the day the kernel
 ships. That lookup covers Ubuntu's stock kernels (`generic`, `aws`,
 `lowlatency` and the like); for an HWE or other backport kernel, add its fixed
 version to `fixed_in`, which takes precedence for its series.
 
-perch does not find advisories for you. A feed was considered: Ubuntu lists
-over three thousand high-priority kernel CVEs for 24.04 and rated NoisyTCP
-"medium", so a feed would have been ignored within a week and would have
-missed the one that mattered.
+The list is curated rather than fed from a CVE database. A feed was
+considered: Ubuntu lists over three thousand high-priority kernel CVEs for
+24.04 and rated NoisyTCP "medium", so a feed would have been ignored within a
+week and would have missed the one that mattered. To propose an entry, open a
+pull request against `advisories.toml`; `cargo test` validates the file.
 
 ## Sandboxing
 

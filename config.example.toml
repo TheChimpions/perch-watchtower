@@ -108,7 +108,12 @@ attempts = 3
 #
 #   ExecStart=/usr/local/bin/node_exporter \
 #     --web.listen-address=10.0.0.5:9100 \
-#     --collector.filesystem
+#     --collector.filesystem \
+#     --collector.uname --collector.os \
+#     --collector.sysctl --collector.sysctl.include=net.ipv4.tcp_syncookies
+#
+# The last two lines are for the kernel advisories below; the disk checks need
+# only --collector.filesystem.
 #
 # Then reach it from the monitoring host over WireGuard/Tailscale, the same
 # private path you use for the validator's local RPC.
@@ -140,9 +145,15 @@ attempts = 2
 #   upgrade   mitigated, and a fixed kernel now exists that is not the one running
 #   restore   the fix is running and the mitigation is still applied
 #
-# perch does not discover advisories; you add the ones that matter and delete
-# them when the fleet is done. It reads the kernel and the sysctl from the
-# node_exporter scrape, so node_exporter needs three more collectors:
+# perch ships with a short list of these (advisories.toml in the repository:
+# the kernel bugs every validator operator was asked to act on), compiled into
+# the binary, so upgrading perch is all it takes to be tracked against a new
+# one. [[advisories]] here adds your own. Declaring an id that is built in
+# replaces that entry; `ignore` under [checks.host_advisory] drops one.
+#
+# Nothing is discovered or downloaded to build the list, and nothing new runs
+# on the host: perch reads the kernel and the sysctl from the node_exporter
+# scrape it already makes, so node_exporter needs three more collectors:
 #
 #   --collector.uname --collector.os \
 #   --collector.sysctl --collector.sysctl.include=net.ipv4.tcp_syncookies
@@ -163,6 +174,9 @@ attempts = 2
 # tracker = "ubuntu"
 # # Appended to the alert.
 # url = "https://example.com/operator-instructions"
+# # A stopgap perch cannot check, such as a firewall rule: a sentence appended
+# # to the alert while the host is unpatched.
+# note = "Until then, block X at the firewall."
 # # The temporary measure. Omit it and only `exposed` is reported.
 # [advisories.mitigation]
 # sysctl = "net.ipv4.tcp_syncookies"
@@ -561,6 +575,10 @@ renotify_after = "30m"
 # get out of bed for. The upgrade and restore follow-ups are always "notify".
 [checks.host_advisory]
 enabled = true
+# Track the advisories that ship with perch. false leaves only [[advisories]].
+builtin = true
+# Built-in ids to leave out, e.g. ["CVE-2026-99288"].
+ignore = []
 pending_for = "10m"
 clear_after = 2
 severity = "notify"

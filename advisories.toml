@@ -1,0 +1,44 @@
+# Kernel advisories built into perch.
+#
+# Every perch with [[hosts]] configured tracks these without being told to. An
+# operator adds their own with [[advisories]] in the config, replaces one of
+# these by declaring the same id, and drops one with
+# `[checks.host_advisory] ignore = ["<id>"]`.
+#
+# What belongs here: a kernel vulnerability that the validator client teams or
+# the Solana Foundation have asked every operator to act on. Not every kernel
+# CVE: a list nobody reads protects nobody.
+#
+# An entry is removed once the fix is in every kernel a supported distribution
+# still ships, which closes anything it left open on the boxes that had it.
+#
+# The schema is the config's [[advisories]]; `cargo test` parses and validates
+# this file.
+
+[[advisories]]
+id = "CVE-2026-99288"
+name = "NoisyTCP"
+# Upstream stable releases carrying the fix (mainline 4e2b3ef19e0e).
+fixed_in = ["6.12.117", "6.18.63", "7.3.4"]
+# Distribution kernels number differently; Ubuntu's are looked up.
+tracker = "ubuntu"
+url = "https://www.openwall.com/lists/oss-security/2026/11/15/2"
+
+[advisories.mitigation]
+sysctl = "net.ipv4.tcp_syncookies"
+value = 0
+
+# TCP use-after-free reachable by a remote, unauthenticated peer through IPv4
+# header options. Ubuntu rates it critical.
+#
+# No `mitigation` on purpose: the stopgap that closes the remote path is a
+# firewall rule, and a node_exporter scrape cannot show one. Tracking only the
+# two sysctls would let perch call a box mitigated when it is not.
+[[advisories]]
+id = "CVE-2026-98432"
+name = "TCP IPv4 options use-after-free"
+# Upstream stable releases carrying the fix; 7.3 and later were released with it.
+fixed_in = ["5.10.272", "5.15.223", "6.1.190", "6.6.159", "6.12.113", "6.18.56", "7.2.10"]
+tracker = "ubuntu"
+url = "https://ubuntu.com/security/CVE-2026-98432"
+note = "Until then, drop inbound TCP packets that carry IPv4 options at the firewall, and set net.mptcp.enabled=0 and net.ipv4.tcp_migrate_req=0; perch cannot see firewall rules, so it does not check these."

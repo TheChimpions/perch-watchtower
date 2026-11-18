@@ -94,6 +94,16 @@ pub struct HostFacts {
 }
 
 impl HostFacts {
+    /// By `/etc/os-release`, or failing that by the kernel's own build tag.
+    pub fn is_ubuntu(&self) -> bool {
+        self.os_id.as_deref() == Some("ubuntu")
+            || self
+                .kernel_version
+                .as_deref()
+                .and_then(|v| v.split_whitespace().next())
+                .is_some_and(|tag| tag.ends_with("-Ubuntu"))
+    }
+
     /// A sysctl by its usual dotted name.
     pub fn sysctl(&self, dotted: &str) -> Option<f64> {
         self.sysctls.get(&dotted.replace('.', "_")).copied()

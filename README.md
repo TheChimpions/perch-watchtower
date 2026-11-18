@@ -63,7 +63,7 @@ journalctl -u perch -f
 ```
 
 ```
-INFO perch 1.4.2 (…) starting: 3 endpoint(s), 1 validator(s), 60s interval
+INFO perch 1.5.0 (…) starting: 3 endpoint(s), 1 validator(s), 60s interval
 INFO sandbox: root=read-only home=hidden proc=private capabilities=none seccomp=on
 INFO cycle complete: 3/3 endpoint(s) usable, ... visibility ok, 0 check(s) firing
 ```
@@ -79,7 +79,7 @@ perch maint 30m                # plain timed silence
 perch maint off
 ```
 
-**Next:** an instance on each validator box watches its disks and reads its log ([layouts](docs/deployment.md#layouts), [examples/](examples/)); a hub on the failover box reports a machine that goes hard down ([layout 3](examples/3-hub-on-failover.toml)); [Grafana](docs/operations.md#grafana); [mainnet and testnet together](docs/deployment.md#running-mainnet-and-testnet).
+**Next:** an instance on each validator box watches its disks and kernel and reads its log ([layouts](docs/deployment.md#layouts), [examples/](examples/)); a hub on the failover box reports a machine that goes hard down ([layout 3](examples/3-hub-on-failover.toml)); [Grafana](docs/operations.md#grafana); [mainnet and testnet together](docs/deployment.md#running-mainnet-and-testnet).
 
 ## Security
 
@@ -88,7 +88,7 @@ perch runs next to validators, so the question that matters is what it could do 
 - **It never holds a keypair and never signs or sends a transaction.** It calls twelve read-only RPC methods, all listed in SECURITY.md.
 - **The kernel enforces the rest.** It runs as an unprivileged user with no capabilities, `/home` hidden, other processes invisible, a read-only filesystem apart from its own state directory, and no ability to start another program. `systemd-analyze security` rates the unit 1.2 out of 10.
 - **It listens on one port**, `127.0.0.1:9469`, read-only metrics. Keep it on localhost or a private network.
-- **It talks only to what you configure**: your RPC endpoints, node_exporter hosts, peers, alert channels and heartbeat, plus an hourly read of the Solana Foundation's public minimum-version schedule and, for an advisory you ask it to track, Ubuntu's public CVE record.
+- **It talks only to what you configure**: your RPC endpoints, node_exporter hosts, peers, alert channels and heartbeat, plus an hourly read of the Solana Foundation's public minimum-version schedule and, for a tracked kernel advisory on an Ubuntu host, Ubuntu's public CVE record.
 - **Secrets stay out of logs and alerts.** Request URLs are cut to the host before an error is written anywhere, and there is a test that sends secrets in the query, path and userinfo and asserts none reach the error text.
 - **Releases are verifiable.** Static binaries built from the tagged commit by a public workflow, with checksums and signed build provenance: `gh attestation verify perch-x86_64-unknown-linux-musl.tar.gz -R TheChimpions/perch-watchtower`.
 
@@ -110,20 +110,22 @@ Report vulnerabilities privately through the repository's Security tab.
 | `node_behind`                       | page          | 15m            | a node _you operate_ lagging or unreachable                                |
 | `disk_space` / `disk_fill`          | notify / page | 10m / 15m      | free-space floor and projected time-to-full                                |
 | `disk_readonly` / `disk_missing`    | page          | immediate / 2m | how disks fail under a validator                                           |
-| `advisory_exposed`                  | notify / page | 10m            | a declared kernel CVE: unpatched and unmitigated, then fix-ready, then undo |
+| `advisory_exposed`                  | notify / page | 10m            | a listed kernel CVE (built in, or yours): exposed, then fix-ready, then undo |
 | `peer_down` / `machine_down`        | notify / page | 10m / 3m       | another perch went silent; paged only if its validator also stopped voting |
 | `cluster_stake` / `cluster_stalled` | notify        | 10m / 3m       | not yours to fix at 3am                                                    |
 
+**Kernel advisories.** perch ships with a short list of the kernel vulnerabilities every validator operator was asked to act on ([advisories.toml](advisories.toml), currently CVE-2026-99288 "NoisyTCP" and CVE-2026-98432), and tells you which of your boxes is still exposed, when your distribution ships the fix, and when to undo a temporary mitigation. It reads the kernel and sysctls from the node_exporter scrape it already makes: nothing is installed on the host and nothing runs as root. Add your own with `[[advisories]]`, or drop one with `ignore`; see [kernel advisories](docs/deployment.md#kernel-advisories) for the node_exporter flags it needs.
+
 `page` goes to PagerDuty and Telegram, once per incident; `notify` to Telegram only. Every threshold and tier is per check. Related symptoms fold into one alert, every alert is tagged with its cluster, and resolves land on the original PagerDuty incident even across restarts.
 
-Compared with agave-watchtower, perch adds corroboration, severities, lag, credit, skip-rate, disk, machine-down and stake-pool checks, maintenance windows, a heartbeat and a self-test; agave-watchtower has more alert channels and ships with Agave. [docs/comparison.md](docs/comparison.md) has the line-by-line comparison and a flag map for moving over.
+Compared with agave-watchtower, perch adds corroboration, severities, lag, credit, skip-rate, disk, kernel-advisory, machine-down and stake-pool checks, maintenance windows, a heartbeat and a self-test; agave-watchtower has more alert channels and ships with Agave. [docs/comparison.md](docs/comparison.md) has the line-by-line comparison and a flag map for moving over.
 
 ## Documentation
 
 |                                            |                                                                                |
 | ------------------------------------------ | ------------------------------------------------------------------------------ |
 | [SECURITY.md](SECURITY.md)                 | the security model, and how to check it                                        |
-| [docs/deployment.md](docs/deployment.md)   | layouts, RPC endpoints, mainnet and testnet, disk monitoring                   |
+| [docs/deployment.md](docs/deployment.md)   | layouts, RPC endpoints, mainnet and testnet, disks, kernel advisories          |
 | [docs/operations.md](docs/operations.md)   | maintenance, verifying alerts, alert context, `perch status`, Grafana, metrics |
 | [docs/design.md](docs/design.md)           | why it behaves the way it does                                                 |
 | [docs/comparison.md](docs/comparison.md)   | perch vs agave-watchtower                                                      |

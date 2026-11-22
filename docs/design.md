@@ -327,8 +327,8 @@ nobody knows about is worse than a noisy one.
 
 The Solana Foundation Delegation Program publishes a minimum validator version
 per upcoming epoch. Fall below it and the foundation's stake leaves. Perch polls
-that schedule and compares it to the version the local node reports, in two
-non-overlapping bands:
+that schedule and compares it to the version the validator announces in gossip,
+in two non-overlapping bands:
 
 - **`sfdp_version_warn`** — you meet today's floor, but the *next* epoch raises
   it above your version. Telegram, roughly an epoch to act.
@@ -339,6 +339,20 @@ non-overlapping bands:
 chimpions-mainnet runs agave 4.2.2; the delegation program requires >= 4.3.0
 from epoch 1042, the next one. Upgrade before it starts to keep foundation stake.
 ```
+
+The version and the client come from `getClusterNodes`, the gossip listing any
+endpoint can relay. That is the version the foundation itself sees, and it means
+the check needs nothing from the validator's own RPC port: a Firedancer node run
+with RPC off is covered, and so is a validator a box only watches from outside.
+The listing is fetched from one endpoint at `poll_interval`, not every cycle.
+A local endpoint's `getVersion` is the fallback when gossip has no entry.
+
+The schedule has a floor per client, and the numbers are not comparable: Agave
+is at 4.x, Firedancer at 26.x. Each validator is held to its own client's
+column. Forks count as their base client (Jito, BAM, Harmonic and Rakurai as
+Agave or Firedancer, whichever they are built on). Where the schedule says a
+client is not allowed at all, as it does for Frankendancer on mainnet, running
+it reads as below the floor.
 
 Only the very next epoch warns. A floor three epochs out is real but not yet
 actionable, and warning for days is how a useful alert becomes wallpaper.

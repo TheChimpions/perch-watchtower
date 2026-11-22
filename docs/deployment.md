@@ -135,6 +135,27 @@ Two settings matter for staying inside free quota:
 - **Leave `checks.cluster_stake` off** (the default). It is the one check that forces the
   full listing every cycle, and the fastest way to get throttled.
 
+### Firedancer
+
+Firedancer is commonly run with its RPC port off, and perch does not need it.
+Leave the local endpoint out of `[[endpoints]]` and list remote ones, as you
+would on a box that only watches. Delinquency, credits, skip rate, the vote
+account checks and the pool checks are cluster data and read the same from any
+endpoint. The delegation program check reads the validator's version and client
+from gossip through those endpoints and holds it to Firedancer's own floor.
+
+What a local endpoint adds on an Agave box, and is absent here: `node_behind`
+(the local node's slot against the cluster's) and the version line in the epoch
+digest. A validator that stops voting is still caught as delinquent.
+
+If the RPC port is on, it can be listed. Firedancer answers HTTP 501 for the
+methods it has not implemented (`getVoteAccounts`, `getBlockProduction` and
+`getInflationReward` in v26.10.8). perch learns that once, logs it once, and
+leaves those methods to the other endpoints; it does not count them as errors.
+
+`[diagnose] log` and the log-following part of `perch maint cluster-restart`
+read Agave's log format and find nothing in a Firedancer log.
+
 ## Configuration is validated strictly
 
 At startup, unknown keys are rejected so a

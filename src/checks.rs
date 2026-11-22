@@ -1177,16 +1177,20 @@ pub fn evaluate_peers(
 /// running (stake at risk now, pages), `warn` for the floor that takes effect
 /// next epoch (roughly an epoch left, Telegram).
 ///
-/// The version comes from a local endpoint, so this only speaks about the
-/// validator the local node identifies as -- a hub listing five remote
-/// validators must not report its own build as theirs. `reqs` of `None` yields
-/// Unknown: an unreachable foundation API is not evidence about anyone.
+/// The version is the one the validator announces in gossip, which is what
+/// the foundation reads and what any endpoint can relay, so the check needs
+/// nothing from the validator's own RPC port. A local endpoint is the
+/// fallback, and it only speaks for the validator the local node identifies
+/// as -- a hub listing five remote validators must not report its own build
+/// as theirs. `reqs` of `None` yields Unknown: an unreachable foundation API
+/// is not evidence about anyone.
 pub fn evaluate_sfdp(
     snapshots: &[Snapshot],
     config: &Config,
     reqs: Option<&crate::sfdp::Requirements>,
+    gossip: &HashMap<String, crate::sfdp::GossipNode>,
 ) -> Vec<CheckOutcome> {
-    use crate::sfdp::Compliance;
+    use crate::sfdp::{Client, Compliance, Floor};
     let sc = &config.checks.sfdp_version;
     if !sc.base.enabled || config.validators.is_empty() {
         return Vec::new();
@@ -1202,25 +1206,44 @@ pub fn evaluate_sfdp(
 
     let mut out = Vec::new();
     for v in &config.validators {
-        if local_identity.is_some_and(|id| id != v.identity) {
+        let announced = gossip.get(&v.identity);
+        // Not in gossip, and the local node is some other validator: this box
+        // has no way to know what that one runs.
+        if announced.is_none() && local_identity.is_some_and(|id| id != v.identity) {
             continue;
         }
         let who = v.display().to_string();
-        let state = match (config.watchtower.sfdp_cluster(), reqs, local, epoch) {
+        // (version, client id): gossip first, then the local node if it is
+        // this validator.
+        let running: Option<(&str, Option<&str>)> = match announced {
+            Some(n) => Some((n.version.as_str(), n.client_id.as_deref())),
+            None if local_identity == Some(v.identity.as_str()) => {
+                local.map(|ver| (ver.solana_core.as_str(), None))
+            }
+            None => None,
+        };
+        let state = match (config.watchtower.sfdp_cluster(), reqs, running, epoch) {
             (None, _, _, _) => Err("cluster is not covered by the delegation program".to_string()),
             (_, None, _, _) => Err("SFDP required-version schedule not fetched yet".to_string()),
-            (_, _, None, _) => Err("no local endpoint reported a validator version".to_string()),
+            (_, _, None, _) => Err(
+                "the validator's version is not known: it is not in the gossip listing, and no \
+                 local endpoint reports it"
+                    .to_string(),
+            ),
             (_, _, _, None) => Err("epoch not observed".to_string()),
-            _ if local_identity.is_none() => {
-                Err("local node identity not observed, so the version cannot be attributed".into())
-            }
-            (Some(_), Some(r), Some(ver), Some(epoch)) => {
-                match semver::Version::parse(&ver.solana_core) {
-                    Err(e) => Err(format!("validator version {:?} is not semver: {e}", ver.solana_core)),
-                    Ok(parsed) => match crate::sfdp::compliance(&parsed, epoch, r) {
-                        None => Err("SFDP schedule is empty".to_string()),
-                        Some(c) => Ok((c, ver.solana_core.clone())),
-                    },
+            (Some(_), Some(r), Some((ver, client_id)), Some(epoch)) => {
+                match semver::Version::parse(ver) {
+                    Err(e) => Err(format!("validator version {ver:?} is not semver: {e}")),
+                    Ok(parsed) => {
+                        let client = Client::classify(client_id, &parsed);
+                        match crate::sfdp::compliance(client, &parsed, epoch, r) {
+                            None => Err(format!(
+                                "the SFDP schedule publishes no requirement for {}",
+                                client.name()
+                            )),
+                            Some(c) => Ok((c, format!("{} {ver}", client.name()))),
+                        }
+                    }
                 }
             }
         };
@@ -1236,24 +1259,38 @@ pub fn evaluate_sfdp(
             let verdict = match &state2 {
                 Err(why) => Verdict::unknown(why.clone()),
                 Ok((c, ver)) => match (suffix, c) {
-                    ("critical", Compliance::BelowCurrent { epoch, required }) => {
+                    ("critical", Compliance::BelowCurrent { epoch, required: Floor::Min(required) }) => {
                         Verdict::unhealthy(format!(
-                            "{who2} runs agave {ver} but the delegation program requires >= {required} \
+                            "{who2} runs {ver} but the delegation program requires >= {required} \
                              as of epoch {epoch}, which has already started. Foundation stake is at \
                              risk until it is upgraded."
                         ))
                     }
-                    ("warn", Compliance::BelowNext { epoch, required }) => {
+                    ("critical", Compliance::BelowCurrent { epoch, required: Floor::NotAllowed }) => {
                         Verdict::unhealthy(format!(
-                            "{who2} runs agave {ver}; the delegation program requires >= {required} \
+                            "{who2} runs {ver}, a client the delegation program does not allow as \
+                             of epoch {epoch}, which has already started. Foundation stake is at \
+                             risk until it runs an allowed client."
+                        ))
+                    }
+                    ("warn", Compliance::BelowNext { epoch, required: Floor::Min(required) }) => {
+                        Verdict::unhealthy(format!(
+                            "{who2} runs {ver}; the delegation program requires >= {required} \
                              from epoch {epoch}, the next one. Upgrade before it starts to keep \
                              foundation stake."
+                        ))
+                    }
+                    ("warn", Compliance::BelowNext { epoch, required: Floor::NotAllowed }) => {
+                        Verdict::unhealthy(format!(
+                            "{who2} runs {ver}; the delegation program stops allowing that client \
+                             from epoch {epoch}, the next one. Move to an allowed client before it \
+                             starts to keep foundation stake."
                         ))
                     }
                     _ => Verdict::Healthy,
                 },
             };
-            // The version is a fact about this box rather than something
+            // The version is one announced fact rather than something
             // endpoints corroborate, so every usable endpoint carries the same
             // verdict and quorum is met whenever the cluster is visible at all.
             out.push(outcome(
@@ -2082,6 +2119,157 @@ mod tests {
         assert!(matches!(v, Verdict::Unknown(_)));
     }
 
+    mod sfdp_version {
+        use super::*;
+        use crate::sfdp::{Client, Floor, GossipNode, Requirement, Requirements};
+        use crate::snapshot::NodeVersion;
+
+        const ID: &str = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv";
+        const OTHER: &str = "2AKKnirWVZMhnzuwqpizw9SwfZjGpRFLx2zCCNtPWpbc";
+
+        fn config() -> Config {
+            Config::parse(&format!(
+                "[watchtower]\ncluster = \"mainnet-beta\"\n\
+                 [[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+                 [[endpoints]]\nname = \"b\"\nurl = \"https://b.example\"\n\
+                 [[validators]]\nidentity = \"{ID}\"\nlabel = \"fox\"\n"
+            ))
+            .unwrap()
+        }
+
+        /// Two remote endpoints and nothing local: a validator whose own RPC
+        /// port is off. bare_snapshot puts both at epoch 10.
+        fn remote_only() -> Vec<Snapshot> {
+            vec![bare_snapshot("a", Some(4_320_100)), bare_snapshot("b", Some(4_320_100))]
+        }
+
+        /// Floors in force at epoch 10, with Firedancer's raised at epoch 11.
+        fn schedule() -> Requirements {
+            let floor = |epoch, client, floor| Requirement { epoch, client, floor, inherited: true };
+            let min = |s: &str| Floor::Min(semver::Version::parse(s).unwrap());
+            Requirements {
+                cluster: "mainnet-beta".into(),
+                entries: vec![
+                    floor(10, Client::Agave, min("4.4.0")),
+                    floor(10, Client::Frankendancer, Floor::NotAllowed),
+                    floor(10, Client::Firedancer, min("26.10.6")),
+                    floor(11, Client::Firedancer, min("26.10.8")),
+                ],
+            }
+        }
+
+        fn gossip(identity: &str, version: &str, client_id: &str) -> HashMap<String, GossipNode> {
+            HashMap::from([(
+                identity.to_string(),
+                GossipNode { version: version.into(), client_id: Some(client_id.into()) },
+            )])
+        }
+
+        fn verdict(out: &[CheckOutcome], id: &str) -> Verdict {
+            out.iter().find(|o| o.id == id).unwrap_or_else(|| panic!("no {id}")).verdict.clone()
+        }
+
+        fn message(v: Verdict) -> String {
+            match v {
+                Verdict::Unhealthy(m) | Verdict::Unknown(m) => m,
+                Verdict::Healthy => panic!("healthy has no message"),
+            }
+        }
+
+        /// The case this exists for: Firedancer with RPC off. The version comes
+        /// from gossip and is held to Firedancer's floor, not Agave's.
+        #[test]
+        fn a_validator_with_no_local_rpc_is_judged_from_gossip() {
+            let out = evaluate_sfdp(
+                &remote_only(), &config(), Some(&schedule()), &gossip(ID, "26.10.8", "Firedancer"),
+            );
+            assert!(matches!(verdict(&out, "sfdp_version_critical:fox"), Verdict::Healthy));
+            assert!(matches!(verdict(&out, "sfdp_version_warn:fox"), Verdict::Healthy));
+        }
+
+        #[test]
+        fn firedancer_below_its_own_floor_pages() {
+            let out = evaluate_sfdp(
+                &remote_only(), &config(), Some(&schedule()), &gossip(ID, "26.10.5", "Firedancer"),
+            );
+            let m = message(verdict(&out, "sfdp_version_critical:fox"));
+            assert!(m.contains("firedancer 26.10.5") && m.contains(">= 26.10.6"), "{m}");
+            assert!(matches!(verdict(&out, "sfdp_version_warn:fox"), Verdict::Healthy));
+        }
+
+        /// 26.10.6 would pass any Agave floor; against Firedancer's it warns.
+        #[test]
+        fn firedancer_below_next_epochs_floor_warns() {
+            let out = evaluate_sfdp(
+                &remote_only(), &config(), Some(&schedule()), &gossip(ID, "26.10.6", "Firedancer"),
+            );
+            assert!(matches!(verdict(&out, "sfdp_version_critical:fox"), Verdict::Healthy));
+            let m = message(verdict(&out, "sfdp_version_warn:fox"));
+            assert!(m.contains("firedancer 26.10.6") && m.contains(">= 26.10.8"), "{m}");
+        }
+
+        #[test]
+        fn a_client_the_program_does_not_allow_pages() {
+            let out = evaluate_sfdp(
+                &remote_only(), &config(), Some(&schedule()), &gossip(ID, "0.101.40300", "Frankendancer"),
+            );
+            let m = message(verdict(&out, "sfdp_version_critical:fox"));
+            assert!(m.contains("frankendancer 0.101.40300") && m.contains("does not allow"), "{m}");
+        }
+
+        #[test]
+        fn an_agave_fork_is_held_to_the_agave_floor() {
+            let out = evaluate_sfdp(
+                &remote_only(), &config(), Some(&schedule()), &gossip(ID, "4.3.0", "JitoLabs"),
+            );
+            let m = message(verdict(&out, "sfdp_version_critical:fox"));
+            assert!(m.contains("agave 4.3.0") && m.contains(">= 4.4.0"), "{m}");
+        }
+
+        /// Neither gossip nor a local node knows: Unknown, never a guess.
+        #[test]
+        fn a_validator_nobody_reports_is_unknown() {
+            let out = evaluate_sfdp(&remote_only(), &config(), Some(&schedule()), &HashMap::new());
+            let v = verdict(&out, "sfdp_version_critical:fox");
+            assert!(matches!(v, Verdict::Unknown(_)), "{v:?}");
+            assert!(message(v).contains("gossip"));
+        }
+
+        /// Gossip can be empty for a while; the local node still answers for
+        /// itself, read as Agave or Firedancer by the shape of its version.
+        #[test]
+        fn the_local_node_is_the_fallback() {
+            let mut snaps = remote_only();
+            snaps[0].identity = Some(ID.into());
+            snaps[0].version = Some(NodeVersion { solana_core: "4.3.0".into(), feature_set: 0 });
+            let out = evaluate_sfdp(&snaps, &config(), Some(&schedule()), &HashMap::new());
+            let m = message(verdict(&out, "sfdp_version_critical:fox"));
+            assert!(m.contains("agave 4.3.0"), "{m}");
+        }
+
+        /// What gossip announces outranks the local node: after a failover the
+        /// identity is running somewhere else.
+        #[test]
+        fn gossip_outranks_the_local_node() {
+            let mut snaps = remote_only();
+            snaps[0].identity = Some(ID.into());
+            snaps[0].version = Some(NodeVersion { solana_core: "4.3.0".into(), feature_set: 0 });
+            let out = evaluate_sfdp(&snaps, &config(), Some(&schedule()), &gossip(ID, "4.4.0", "Agave"));
+            assert!(matches!(verdict(&out, "sfdp_version_critical:fox"), Verdict::Healthy));
+        }
+
+        /// A local node that is some other validator says nothing about this
+        /// one, and its build must not be reported as this one's.
+        #[test]
+        fn another_validators_local_node_is_not_evidence() {
+            let mut snaps = remote_only();
+            snaps[0].identity = Some(OTHER.into());
+            snaps[0].version = Some(NodeVersion { solana_core: "4.3.0".into(), feature_set: 0 });
+            let out = evaluate_sfdp(&snaps, &config(), Some(&schedule()), &HashMap::new());
+            assert!(out.is_empty(), "{:?}", out.iter().map(|o| &o.id).collect::<Vec<_>>());
+        }
+    }
+
     mod orphans {
         use super::*;
 
@@ -2108,7 +2296,7 @@ mod tests {
             let snaps = vec![bare_snapshot("a", Some(4_320_100)), bare_snapshot("localhost", Some(4_320_100))];
             let mut out = evaluate(&snaps, &c, &mut Progress::default());
             out.extend(evaluate_nodes(&snaps, &c));
-            out.extend(evaluate_sfdp(&snaps, &c, None));
+            out.extend(evaluate_sfdp(&snaps, &c, None, &HashMap::new()));
             out.extend(evaluate_peers(&[peer_status("hub", false, None)], &snaps, &c, Duration::from_secs(300), &HashMap::new(), 0));
             // Exact on purpose: a new check kind changes this count, and whoever
             // adds it must also teach still_configured about it.

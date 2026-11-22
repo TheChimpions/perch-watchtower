@@ -104,7 +104,7 @@ Report vulnerabilities privately through the repository's Security tab.
 | `skip_rate`                         | notify / page | 20m            | leader slots assigned vs blocks produced                                   |
 | `vote_admission`                    | notify / page | 10m            | Alpenglow: BLS key and VAT balance for the next epoch boundary             |
 | `commission_changed`                | page          | immediate      | an unexpected change is a hijacked-identity signal                         |
-| `sfdp_version`                      | notify / page | —              | below the delegation program's minimum version                             |
+| `sfdp_version`                      | notify / page | —              | below the delegation program's minimum version for its client              |
 | `vault_invoices`                    | notify / page | 15m            | unpaid Vault invoices: 6 notify, 9 page, removal at 10                     |
 | `jpool_bond`                        | notify / page | 15m            | below JPool's security requirement, or under a week of runway              |
 | `node_behind`                       | page          | 15m            | a node _you operate_ lagging or unreachable                                |

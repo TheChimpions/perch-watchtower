@@ -402,14 +402,17 @@ severity = "page"
 renotify_after = "0s"
 warn_epochs = 3
 
+# The validator's version and client (Agave, Frankendancer, Firedancer) are read
+# from gossip through any endpoint, so this works with the validator's own RPC
+# port closed, and each client is held to its own floor in the schedule.
 [checks.sfdp_version]
 enabled = true
 pending_for = "0s"
 clear_after = 1
 severity = "page"
 renotify_after = "6h"
-# Re-fetch this often; once per epoch would notice a mid-epoch announcement up
-# to two days late. Floored at 5m.
+# Re-fetch the schedule and the gossip listing this often; once per epoch would
+# notice a mid-epoch announcement up to two days late. Floored at 5m.
 poll_interval = "1h"
 # Telegram note whenever the schedule changes at all. Every box on a cluster
 # sees the same schedule, so enable this on ONE box per cluster.

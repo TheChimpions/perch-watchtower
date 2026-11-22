@@ -1384,18 +1384,30 @@ pub fn evaluate_advisories(
 
     let mut out = Vec::new();
     for snap in snapshots {
+        let mitigated = config
+            .hosts
+            .iter()
+            .find(|h| h.name == snap.host)
+            .map(|h| h.mitigated.as_slice())
+            .unwrap_or(&[]);
         for adv in &config.advisories {
             let label = adv.label();
             let subject = format!("{} {}", snap.host, adv.id);
             let a = match &snap.error {
-                // The kernel and sysctl collectors are independent of the
-                // filesystem one, so "no mountpoint matched" still has facts.
-                Some(err) if err != crate::node_exporter::NOTHING_MATCHED => crate::advisory::Assessment {
-                    exposed: Verdict::unknown(format!("node_exporter unreachable: {err}")),
-                    upgrade: None,
-                    restore: None,
-                },
-                _ => crate::advisory::assess(&snap.host, adv, &snap.facts, tracked),
+                // A dead exporter only matters if it was the source of the
+                // kernel: for the machine perch is on, that is read directly.
+                // "No mountpoint matched" is a filesystem complaint and says
+                // nothing about the kernel facts.
+                Some(err)
+                    if err != crate::node_exporter::NOTHING_MATCHED && snap.facts.kernel_release.is_none() =>
+                {
+                    crate::advisory::Assessment {
+                        exposed: Verdict::unknown(format!("node_exporter unreachable: {err}")),
+                        upgrade: None,
+                        restore: None,
+                    }
+                }
+                _ => crate::advisory::assess(&snap.host, adv, &snap.facts, tracked, mitigated.contains(&adv.id)),
             };
             out.push(single(
                 format!("advisory_exposed:{subject}"),
@@ -1416,7 +1428,7 @@ pub fn evaluate_advisories(
             if let Some(v) = a.restore {
                 out.push(single(
                     format!("advisory_restore:{subject}"),
-                    format!("{} still has the {label} mitigation applied", snap.host),
+                    format!("{} is still marked mitigated for {label}", snap.host),
                     follow_up.clone(),
                     v,
                     None,
@@ -1579,16 +1591,11 @@ pub fn still_configured(id: &str, config: &Config) -> bool {
                     config.hosts.iter().any(|x| x.name == h && x.mountpoints.iter().any(|p| p == m))
                 })
         }
-        // Subjects are "<host> <advisory id>". The follow-ups only exist for an
-        // advisory that declares a mitigation.
+        // Subjects are "<host> <advisory id>".
         "advisory_exposed" | "advisory_upgrade" | "advisory_restore" => {
             c.host_advisory.base.enabled
                 && subject.and_then(|s| s.split_once(' ')).is_some_and(|(h, id)| {
-                    config.hosts.iter().any(|x| x.name == h)
-                        && config
-                            .advisories
-                            .iter()
-                            .any(|a| a.id == id && (kind == "advisory_exposed" || a.mitigation.is_some()))
+                    config.hosts.iter().any(|x| x.name == h) && config.advisories.iter().any(|a| a.id == id)
                 })
         }
         "node_behind" => {
@@ -2232,22 +2239,86 @@ mod tests {
             assert!(firing(snap("6.8.0-151-generic", 1.0, None)).is_empty());
         }
 
-        /// An exporter that cannot be reached must not read as exposed, and
-        /// must not read as fine; one that answered with no matching
-        /// mountpoint still told us the kernel.
+        /// An exporter that cannot be reached, on a host whose kernel perch
+        /// has no other way to learn, must not read as exposed or as fine.
         #[test]
-        fn an_unreachable_exporter_is_unknown() {
+        fn an_unreachable_remote_exporter_is_unknown() {
             let c = config(ADVISORY);
-            let out = verdicts(snap("6.8.0-54-generic", 1.0, Some("connection refused")), &c);
-            // One check per advisory, so a dead exporter is one "cannot be
-            // evaluated" note for each rather than three.
+            let mut down = snap("6.8.0-54-generic", 1.0, Some("connection refused"));
+            down.facts = HostFacts::default();
+            let out = verdicts(down, &c);
+            // One check per advisory, so it is one "cannot be evaluated" note
+            // for each rather than three.
             assert_eq!(out.len(), c.advisories.len());
             assert!(out.iter().all(|(id, v, _)| id.starts_with("advisory_exposed:")
                 && matches!(v, Verdict::Unknown(m) if m.contains("unreachable"))));
+        }
 
-            let out = verdicts(snap("6.8.0-54-generic", 1.0, Some(NOTHING_MATCHED)), &c);
-            let noisy = out.iter().find(|(id, _, _)| id == "advisory_exposed:hw CVE-2026-99288").unwrap();
-            assert!(matches!(&noisy.1, Verdict::Unhealthy(_)));
+        /// On the machine perch runs on, the kernel is read directly, so a
+        /// dead exporter (or one that matched no mountpoint) changes nothing.
+        #[test]
+        fn the_local_kernel_is_judged_even_with_the_exporter_down() {
+            let c = config(ADVISORY);
+            for err in ["connection refused", NOTHING_MATCHED] {
+                let out = verdicts(snap("6.8.0-54-generic", 1.0, Some(err)), &c);
+                let noisy = out.iter().find(|(id, _, _)| id == "advisory_exposed:hw CVE-2026-99288").unwrap();
+                assert!(matches!(&noisy.1, Verdict::Unhealthy(_)), "{err}");
+            }
+        }
+
+        /// The fleet's layout: nothing exported but the kernel, the operator
+        /// applies the stopgap as root and then says so in the config.
+        #[test]
+        fn the_hosts_mitigated_list_is_what_clears_exposure() {
+            let blind = |release: &str| {
+                let mut s = snap(release, 1.0, None);
+                s.facts.sysctls.clear();
+                s
+            };
+            let firing = |c: &Config, s: HostSnapshot| -> Vec<String> {
+                verdicts(s, c)
+                    .into_iter()
+                    .filter(|(id, v, _)| id.ends_with("CVE-2026-99288") && matches!(v, Verdict::Unhealthy(_)))
+                    .map(|(id, _, _)| id)
+                    .collect()
+            };
+            let plain = config(ADVISORY);
+            let declared = Config::parse(&format!(
+                "[[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+                 [[endpoints]]\nname = \"b\"\nurl = \"https://b.example\"\n\
+                 [[validators]]\nidentity = \"2AKKnirWVZMhnzuwqpizw9SwfZjGpRFLx2zCCNtPWpbc\"\nlabel = \"v\"\n\
+                 [[hosts]]\nname = \"hw\"\nurl = \"http://127.0.0.1:9100/metrics\"\n\
+                 mitigated = [\"CVE-2026-99288\"]\n{ADVISORY}"
+            ))
+            .unwrap();
+
+            assert_eq!(firing(&plain, blind("6.8.0-54-generic")), ["advisory_exposed:hw CVE-2026-99288"]);
+            assert_eq!(firing(&declared, blind("6.8.0-54-generic")), ["advisory_upgrade:hw CVE-2026-99288"]);
+            assert_eq!(firing(&declared, blind("6.8.0-151-generic")), ["advisory_restore:hw CVE-2026-99288"]);
+            assert!(firing(&plain, blind("6.8.0-151-generic")).is_empty());
+        }
+
+        #[test]
+        fn a_loopback_host_is_this_machine_unless_told_otherwise() {
+            let host = |url: &str, local: &str| {
+                Config::parse(&format!(
+                    "[[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+                     [[endpoints]]\nname = \"b\"\nurl = \"https://b.example\"\n\
+                     [[validators]]\nidentity = \"2AKKnirWVZMhnzuwqpizw9SwfZjGpRFLx2zCCNtPWpbc\"\n\
+                     [[hosts]]\nname = \"hw\"\nurl = \"{url}\"\n{local}"
+                ))
+                .unwrap()
+                .hosts[0]
+                    .is_local()
+            };
+            assert!(host("http://127.0.0.1:9100/metrics", ""));
+            assert!(host("http://localhost:9100/metrics", ""));
+            assert!(host("http://[::1]:9100/metrics", ""));
+            assert!(!host("http://10.0.0.5:9100/metrics", ""));
+            assert!(!host("http://validator.internal:9100/metrics", ""));
+            // A tunnel to another machine's exporter terminates on loopback.
+            assert!(!host("http://127.0.0.1:19100/metrics", "local = false\n"));
+            assert!(host("http://10.0.0.5:9100/metrics", "local = true\n"));
         }
 
         #[test]
@@ -2319,10 +2390,6 @@ mod tests {
                 assert!(!still_configured(&id, &without), "{id}");
                 assert!(!still_configured(&format!("{kind}:gone CVE-2026-99288"), &with));
             }
-            // Dropping only the mitigation leaves exposure and retires the follow-ups.
-            let bare = config(&format!("[[advisories]]\nid = \"CVE-2026-99288\"\nfixed_in = [\"6.8.0-151\"]\n{NO_BUILTIN}"));
-            assert!(still_configured("advisory_exposed:hw CVE-2026-99288", &bare));
-            assert!(!still_configured("advisory_restore:hw CVE-2026-99288", &bare));
         }
 
         #[test]

@@ -1,7 +1,9 @@
 # Kernel advisories built into perch.
 #
-# Every perch with [[hosts]] configured tracks these without being told to. An
-# operator adds their own with [[advisories]] in the config, replaces one of
+# Every perch with [[hosts]] configured tracks these without being told to,
+# reading only the kernel version, which needs no privilege. An operator who
+# has applied an advisory's stopgap lists its id under the host's `mitigated`.
+# They add their own with [[advisories]] in the config, replaces one of
 # these by declaring the same id, and drops one with
 # `[checks.host_advisory] ignore = ["<id>"]`.
 #
@@ -31,9 +33,9 @@ value = 0
 # TCP use-after-free reachable by a remote, unauthenticated peer through IPv4
 # header options. Ubuntu rates it critical.
 #
-# No `mitigation` on purpose: the stopgap that closes the remote path is a
-# firewall rule, and a node_exporter scrape cannot show one. Tracking only the
-# two sysctls would let perch call a box mitigated when it is not.
+# No `mitigation` table: the stopgap that closes the remote path is a firewall
+# rule, not one sysctl. The operator applies the steps in `note` and lists the
+# id under the host's `mitigated`.
 [[advisories]]
 id = "CVE-2026-98432"
 name = "TCP IPv4 options use-after-free"
@@ -41,4 +43,4 @@ name = "TCP IPv4 options use-after-free"
 fixed_in = ["5.10.272", "5.15.223", "6.1.190", "6.6.159", "6.12.113", "6.18.56", "7.2.10"]
 tracker = "ubuntu"
 url = "https://ubuntu.com/security/CVE-2026-98432"
-note = "Until then, drop inbound TCP packets that carry IPv4 options at the firewall, and set net.mptcp.enabled=0 and net.ipv4.tcp_migrate_req=0; perch cannot see firewall rules, so it does not check these."
+note = "Until it is running, drop inbound TCP packets that carry IPv4 options at the firewall, and set net.mptcp.enabled=0 and net.ipv4.tcp_migrate_req=0."

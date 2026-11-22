@@ -94,6 +94,43 @@ pub struct HostFacts {
 }
 
 impl HostFacts {
+    /// The same facts read from the machine perch itself runs on: `uname(2)`
+    /// and `/etc/os-release`. Both are open to any unprivileged process and
+    /// stay readable inside the systemd sandbox, so a perch on the validator
+    /// box needs no exporter flag, and nothing with more access than it has,
+    /// to know what kernel it is under. Sysctls are deliberately absent: the
+    /// sandbox hides `/proc/sys`, and that is not worth loosening.
+    pub fn local() -> Self {
+        let mut facts = Self::default();
+        if let Some((sysname, release, version)) = uname() {
+            if sysname == "Linux" {
+                facts.kernel_release = Some(release).filter(|s| !s.is_empty());
+                facts.kernel_version = Some(version).filter(|s| !s.is_empty());
+            }
+        }
+        if facts.kernel_release.is_some() {
+            if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
+                (facts.os_id, facts.os_codename) = parse_os_release(&text);
+            }
+        }
+        facts
+    }
+
+    /// Takes from `other` whatever this one lacks. What the exporter reported
+    /// stays: it is the host's own account of itself.
+    pub fn fill_from(&mut self, other: &Self) {
+        // The kernel and its build tag travel together; mixing one source's
+        // release with another's version would describe no real kernel.
+        if self.kernel_release.is_none() {
+            self.kernel_release = other.kernel_release.clone();
+            self.kernel_version = other.kernel_version.clone();
+        }
+        if self.os_id.is_none() {
+            self.os_id = other.os_id.clone();
+            self.os_codename = other.os_codename.clone();
+        }
+    }
+
     /// By `/etc/os-release`, or failing that by the kernel's own build tag.
     pub fn is_ubuntu(&self) -> bool {
         self.os_id.as_deref() == Some("ubuntu")
@@ -124,6 +161,9 @@ pub struct Host {
     pub mountpoints: Vec<String>,
     client: reqwest::Client,
     attempts: u32,
+    /// This host is the machine perch runs on, so what the exporter does not
+    /// say about the kernel can be read directly.
+    local: bool,
 }
 
 impl Host {
@@ -144,10 +184,27 @@ impl Host {
             mountpoints,
             client,
             attempts: attempts.max(1),
+            local: false,
         })
     }
 
+    pub fn on_this_machine(mut self, local: bool) -> Self {
+        self.local = local;
+        self
+    }
+
+    /// The scrape, plus, for the machine perch is on, the kernel facts the
+    /// exporter left out. Those are filled in even when the scrape failed: a
+    /// dead exporter does not make the local kernel unknowable.
     pub async fn scrape(&self) -> HostSnapshot {
+        let mut snap = self.scrape_exporter().await;
+        if self.local {
+            snap.facts.fill_from(&HostFacts::local());
+        }
+        snap
+    }
+
+    async fn scrape_exporter(&self) -> HostSnapshot {
         let mut last = String::from("no attempt made");
 
         for attempt in 0..self.attempts {
@@ -301,6 +358,47 @@ pub(crate) fn parse_line(line: &str) -> Option<(String, HashMap<String, String>,
         }
     };
     rest.parse::<f64>().ok().map(|v| (name, HashMap::new(), v))
+}
+
+/// `(sysname, release, version)` from uname(2).
+///
+/// The only `unsafe` in perch. `uname` fills a caller-provided struct of
+/// fixed-size, NUL-terminated arrays and has no other effect; it needs no
+/// privilege and is in systemd's `@system-service` set. `/proc/sys/kernel`
+/// would say the same without `unsafe`, but the sandbox hides it.
+#[cfg(unix)]
+fn uname() -> Option<(String, String, String)> {
+    // SAFETY: `utsname` is plain arrays of c_char, for which all-zero is a
+    // valid value, and `uname` writes NUL-terminated strings into it.
+    let u = unsafe {
+        let mut u: libc::utsname = std::mem::zeroed();
+        if libc::uname(&mut u) != 0 {
+            return None;
+        }
+        u
+    };
+    let text = |field: &[libc::c_char]| {
+        let bytes: Vec<u8> = field.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Some((text(&u.sysname), text(&u.release), text(&u.version)))
+}
+
+#[cfg(not(unix))]
+fn uname() -> Option<(String, String, String)> {
+    None
+}
+
+/// `ID` and `VERSION_CODENAME` from os-release(5).
+pub fn parse_os_release(text: &str) -> (Option<String>, Option<String>) {
+    let field = |key: &str| {
+        text.lines()
+            .filter_map(|l| l.trim().split_once('='))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+            .filter(|v| !v.is_empty())
+    };
+    (field("ID"), field("VERSION_CODENAME"))
 }
 
 /// The kernel, distribution and exported sysctls from one scrape.
@@ -566,6 +664,56 @@ node_cpu_seconds_total{cpu="0",mode="idle"} 12345.67
     fn collectors_that_are_off_leave_the_facts_empty() {
         assert_eq!(parse_facts(SAMPLE), HostFacts::default());
         assert_eq!(parse_facts("node_uname_info{release=\"\"} 1\n").kernel_release, None);
+    }
+
+    #[test]
+    fn os_release_is_read_quoted_or_not() {
+        let ubuntu = "PRETTY_NAME=\"Ubuntu 24.04.2 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\n\
+                      VERSION_CODENAME=noble\nID=ubuntu\nID_LIKE=debian\n";
+        assert_eq!(parse_os_release(ubuntu), (Some("ubuntu".into()), Some("noble".into())));
+        // ID_LIKE must not be mistaken for ID, and quotes are optional.
+        let rocky = "NAME=\"Rocky Linux\"\nID_LIKE=\"rhel centos fedora\"\nID=\"rocky\"\n";
+        assert_eq!(parse_os_release(rocky), (Some("rocky".into()), None));
+        assert_eq!(parse_os_release(""), (None, None));
+    }
+
+    /// The exporter's account wins where it gave one; the local read only
+    /// fills what is missing, and never half a kernel.
+    #[test]
+    fn local_facts_fill_gaps_without_overriding_the_exporter() {
+        let local = HostFacts {
+            kernel_release: Some("6.8.0-149-generic".into()),
+            kernel_version: Some("#149-Ubuntu SMP".into()),
+            os_id: Some("ubuntu".into()),
+            os_codename: Some("noble".into()),
+            sysctls: HashMap::new(),
+        };
+        let mut empty = HostFacts::default();
+        empty.fill_from(&local);
+        assert_eq!(empty, local);
+
+        let mut partial = HostFacts {
+            kernel_release: Some("6.8.0-54-generic".into()),
+            kernel_version: None,
+            sysctls: HashMap::from([("net_ipv4_tcp_syncookies".to_string(), 0.0)]),
+            ..Default::default()
+        };
+        partial.fill_from(&local);
+        assert_eq!(partial.kernel_release.as_deref(), Some("6.8.0-54-generic"));
+        assert_eq!(partial.kernel_version, None, "a version from another kernel must not be attached");
+        assert_eq!(partial.os_codename.as_deref(), Some("noble"));
+        assert_eq!(partial.sysctl("net.ipv4.tcp_syncookies"), Some(0.0));
+    }
+
+    /// Whatever this test runs on, reading it must not fail or invent a
+    /// distribution for a kernel it could not identify.
+    #[test]
+    fn reading_this_machine_never_half_answers() {
+        let f = HostFacts::local();
+        if f.kernel_release.is_none() {
+            assert_eq!(f, HostFacts::default());
+        }
+        assert!(f.sysctls.is_empty());
     }
 
     #[test]

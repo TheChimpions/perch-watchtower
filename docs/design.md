@@ -186,15 +186,19 @@ which can happen with space to spare.
 A few times a year a kernel bug needs every operator to act the same day, and
 the hard part is not hearing about it but knowing a week later which box never
 got the stopgap and which has had the fix sitting unbooted. perch tracks each
-host through that, from the node_exporter scrape it already makes.
+host through that from the one thing it can read without privilege, the
+running kernel version.
 
 Which bugs is a curated list, compiled into the binary and extended from the
 config, rather than a CVE feed. Ubuntu's tracker lists over three thousand
 high-priority kernel CVEs for 24.04 and rated NoisyTCP "medium": a feed would
 be ignored within a week and would have missed the one that mattered. And
-perch only claims what it can see. A stopgap it cannot observe, such as a
-firewall rule, is carried as text in the alert, and the box stays "exposed"
-until the fixed kernel is running. Details in
+perch only claims what it can see. A stopgap is a sysctl or a firewall rule,
+and seeing either would mean loosening the sandbox or running something as
+root, which is the wrong trade for a process that sits next to a validator. So
+the operator applies the stopgap and declares it, with `mitigated` on the host,
+and perch tracks the rest: the box is "exposed" until it is declared or
+patched, and the declaration is flagged once a fixed kernel makes it stale. Details in
 [deployment.md](deployment.md#kernel-advisories).
 
 ### One page, even across layers

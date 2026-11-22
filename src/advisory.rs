@@ -16,23 +16,27 @@
 //! few kernel bugs every validator operator was asked to act on, so a box is
 //! tracked against them by upgrading perch and nothing else. `[[advisories]]`
 //! in the config adds to it, and replaces a built-in entry of the same id.
-//! Nothing is fetched to build the list, and nothing on the host is given
-//! more access to produce it: perch still only reads a node_exporter scrape.
+//! Nothing is fetched to build the list.
 //!
 //! For a declared advisory, each host is in one of three actionable states,
 //! one check each:
 //!
-//! - **exposed**: the running kernel lacks the fix and the mitigation is not
-//!   applied.
-//! - **upgrade**: mitigated, but a fixed kernel now exists and is not the one
-//!   running.
-//! - **restore**: the fix is running and the mitigation is still applied.
+//! - **exposed**: the running kernel lacks the fix and the host is not marked
+//!   mitigated.
+//! - **upgrade**: marked mitigated, but a fixed kernel now exists and is not
+//!   the one running.
+//! - **restore**: the fix is running and the host is still marked mitigated.
 //!
-//! Everything is read from the node_exporter scrape perch already makes. A
-//! collector that is not enabled is `Unknown` with the flag to add, never
-//! "fine". Where the fix landed comes from `fixed_in`, and for Ubuntu hosts
-//! optionally from Ubuntu's own tracker, which is what turns "as soon as your
-//! distribution ships one" into a notification.
+//! perch sees the kernel and nothing else. On the machine it runs on that is
+//! `uname(2)` and `/etc/os-release`; for a remote host, the node_exporter
+//! scrape. It does not see whether a mitigation is applied: a firewall rule
+//! needs root to list, `/proc/sys` is hidden by perch's own sandbox, and a
+//! watchtower that asked for either would be a worse thing to run next to a
+//! validator. The operator applies the mitigation and lists the advisory under
+//! the host's `mitigated`; that declaration is what moves a host from exposed
+//! to waiting for a kernel. Where the fix landed comes from `fixed_in`, and
+//! for Ubuntu hosts from Ubuntu's own tracker, which is what turns "as soon
+//! as your distribution ships one" into a notification.
 
 use crate::{
     config::{AdvisoryConfig, AdvisoryTracker},
@@ -334,29 +338,9 @@ pub fn patch_state(adv: &AdvisoryConfig, facts: &HostFacts, tracked: &Tracked) -
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum Mitigation {
-    NotDeclared,
-    Applied,
-    NotApplied(f64),
-    /// Declared, but node_exporter does not export the sysctl.
-    Unseen,
-}
-
-fn mitigation_state(adv: &AdvisoryConfig, facts: &HostFacts) -> Mitigation {
-    let Some(m) = &adv.mitigation else {
-        return Mitigation::NotDeclared;
-    };
-    match facts.sysctl(&m.sysctl) {
-        None => Mitigation::Unseen,
-        Some(v) if v == m.value as f64 => Mitigation::Applied,
-        Some(v) => Mitigation::NotApplied(v),
-    }
-}
-
 /// The three verdicts for one advisory on one host. `upgrade` and `restore`
-/// only exist for an advisory with a mitigation: without one, `exposed` is the
-/// whole story.
+/// are absent only while the kernel itself cannot be judged: three checks
+/// repeating one reason would be three "cannot be evaluated" notes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Assessment {
     pub exposed: Verdict,
@@ -364,105 +348,128 @@ pub struct Assessment {
     pub restore: Option<Verdict>,
 }
 
-pub fn assess(host: &str, adv: &AdvisoryConfig, facts: &HostFacts, tracked: &Tracked) -> Assessment {
-    let label = adv.label();
-    let release = facts.kernel_release.as_deref().unwrap_or("?");
-    let see = adv.url.as_ref().map(|u| format!(" See {u}")).unwrap_or_default();
-    // What to do meanwhile only matters while the fix is not running.
-    let more = format!("{}{see}", adv.note.as_ref().map(|n| format!(" {n}")).unwrap_or_default());
-    let (name, want) = adv
-        .mitigation
-        .as_ref()
-        .map(|m| (m.sysctl.as_str(), m.value))
-        .unwrap_or(("", 0));
-    let unseen = || {
-        Verdict::unknown(format!(
-            "node_exporter does not export {name}; start it with --collector.sysctl \
-             --collector.sysctl.include={name}"
-        ))
+/// `acknowledged` is the operator's word, from the host's `mitigated` list,
+/// that the temporary mitigation is in place.
+///
+/// perch can see a kernel version without help. It cannot see a firewall rule
+/// at all, or a sysctl from inside its sandbox, and it is not given the access
+/// that would change that. So a mitigation is something the operator applies
+/// and then declares. Where a node_exporter does export the sysctl, what it
+/// reports is believed over the declaration, in either direction.
+pub fn assess(
+    host: &str,
+    adv: &AdvisoryConfig,
+    facts: &HostFacts,
+    tracked: &Tracked,
+    acknowledged: bool,
+) -> Assessment {
+    let patch = match patch_state(adv, facts, tracked) {
+        Patch::Unknown(why) => {
+            return Assessment {
+                exposed: Verdict::unknown(why),
+                upgrade: None,
+                restore: None,
+            }
+        }
+        known => known,
     };
 
-    match (patch_state(adv, facts, tracked), mitigation_state(adv, facts)) {
-        // Only `exposed` carries it. Three checks reporting the same missing
-        // collector would be three "cannot be evaluated" notes for one flag.
-        (Patch::Unknown(why), _) => Assessment {
-            exposed: Verdict::unknown(why),
-            upgrade: None,
-            restore: None,
-        },
+    let label = adv.label();
+    let id = &adv.id;
+    let release = facts.kernel_release.as_deref().unwrap_or("?");
+    let see = adv.url.as_ref().map(|u| format!(" See {u}")).unwrap_or_default();
+    let note = adv.note.as_ref().map(|n| format!(" {n}")).unwrap_or_default();
+    let sysctl = adv.mitigation.as_ref().map(|m| (m.sysctl.as_str(), m.value));
+    // The live value, where an exporter reports it.
+    let observed = adv
+        .mitigation
+        .as_ref()
+        .and_then(|m| facts.sysctl(&m.sysctl).map(|v| (v == m.value as f64, v)));
+    let applied = observed.map_or(acknowledged, |(applied, _)| applied);
+    let healthy = Some(Verdict::Healthy);
 
-        (Patch::Fixed(_) | Patch::NotAffected, Mitigation::NotDeclared) => Assessment {
+    match patch {
+        Patch::Unknown(_) => unreachable!("returned above"),
+
+        Patch::Fixed(_) | Patch::NotAffected if !applied => Assessment {
             exposed: Verdict::Healthy,
-            upgrade: None,
-            restore: None,
+            upgrade: healthy.clone(),
+            restore: healthy,
         },
-        (patch @ (Patch::Fixed(_) | Patch::NotAffected), m) => {
+        patch @ (Patch::Fixed(_) | Patch::NotAffected) => {
             let why = match patch {
                 Patch::Fixed(by) => format!("has the fix for {label} ({by})"),
                 _ => format!("is not affected by {label}"),
             };
+            let delist = if acknowledged {
+                format!(" Then remove {id} from this host's `mitigated` list.")
+            } else {
+                String::new()
+            };
+            let undo = match (observed, sysctl) {
+                (Some(_), Some((name, want))) => format!(
+                    "but {name} is still {want}, the temporary mitigation. Restore its previous value."
+                ),
+                (None, Some((name, want))) => format!(
+                    "and the config still marks it mitigated. Undo the temporary mitigation \
+                     ({name} = {want})."
+                ),
+                (_, None) => "and the config still marks it mitigated. Undo the temporary mitigation.".to_string(),
+            };
             Assessment {
                 exposed: Verdict::Healthy,
-                upgrade: Some(Verdict::Healthy),
-                restore: Some(match m {
-                    Mitigation::Applied => Verdict::unhealthy(format!(
-                        "{host} runs kernel {release}, which {why}, but {name} is still {want}, the \
-                         temporary mitigation. Restore its previous value.{see}"
-                    )),
-                    Mitigation::Unseen => unseen(),
-                    _ => Verdict::Healthy,
-                }),
+                upgrade: healthy,
+                restore: Some(Verdict::unhealthy(format!(
+                    "{host} runs kernel {release}, which {why}, {undo}{delist}{see}"
+                ))),
             }
         }
 
-        (Patch::Unpatched { fix }, Mitigation::NotDeclared) => Assessment {
-            exposed: Verdict::unhealthy(match fix {
-                Some(fix) => format!(
-                    "{host} runs kernel {release}, which is affected by {label}. The fix is in {fix}: \
-                     upgrade and reboot.{more}"
-                ),
-                None => format!(
-                    "{host} runs kernel {release}, which is affected by {label}, and no patched \
-                     kernel is listed for it yet.{more}"
-                ),
-            }),
-            upgrade: None,
-            restore: None,
-        },
-        (Patch::Unpatched { fix }, Mitigation::NotApplied(cur)) => Assessment {
-            exposed: Verdict::unhealthy(match fix {
-                Some(fix) => format!(
-                    "{host} runs kernel {release}, which is affected by {label}, and {name} is {cur}. \
-                     The fix is in {fix}: upgrade and reboot, or set {name} = {want} until you can.{more}"
-                ),
-                None => format!(
-                    "{host} runs kernel {release}, which is affected by {label}, and no patched \
-                     kernel is listed for it yet. {name} is {cur}; set it to {want} as the temporary \
-                     mitigation.{more}"
-                ),
-            }),
-            upgrade: Some(Verdict::Healthy),
-            restore: Some(Verdict::Healthy),
-        },
-        (Patch::Unpatched { fix }, m @ (Mitigation::Applied | Mitigation::Unseen)) => Assessment {
-            exposed: if m == Mitigation::Applied {
-                Verdict::Healthy
-            } else {
-                unseen()
-            },
+        Patch::Unpatched { fix } if applied => Assessment {
+            exposed: Verdict::Healthy,
             upgrade: Some(match fix {
-                Some(fix) if m == Mitigation::Applied => Verdict::unhealthy(format!(
-                    "{host} is mitigated against {label} ({name} = {want}) and a patched kernel now \
-                     exists: {fix}. It runs {release}. Upgrade and reboot, then restore {name}.{more}"
-                )),
                 Some(fix) => Verdict::unhealthy(format!(
-                    "{host} runs kernel {release}, which is affected by {label}. The fix is in {fix}: \
-                     upgrade and reboot.{more}"
+                    "{host} is mitigated against {label} and a patched kernel now exists: {fix}. It \
+                     runs {release}. Upgrade and reboot, then undo the mitigation.{see}"
                 )),
                 None => Verdict::Healthy,
             }),
-            restore: Some(Verdict::Healthy),
+            restore: healthy,
         },
+        Patch::Unpatched { fix } => {
+            let kernel = match &fix {
+                Some(fix) => format!(" The fix is in {fix}: upgrade and reboot."),
+                None => " No patched kernel is listed for it yet.".to_string(),
+            };
+            let stopgap = match (observed, sysctl) {
+                (Some((_, cur)), Some((name, want))) => {
+                    let claimed = if acknowledged {
+                        " The config marks this host mitigated, but that is not what it reports."
+                    } else {
+                        ""
+                    };
+                    format!(" {name} is {cur}; set it to {want} as the temporary mitigation.{claimed}")
+                }
+                (None, Some((name, want))) => format!(" Until it is running, set {name} = {want}."),
+                (_, None) => String::new(),
+            };
+            // Without something to read, the operator has to say when it is done.
+            let declare = if observed.is_none() {
+                format!(
+                    " perch cannot see whether that is done: once it is, add \"{id}\" to this \
+                     host's `mitigated` list."
+                )
+            } else {
+                String::new()
+            };
+            Assessment {
+                exposed: Verdict::unhealthy(format!(
+                    "{host} runs kernel {release}, which is affected by {label}.{kernel}{stopgap}{note}{declare}{see}"
+                )),
+                upgrade: healthy.clone(),
+                restore: healthy,
+            }
+        }
     }
 }
 
@@ -714,22 +721,29 @@ mod tests {
         assert_eq!(patch_from_fixed_in(&Kernel::parse("6.8.0-54-generic", None).unwrap(), &[]), None);
     }
 
-    /// The fleet on 2026-11-16: 24.04 on 6.8, SYN cookies on, Ubuntu not yet
-    /// shipping a fix.
+    /// What `assess` says for a host that does not export the sysctl, which
+    /// is every box whose exporter was left alone.
+    fn blind(kernel: (&str, &str)) -> HostFacts {
+        facts(kernel, None)
+    }
+
+    /// The fleet on 2026-11-18: 24.04 on 6.8, nothing exported but the
+    /// kernel, Ubuntu not yet shipping a fix.
     #[test]
-    fn unpatched_and_unmitigated_is_exposed() {
-        let a = assess("fox", &noisytcp(), &facts(NOBLE_54, Some(1.0)), &untriaged());
+    fn unpatched_and_not_marked_mitigated_is_exposed() {
+        let a = assess("fox", &noisytcp(), &blind(NOBLE_54), &untriaged(), false);
         let msg = unhealthy(&a.exposed);
         assert!(msg.contains("CVE-2026-99288 (NoisyTCP)"), "{msg}");
-        assert!(msg.contains("no patched kernel is listed"), "{msg}");
-        assert!(msg.contains("net.ipv4.tcp_syncookies is 1; set it to 0"), "{msg}");
+        assert!(msg.contains("No patched kernel is listed"), "{msg}");
+        assert!(msg.contains("set net.ipv4.tcp_syncookies = 0"), "{msg}");
+        assert!(msg.contains("add \"CVE-2026-99288\" to this host's `mitigated` list"), "{msg}");
         assert_eq!(a.upgrade, Some(Verdict::Healthy));
         assert_eq!(a.restore, Some(Verdict::Healthy));
     }
 
     #[test]
-    fn mitigated_with_no_fix_to_boot_is_quiet() {
-        let a = assess("fox", &noisytcp(), &facts(NOBLE_54, Some(0.0)), &untriaged());
+    fn marked_mitigated_with_no_fix_to_boot_is_quiet() {
+        let a = assess("fox", &noisytcp(), &blind(NOBLE_54), &untriaged(), true);
         assert_eq!(a.exposed, Verdict::Healthy);
         assert_eq!(a.upgrade, Some(Verdict::Healthy));
         assert_eq!(a.restore, Some(Verdict::Healthy));
@@ -737,28 +751,35 @@ mod tests {
 
     #[test]
     fn a_shipped_fix_asks_a_mitigated_box_to_upgrade() {
-        let a = assess("fox", &noisytcp(), &facts(NOBLE_54, Some(0.0)), &released("6.8.0-151.161"));
+        let a = assess("fox", &noisytcp(), &blind(NOBLE_54), &released("6.8.0-151.161"), true);
         assert_eq!(a.exposed, Verdict::Healthy);
         let msg = unhealthy(a.upgrade.as_ref().unwrap());
         assert!(msg.contains("linux 6.8.0-151.161") && msg.contains("6.8.0-54-generic"), "{msg}");
         assert_eq!(a.restore, Some(Verdict::Healthy));
 
-        // Unmitigated: one alert, not two, and it names both ways out.
-        let a = assess("fox", &noisytcp(), &facts(NOBLE_54, Some(1.0)), &released("6.8.0-151.161"));
-        assert!(unhealthy(&a.exposed).contains("upgrade and reboot, or set net.ipv4.tcp_syncookies = 0"));
+        // Not mitigated: one alert, not two, and it names both ways out.
+        let a = assess("fox", &noisytcp(), &blind(NOBLE_54), &released("6.8.0-151.161"), false);
+        let msg = unhealthy(&a.exposed);
+        assert!(msg.contains("upgrade and reboot.") && msg.contains("set net.ipv4.tcp_syncookies = 0"), "{msg}");
         assert_eq!(a.upgrade, Some(Verdict::Healthy));
     }
 
     #[test]
-    fn the_fixed_kernel_with_the_mitigation_left_on_asks_to_restore() {
+    fn the_fixed_kernel_still_marked_mitigated_asks_to_undo_it() {
         let fixed = ("6.8.0-151-generic", "#161-Ubuntu SMP PREEMPT_DYNAMIC");
-        let a = assess("fox", &noisytcp(), &facts(fixed, Some(0.0)), &released("6.8.0-151.161"));
+        let a = assess("fox", &noisytcp(), &blind(fixed), &released("6.8.0-151.161"), true);
         assert_eq!(a.exposed, Verdict::Healthy);
         assert_eq!(a.upgrade, Some(Verdict::Healthy));
-        assert!(unhealthy(a.restore.as_ref().unwrap()).contains("Restore its previous value"));
+        let msg = unhealthy(a.restore.as_ref().unwrap());
+        assert!(msg.contains("Undo the temporary mitigation (net.ipv4.tcp_syncookies = 0)"), "{msg}");
+        assert!(msg.contains("remove CVE-2026-99288 from this host's `mitigated` list"), "{msg}");
 
-        let a = assess("fox", &noisytcp(), &facts(fixed, Some(1.0)), &released("6.8.0-151.161"));
-        assert_eq!(a, Assessment { exposed: Verdict::Healthy, upgrade: Some(Verdict::Healthy), restore: Some(Verdict::Healthy) });
+        let quiet = Assessment {
+            exposed: Verdict::Healthy,
+            upgrade: Some(Verdict::Healthy),
+            restore: Some(Verdict::Healthy),
+        };
+        assert_eq!(assess("fox", &noisytcp(), &blind(fixed), &released("6.8.0-151.161"), false), quiet);
     }
 
     /// Same ABI, earlier upload: Ubuntu respins a kernel without bumping the
@@ -766,41 +787,58 @@ mod tests {
     #[test]
     fn the_upload_number_decides_within_one_abi() {
         let early = ("6.8.0-151-generic", "#160-Ubuntu SMP PREEMPT_DYNAMIC");
-        let a = assess("fox", &noisytcp(), &facts(early, Some(1.0)), &released("6.8.0-151.161"));
+        let a = assess("fox", &noisytcp(), &blind(early), &released("6.8.0-151.161"), false);
         assert!(matches!(a.exposed, Verdict::Unhealthy(_)));
     }
 
+    /// An exporter that does report the sysctl is believed over the config,
+    /// both ways: a declaration cannot hide a box that is visibly unmitigated,
+    /// and a visibly mitigated box needs no declaration.
     #[test]
-    fn what_cannot_be_seen_is_unknown_and_says_which_flag() {
+    fn an_exported_sysctl_outranks_the_declaration() {
+        let on = facts(NOBLE_54, Some(1.0));
+        let msg = unhealthy(&assess("fox", &noisytcp(), &on, &untriaged(), true).exposed).to_string();
+        assert!(msg.contains("net.ipv4.tcp_syncookies is 1; set it to 0"), "{msg}");
+        assert!(msg.contains("marks this host mitigated, but that is not what it reports"), "{msg}");
+        assert!(!msg.contains("perch cannot see"), "{msg}");
+
+        let off = facts(NOBLE_54, Some(0.0));
+        assert_eq!(assess("fox", &noisytcp(), &off, &untriaged(), false).exposed, Verdict::Healthy);
+
+        let fixed = ("6.8.0-151-generic", "#161-Ubuntu SMP PREEMPT_DYNAMIC");
+        let a = assess("fox", &noisytcp(), &facts(fixed, Some(0.0)), &released("6.8.0-151.161"), false);
+        let msg = unhealthy(a.restore.as_ref().unwrap());
+        assert!(msg.contains("is still 0, the temporary mitigation. Restore its previous value."), "{msg}");
+        assert!(!msg.contains("`mitigated` list"), "{msg}");
+    }
+
+    /// Not being able to see a sysctl is no longer a reason to say nothing:
+    /// only a kernel that cannot be placed is.
+    #[test]
+    fn only_an_unplaceable_kernel_is_unknown() {
         let unknown = |v: &Verdict| match v {
             Verdict::Unknown(m) => m.clone(),
             other => panic!("expected unknown, got {other:?}"),
         };
-        // No uname collector: fox_main and the other mainnet boxes today.
-        let a = assess("fox", &noisytcp(), &HostFacts::default(), &untriaged());
+        // A remote host whose exporter has no uname collector.
+        let a = assess("fox", &noisytcp(), &HostFacts::default(), &untriaged(), false);
         assert!(unknown(&a.exposed).contains("--collector.uname"));
-        // One check says so, not three: each would become its own "cannot
-        // be evaluated" note about the same missing flag.
+        // One check says so, not three.
         assert_eq!((a.upgrade, a.restore), (None, None));
 
-        // No sysctl collector.
-        let a = assess("fox", &noisytcp(), &facts(NOBLE_54, None), &untriaged());
-        assert!(unknown(&a.exposed).contains("--collector.sysctl.include=net.ipv4.tcp_syncookies"));
-        assert_eq!(a.upgrade, Some(Verdict::Healthy));
-
-        // No os collector, so no codename to look the kernel up under.
-        let mut f = facts(NOBLE_54, Some(1.0));
+        // An Ubuntu kernel with no release codename to look it up under.
+        let mut f = blind(NOBLE_54);
         f.os_id = None;
         f.os_codename = None;
-        assert!(unknown(&assess("fox", &noisytcp(), &f, &untriaged()).exposed).contains("--collector.os"));
+        assert!(unknown(&assess("fox", &noisytcp(), &f, &untriaged(), false).exposed).contains("--collector.os"));
 
         // Tracker not fetched: no claim either way.
-        let a = assess("fox", &noisytcp(), &facts(NOBLE_54, Some(1.0)), &Tracked::new());
+        let a = assess("fox", &noisytcp(), &blind(NOBLE_54), &Tracked::new(), false);
         assert!(unknown(&a.exposed).contains("not been fetched"));
 
         // A backport kernel the tracker row cannot be chosen for.
         let hwe = ("6.8.0-60-generic", "#63~22.04.1-Ubuntu SMP");
-        assert!(unknown(&assess("fox", &noisytcp(), &facts(hwe, Some(1.0)), &untriaged()).exposed).contains("fixed_in"));
+        assert!(unknown(&assess("fox", &noisytcp(), &blind(hwe), &untriaged(), false).exposed).contains("fixed_in"));
     }
 
     #[test]
@@ -808,27 +846,26 @@ mod tests {
         let mut adv = noisytcp();
         adv.fixed_in.push("6.8.0-60".into());
         let hwe = ("6.8.0-60-generic", "#63~22.04.1-Ubuntu SMP");
-        let a = assess("fox", &adv, &facts(hwe, Some(1.0)), &Tracked::new());
+        let a = assess("fox", &adv, &blind(hwe), &Tracked::new(), false);
         assert_eq!(a.exposed, Verdict::Healthy);
     }
 
     #[test]
-    fn without_a_tracker_or_mitigation_only_exposure_is_reported() {
+    fn upstream_kernels_are_judged_from_fixed_in_alone() {
         let adv = AdvisoryConfig { tracker: None, mitigation: None, ..noisytcp() };
         let debian = ("6.12.48+deb13-amd64", "#1 SMP PREEMPT_DYNAMIC Debian 6.12.48-1");
-        let a = assess("deb", &adv, &facts(debian, None), &Tracked::new());
+        let a = assess("deb", &adv, &blind(debian), &Tracked::new(), false);
         assert!(unhealthy(&a.exposed).contains("The fix is in 6.12.117"));
-        assert_eq!((a.upgrade, a.restore), (None, None));
 
-        let a = assess("deb", &adv, &facts(("6.12.117-amd64", "#1 SMP"), None), &Tracked::new());
+        let a = assess("deb", &adv, &blind(("6.12.117-amd64", "#1 SMP")), &Tracked::new(), false);
         assert_eq!(a.exposed, Verdict::Healthy);
     }
 
-    /// CVE-2026-98432: the stopgap is a firewall rule, which a node_exporter
-    /// scrape cannot show. perch must not call a box mitigated on a guess, so
-    /// the advisory declares no mitigation and carries the steps as a note.
+    /// CVE-2026-98432: the stopgap is a firewall rule. perch cannot see one,
+    /// so the advisory carries the steps as a note and the operator declares
+    /// them done.
     #[test]
-    fn a_stopgap_perch_cannot_see_is_a_note_not_a_mitigation() {
+    fn a_stopgap_perch_cannot_see_is_declared_not_guessed() {
         let adv = builtin().unwrap().into_iter().find(|a| a.id == "CVE-2026-98432").unwrap();
         assert!(adv.mitigation.is_none());
         let fixed = |codename: &str, v: &str| {
@@ -840,22 +877,29 @@ mod tests {
         };
         // fox_test on 2026-11-18: 6.8.0-85, with the fix in 6.8.0-149.149.
         let old = ("6.8.0-85-generic", "#85-Ubuntu SMP PREEMPT_DYNAMIC");
-        let a = assess("fox", &adv, &facts(old, None), &fixed("noble", "6.8.0-149.149"));
+        let noble = fixed("noble", "6.8.0-149.149");
+        let a = assess("fox", &adv, &blind(old), &noble, false);
         let msg = unhealthy(&a.exposed);
         assert!(msg.contains("The fix is in linux 6.8.0-149.149: upgrade and reboot."), "{msg}");
-        assert!(msg.contains("IPv4 options") && msg.contains("perch cannot see"), "{msg}");
-        assert_eq!((a.upgrade, a.restore), (None, None));
+        assert!(msg.contains("IPv4 options"), "{msg}");
+        assert!(msg.contains("add \"CVE-2026-98432\" to this host's `mitigated` list"), "{msg}");
+
+        // Declared mitigated: no longer exposed, still told the fix is out.
+        let a = assess("fox", &adv, &blind(old), &noble, true);
+        assert_eq!(a.exposed, Verdict::Healthy);
+        assert!(unhealthy(a.upgrade.as_ref().unwrap()).contains("a patched kernel now exists"));
 
         // failover, on the fixed build, and mind_test on 26.04.
         let new = ("6.8.0-149-generic", "#149-Ubuntu SMP PREEMPT_DYNAMIC");
-        assert_eq!(assess("failover", &adv, &facts(new, None), &fixed("noble", "6.8.0-149.149")).exposed, Verdict::Healthy);
-        let mut resolute = facts(("7.0.0-43-generic", "#43-Ubuntu SMP PREEMPT_DYNAMIC"), None);
+        assert_eq!(assess("failover", &adv, &blind(new), &noble, false).exposed, Verdict::Healthy);
+        let mut resolute = blind(("7.0.0-43-generic", "#43-Ubuntu SMP PREEMPT_DYNAMIC"));
         resolute.os_codename = Some("resolute".into());
-        assert_eq!(assess("mind", &adv, &resolute, &fixed("resolute", "7.0.0-43.43")).exposed, Verdict::Healthy);
+        let a = assess("mind", &adv, &resolute, &fixed("resolute", "7.0.0-43.43"), false);
+        assert_eq!(a.exposed, Verdict::Healthy);
 
         // Upstream numbering, from fixed_in alone.
         let adv = AdvisoryConfig { tracker: None, ..adv };
-        let stable = |rel: &str| assess("deb", &adv, &facts((rel, "#1 SMP"), None), &Tracked::new()).exposed;
+        let stable = |rel: &str| assess("deb", &adv, &blind((rel, "#1 SMP")), &Tracked::new(), false).exposed;
         assert!(matches!(stable("6.12.112"), Verdict::Unhealthy(_)));
         assert_eq!(stable("6.12.113"), Verdict::Healthy);
         assert_eq!(stable("7.3.0"), Verdict::Healthy);
@@ -863,8 +907,8 @@ mod tests {
 
     #[test]
     fn tracker_statuses_map_conservatively() {
-        let k = facts(NOBLE_54, Some(1.0));
-        let exposed = |t: &Tracked| assess("fox", &noisytcp(), &k, t).exposed;
+        let k = blind(NOBLE_54);
+        let exposed = |t: &Tracked| assess("fox", &noisytcp(), &k, t, false).exposed;
         assert_eq!(exposed(&tracked(r#"{"status":"not-affected","description":"6.5.0-9.9"}"#)), Verdict::Healthy);
         assert!(matches!(exposed(&tracked(r#"{"status":"needed","description":""}"#)), Verdict::Unhealthy(_)));
         // "ignored" and "DNE" describe the package, not the fix.

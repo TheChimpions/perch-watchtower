@@ -397,6 +397,31 @@ pub struct HostConfig {
     pub timeout: Duration,
     #[serde(default = "default_host_attempts")]
     pub attempts: u32,
+    /// Advisory ids whose temporary mitigation has been applied on this host.
+    /// perch cannot see a firewall rule or, from inside its sandbox, a sysctl,
+    /// and it is not given the access that would let it. The operator who
+    /// applied the mitigation says so here; perch then stops reporting the
+    /// host as exposed, and says when a fixed kernel makes the entry obsolete.
+    #[serde(default)]
+    pub mitigated: Vec<String>,
+    /// Whether this host is the machine perch runs on, so that the kernel can
+    /// be read directly when node_exporter does not report it. Unset, a
+    /// loopback `url` is taken to mean yes. Set it to false for an exporter on
+    /// another machine reached through a tunnel on localhost.
+    #[serde(default)]
+    pub local: Option<bool>,
+}
+
+impl HostConfig {
+    pub fn is_local(&self) -> bool {
+        self.local.unwrap_or_else(|| {
+            let url = reqwest::Url::parse(&self.url).ok();
+            let host = url.as_ref().and_then(|u| u.host_str()).unwrap_or("");
+            // An IPv6 literal comes back in brackets.
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        })
+    }
 }
 
 /// A kernel vulnerability the operator wants every `[[hosts]]` entry tracked
@@ -428,7 +453,8 @@ pub struct AdvisoryConfig {
     /// `mitigation` instead.
     #[serde(default)]
     pub note: Option<String>,
-    /// The temporary measure for kernels without the fix.
+    /// The temporary measure for kernels without the fix, when it is a sysctl.
+    /// Named in the alert; checked only where an exporter reports the value.
     #[serde(default)]
     pub mitigation: Option<AdvisoryMitigation>,
 }
@@ -1846,6 +1872,16 @@ impl Config {
             a.validate()?;
             if !advisory_ids.insert(a.id.as_str()) {
                 bail!("duplicate advisory id {:?}", a.id);
+            }
+        }
+        for h in &self.hosts {
+            for id in &h.mitigated {
+                // Not an error, for the same reason as `ignore`: a built-in
+                // advisory is retired eventually, and a host that had it
+                // mitigated must keep loading.
+                if !advisory_ids.contains(id.as_str()) {
+                    tracing::info!("host {:?} lists {id:?} as mitigated, which is not a tracked advisory", h.name);
+                }
             }
         }
         if df.min_samples < 2 {

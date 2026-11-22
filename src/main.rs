@@ -135,6 +135,7 @@ fn build_hosts(config: &Config) -> Result<Vec<node_exporter::Host>> {
                 h.timeout,
                 h.attempts,
             )
+            .map(|host| host.on_this_machine(h.is_local()))
             .with_context(|| format!("building scraper for host {:?}", h.name))
         })
         .collect()

@@ -86,6 +86,7 @@ Tailscale) or an SSH tunnel, never `0.0.0.0` on a public address.
 | `/var/lib/perch/maint/silence` | read, write, delete | Maintenance windows. Written by `perch maint`, rewritten by perch to record a cluster restart's stage, deleted when a window ends. Written without following a symlink, so a link planted in the group-writable directory cannot redirect the write. |
 | `/proc/*/cmdline` | read | `perch maint` and `perch status` only, run without `--config`: to find the running perch's config. A config found this way is used only if root or the invoking user owns it and nobody else can write it. |
 | `/proc/self/{status,mountinfo}` | read | The startup sandbox self-report. |
+| `/etc/os-release` | read | Which distribution and release this is, for the kernel advisory checks. World-readable. The running kernel version comes from `uname(2)`, which reads no file. Nothing else about the host is read for these checks: not `/proc/sys`, which the sandbox hides, and not firewall rules, which would need root. |
 | `/sys/class/net/*/carrier_down_count` | read | Only with `[diagnose]`: link-flap counts. |
 | The validator log | read | Only with `[diagnose]`, and only after you bind-mount its directory in. |
 | `/home`, `/root`, `/run/user` | **none** | Hidden by `ProtectHome=true`. |
@@ -214,6 +215,9 @@ startup line then reports `home=empty` instead of `home=hidden`.
   lockfile but not in the Linux build. Two informational notices remain, with
   no fixed version to move to: chrono and humantime are flagged unmaintained
   (RUSTSEC-2026-0543, RUSTSEC-2026-0542).
+- **`unsafe`.** One block, in `src/node_exporter.rs`: the call to `uname(2)`,
+  which fills a fixed-size struct and has no other effect. There is no other
+  `unsafe` in perch's own code.
 - **TLS** is rustls. There is no OpenSSL and no system TLS library.
 - **Release binaries** are statically linked (musl) and built by
   [`.github/workflows/release.yml`](.github/workflows/release.yml) from the

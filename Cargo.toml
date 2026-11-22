@@ -1,6 +1,6 @@
 [package]
 name = "perch"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2021"
 # Validator hosts often run whatever Rust shipped with the distro. Keeping this
 # low, and shipping Cargo.lock, means the build does not demand a fresh toolchain.
@@ -23,6 +23,8 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
+# Already in the tree through tokio; used directly for one call, uname(2).
+libc = "0.2"
 humantime = "2"
 humantime-serde = "1"
 rand = "0.8"

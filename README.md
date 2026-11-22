@@ -63,7 +63,7 @@ journalctl -u perch -f
 ```
 
 ```
-INFO perch 1.5.0 (…) starting: 3 endpoint(s), 1 validator(s), 60s interval
+INFO perch 1.5.1 (…) starting: 3 endpoint(s), 1 validator(s), 60s interval
 INFO sandbox: root=read-only home=hidden proc=private capabilities=none seccomp=on
 INFO cycle complete: 3/3 endpoint(s) usable, ... visibility ok, 0 check(s) firing
 ```
@@ -110,11 +110,11 @@ Report vulnerabilities privately through the repository's Security tab.
 | `node_behind`                       | page          | 15m            | a node _you operate_ lagging or unreachable                                |
 | `disk_space` / `disk_fill`          | notify / page | 10m / 15m      | free-space floor and projected time-to-full                                |
 | `disk_readonly` / `disk_missing`    | page          | immediate / 2m | how disks fail under a validator                                           |
-| `advisory_exposed`                  | notify / page | 10m            | a listed kernel CVE (built in, or yours): exposed, then fix-ready, then undo |
+| `advisory_exposed`                  | notify / page | 10m            | a listed kernel CVE (built in, or yours): unpatched and not marked mitigated |
 | `peer_down` / `machine_down`        | notify / page | 10m / 3m       | another perch went silent; paged only if its validator also stopped voting |
 | `cluster_stake` / `cluster_stalled` | notify        | 10m / 3m       | not yours to fix at 3am                                                    |
 
-**Kernel advisories.** perch ships with a short list of the kernel vulnerabilities every validator operator was asked to act on ([advisories.toml](advisories.toml), currently CVE-2026-99288 "NoisyTCP" and CVE-2026-98432), and tells you which of your boxes is still exposed, when your distribution ships the fix, and when to undo a temporary mitigation. It reads the kernel and sysctls from the node_exporter scrape it already makes: nothing is installed on the host and nothing runs as root. Add your own with `[[advisories]]`, or drop one with `ignore`; see [kernel advisories](docs/deployment.md#kernel-advisories) for the node_exporter flags it needs.
+**Kernel advisories.** perch ships with a short list of the kernel vulnerabilities every validator operator was asked to act on ([advisories.toml](advisories.toml), currently CVE-2026-99288 "NoisyTCP" and CVE-2026-98432), and tells you which of your boxes is still exposed, when your distribution ships the fix, and when to undo a temporary mitigation. It needs no setup: perch reads the running kernel with `uname` and the distribution from `/etc/os-release`, which any unprivileged process can do. Nothing is installed on the host and nothing runs as root. A temporary mitigation is something perch cannot see and is not given the access to see, so once you have applied one you say so with `mitigated = ["<id>"]` on the host. Add your own advisories with `[[advisories]]`, or drop one with `ignore`; see [kernel advisories](docs/deployment.md#kernel-advisories).
 
 `page` goes to PagerDuty and Telegram, once per incident; `notify` to Telegram only. Every threshold and tier is per check. Related symptoms fold into one alert, every alert is tagged with its cluster, and resolves land on the original PagerDuty incident even across restarts.
 

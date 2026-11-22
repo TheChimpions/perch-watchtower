@@ -63,7 +63,7 @@ journalctl -u perch -f
 ```
 
 ```
-INFO perch 1.5.1 (…) starting: 3 endpoint(s), 1 validator(s), 60s interval
+INFO perch 1.5.2 (…) starting: 3 endpoint(s), 1 validator(s), 60s interval
 INFO sandbox: root=read-only home=hidden proc=private capabilities=none seccomp=on
 INFO cycle complete: 3/3 endpoint(s) usable, ... visibility ok, 0 check(s) firing
 ```

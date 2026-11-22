@@ -230,6 +230,8 @@ pub struct CycleReport<'a> {
     /// Identity pubkey -> configured label, so graphs say "chimps-1" rather
     /// than a 44-character key.
     pub validator_labels: &'a HashMap<String, String>,
+    /// What the watched validators announce in gossip, by identity.
+    pub gossip: &'a HashMap<String, crate::sfdp::GossipNode>,
     /// Which checks are this instance's own to show as firing.
     pub alerting: crate::config::Alerting,
     /// `checks.jpool_bond.security_sol_per_1000`, to export the requirement.
@@ -265,8 +267,6 @@ pub fn render(r: &CycleReport<'_>) -> String {
     // The watchtower watching its own mouth. Every other metric here describes
     // the validators; these describe whether anything said about them can
     // actually leave the box.
-    // The version each box is actually running. Only local endpoints report one,
-    // so every instance describes its own validator and nobody else's.
     // Makes the auto-resume legible instead of a black box: you can see whether
     // a window is still waiting for the work to start, or counting clean cycles.
     e.metric(
@@ -290,13 +290,21 @@ pub fn render(r: &CycleReport<'_>) -> String {
         r.maintenance_awaiting_work as u8 as f64,
     );
 
+    // The version each box's validator is running. A local endpoint answers
+    // for its own node. Where there is none -- Firedancer with its RPC port
+    // off -- the version the validator announces in gossip stands in, under
+    // endpoint="gossip". Never both: with a local node, gossip would also
+    // describe validators this box only watches, and a hub would list every
+    // build in the fleet as its own.
     e.metric(
         "perch_node_version",
-        "Validator software reported by a local endpoint. Always 1; read the labels.",
+        "Validator software, from a local endpoint or else from gossip. Always 1; read the labels.",
         "gauge",
     );
+    let mut local_version = false;
     for s in r.snapshots {
         if let Some(v) = &s.version {
+            local_version = true;
             let fs = v.feature_set.to_string();
             e.value(
                 "perch_node_version",
@@ -304,6 +312,27 @@ pub fn render(r: &CycleReport<'_>) -> String {
                     ("endpoint", s.endpoint.as_str()),
                     ("version", v.solana_core.as_str()),
                     ("feature_set", fs.as_str()),
+                ],
+                1.0,
+            );
+        }
+    }
+    if !local_version {
+        let mut announced: Vec<(&String, &crate::sfdp::GossipNode)> = r
+            .gossip
+            .iter()
+            .filter_map(|(id, node)| r.validator_labels.get(id).map(|label| (label, node)))
+            .collect();
+        announced.sort_by_key(|(label, _)| label.as_str());
+        for (label, node) in announced {
+            let fs = node.feature_set.unwrap_or(0).to_string();
+            e.value(
+                "perch_node_version",
+                &[
+                    ("endpoint", "gossip"),
+                    ("version", node.version.as_str()),
+                    ("feature_set", fs.as_str()),
+                    ("validator", label.as_str()),
                 ],
                 1.0,
             );
@@ -956,6 +985,9 @@ pub fn render(r: &CycleReport<'_>) -> String {
 }
 
 #[cfg(test)]
+static NO_GOSSIP: std::sync::LazyLock<HashMap<String, crate::sfdp::GossipNode>> =
+    std::sync::LazyLock::new(HashMap::new);
+#[cfg(test)]
 static NO_LABELS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
 
@@ -1034,6 +1066,7 @@ mod notify_metrics {
             watchtower_name: "t",
             solana_cluster: "unpinned",
             validator_labels: &NO_LABELS,
+            gossip: &NO_GOSSIP,
             alerting: crate::config::Alerting::Always,
             jpool_security_sol_per_1000: 0.5,
         })
@@ -1071,6 +1104,14 @@ mod version_metric {
     use crate::{notify::NotifyCounts, snapshot::NodeVersion};
 
     fn render_with(snaps: &[Snapshot]) -> String {
+        render_announced(snaps, &NO_LABELS, &NO_GOSSIP)
+    }
+
+    fn render_announced(
+        snaps: &[Snapshot],
+        labels: &HashMap<String, String>,
+        gossip: &HashMap<String, crate::sfdp::GossipNode>,
+    ) -> String {
         let disk = DiskHistory::default();
         let (states, health, suppressed) = (HashMap::new(), HashMap::new(), HashMap::new());
         render(&CycleReport {
@@ -1095,7 +1136,8 @@ mod version_metric {
             maintenance_awaiting_work: false,
             watchtower_name: "t",
             solana_cluster: "unpinned",
-            validator_labels: &NO_LABELS,
+            validator_labels: labels,
+            gossip,
             alerting: crate::config::Alerting::Always,
             jpool_security_sol_per_1000: 0.5,
         })
@@ -1117,6 +1159,46 @@ mod version_metric {
             out.contains(r#"perch_node_version{endpoint="localhost",version="4.3.0-rc.1",feature_set="3383571666"} 1"#),
             "got:\n{out}"
         );
+    }
+
+    fn fox_in_gossip() -> (HashMap<String, String>, HashMap<String, crate::sfdp::GossipNode>) {
+        let node = crate::sfdp::GossipNode {
+            version: "26.10.8".into(),
+            client_id: Some("Firedancer".into()),
+            feature_set: Some(2681577653),
+        };
+        (
+            HashMap::from([("FoxIdentity".to_string(), "fox-main".to_string())]),
+            HashMap::from([
+                ("FoxIdentity".to_string(), node.clone()),
+                // Left over from a validator since removed from the config.
+                ("GoneIdentity".to_string(), node),
+            ]),
+        )
+    }
+
+    /// Firedancer with its RPC port off: no local endpoint, so the version the
+    /// validator announces in gossip is what the dashboard shows.
+    #[test]
+    fn with_no_local_endpoint_the_gossip_version_is_exported() {
+        let (labels, gossip) = fox_in_gossip();
+        let out = render_announced(&[snap("publicnode", None)], &labels, &gossip);
+        assert!(
+            out.contains(r#"perch_node_version{endpoint="gossip",version="26.10.8",feature_set="2681577653",validator="fox-main"} 1"#),
+            "got:\n{out}"
+        );
+        assert_eq!(out.matches("perch_node_version{").count(), 1, "got:\n{out}");
+    }
+
+    /// A box with its own node reports that node and nothing else, or a hub
+    /// would show every watched validator's build as its own.
+    #[test]
+    fn a_local_endpoint_version_keeps_gossip_out() {
+        let (labels, gossip) = fox_in_gossip();
+        let local = snap("localhost", Some(NodeVersion { solana_core: "4.4.0".into(), feature_set: 1 }));
+        let out = render_announced(&[local], &labels, &gossip);
+        assert!(out.contains(r#"endpoint="localhost",version="4.4.0""#), "got:\n{out}");
+        assert!(!out.contains(r#"endpoint="gossip""#), "got:\n{out}");
     }
 
     /// An endpoint that reported no version must emit no series at all, rather
@@ -1145,7 +1227,7 @@ mod build_identity {
             visible: true, silenced: false, cycle_duration: Duration::from_secs(1),
             unix_time: 1_700_000_000, maintenance_until: 0, restart_gossip_percent: None, start_time: 1_699_000_000,
             notify: NotifyCounts::default(), maintenance_streak: 0, maintenance_awaiting_work: false,
-            watchtower_name: "t", solana_cluster: "unpinned", validator_labels: &HashMap::new(), alerting: crate::config::Alerting::Always,
+            watchtower_name: "t", solana_cluster: "unpinned", validator_labels: &HashMap::new(), gossip: &HashMap::new(), alerting: crate::config::Alerting::Always,
             jpool_security_sol_per_1000: 0.5,
         });
         let expected = format!(
@@ -1195,6 +1277,7 @@ mod alpenglow_metrics {
             watchtower_name: "t",
             solana_cluster: "testnet",
             validator_labels: labels,
+            gossip: &NO_GOSSIP,
             alerting: crate::config::Alerting::Always,
             jpool_security_sol_per_1000: 0.5,
         })

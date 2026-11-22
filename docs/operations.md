@@ -627,8 +627,13 @@ perch_watchtower_info{name="...",solana_cluster="..."}
                                            this instance's [watchtower] name and pinned cluster
 perch_node_version{endpoint="...",version="...",feature_set="..."}
                                            which validator build, from a local
-                                           endpoint only -- a public RPC would
-                                           report its provider's build, not yours
+                                           endpoint -- a public RPC would report
+                                           its provider's build, not yours. With
+                                           no local endpoint (Firedancer, RPC
+                                           off) it is the version announced in
+                                           gossip: endpoint="gossip", plus a
+                                           validator label. Needs the
+                                           sfdp_version check enabled.
 perch_cycle_duration_seconds
 perch_check_pending_for_seconds{check="..."}
 perch_endpoint_config_errors_total{endpoint="..."}

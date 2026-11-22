@@ -264,6 +264,7 @@ pub fn diff(old: &Requirements, new: &Requirements) -> Vec<String> {
 pub struct GossipNode {
     pub version: String,
     pub client_id: Option<String>,
+    pub feature_set: Option<u64>,
 }
 
 /// Pick the wanted identities out of a `getClusterNodes` listing.
@@ -285,6 +286,7 @@ pub fn parse_cluster_nodes(listing: &Value, wanted: &[&str]) -> HashMap<String, 
             GossipNode {
                 version: version.to_string(),
                 client_id: node.get("clientId").and_then(Value::as_str).map(str::to_string),
+                feature_set: node.get("featureSet").and_then(Value::as_u64),
             },
         );
     }
@@ -579,14 +581,14 @@ mod tests {
     #[test]
     fn only_the_wanted_identities_are_kept_from_gossip() {
         let listing = json!([
-            {"pubkey": "mine", "version": "26.10.8", "clientId": "Firedancer", "gossip": "1.2.3.4:8001"},
+            {"pubkey": "mine", "version": "26.10.8", "clientId": "Firedancer", "featureSet": 2681577653u32, "gossip": "1.2.3.4:8001"},
             {"pubkey": "other", "version": "4.4.0", "clientId": "Agave"},
             {"pubkey": "quiet", "version": null, "clientId": null},
             {"pubkey": "old-rpc", "version": "4.4.0"}
         ]);
         let got = parse_cluster_nodes(&listing, &["mine", "quiet", "old-rpc"]);
         assert_eq!(got.len(), 2);
-        assert_eq!(got["mine"], GossipNode { version: "26.10.8".into(), client_id: Some("Firedancer".into()) });
-        assert_eq!(got["old-rpc"], GossipNode { version: "4.4.0".into(), client_id: None });
+        assert_eq!(got["mine"], GossipNode { version: "26.10.8".into(), client_id: Some("Firedancer".into()), feature_set: Some(2681577653) });
+        assert_eq!(got["old-rpc"], GossipNode { version: "4.4.0".into(), client_id: None, feature_set: None });
     }
 }

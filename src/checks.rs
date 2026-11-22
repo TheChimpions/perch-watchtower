@@ -2161,7 +2161,7 @@ mod tests {
         fn gossip(identity: &str, version: &str, client_id: &str) -> HashMap<String, GossipNode> {
             HashMap::from([(
                 identity.to_string(),
-                GossipNode { version: version.into(), client_id: Some(client_id.into()) },
+                GossipNode { version: version.into(), client_id: Some(client_id.into()), feature_set: None },
             )])
         }
 

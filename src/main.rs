@@ -912,6 +912,7 @@ async fn run_cycle(
         watchtower_name: &config.watchtower.name,
         solana_cluster: &solana_cluster,
         validator_labels: &validator_labels,
+        gossip: rt.gossip.nodes(),
         alerting,
         jpool_security_sol_per_1000: config.checks.jpool_bond.security_sol_per_1000,
         snapshots: &snapshots,

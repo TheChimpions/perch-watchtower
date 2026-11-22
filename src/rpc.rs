@@ -148,7 +148,11 @@ fn classify_status(status: reqwest::StatusCode, body: &str) -> RpcError {
         // api.mainnet-beta.solana.com returns 429 under perfectly normal conditions.
         429 => RpcError::Transient(format!("rate limited (429): {snippet}")),
         408 | 425 => RpcError::Transient(format!("http {status}: {snippet}")),
-        // Every 5xx, not just the 502 upstream special-cases.
+        // Not Implemented is an answer, not an outage: Firedancer's RPC replies
+        // 501 to every method it has not written yet (getVoteAccounts and
+        // getBlockProduction among them), and will say the same next cycle.
+        501 => RpcError::Unsupported(format!("http 501: the endpoint does not implement this method. {snippet}")),
+        // Every other 5xx, not just the 502 upstream special-cases.
         500..=599 => RpcError::Transient(format!("http {status}: {snippet}")),
         // 401/403 is a watchtower config problem worth telling the operator about,
         // but never a page. Two very different causes share the status, and the
@@ -429,6 +433,16 @@ mod tests {
                 "http {code} should be transient"
             );
         }
+    }
+
+    /// Firedancer's RPC answers 501 for the methods it has not implemented.
+    /// That is a standing fact about the endpoint, so it must be learned once
+    /// and never counted as an error or retried.
+    #[test]
+    fn not_implemented_is_unsupported_not_an_outage() {
+        let e = classify_status(reqwest::StatusCode::NOT_IMPLEMENTED, "");
+        assert!(matches!(e, RpcError::Unsupported(_)), "got {e}");
+        assert!(!e.is_transient());
     }
 
     #[test]

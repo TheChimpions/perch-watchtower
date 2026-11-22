@@ -135,6 +135,7 @@ fn build_hosts(config: &Config) -> Result<Vec<node_exporter::Host>> {
                 h.timeout,
                 h.attempts,
             )
+            .map(|host| host.on_this_machine(h.is_local()))
             .with_context(|| format!("building scraper for host {:?}", h.name))
         })
         .collect()
@@ -384,6 +385,7 @@ async fn main() -> Result<()> {
         persist: !args.dry_run,
         sfdp: None,
         sfdp_last_fetch: None,
+        gossip: sfdp::Gossip::default(),
         sfdp_fetcher: match sfdp::Fetcher::new() {
             Ok(f) => Some(f),
             Err(e) => {
@@ -498,6 +500,7 @@ struct Runtime {
     /// SFDP required-version schedule, re-fetched on an interval.
     sfdp: Option<sfdp::Requirements>,
     sfdp_last_fetch: Option<Instant>,
+    gossip: sfdp::Gossip,
     sfdp_fetcher: Option<sfdp::Fetcher>,
     /// Distribution tracker records for `[[advisories]]` that ask for them.
     advisories: advisory::Tracker,
@@ -721,7 +724,12 @@ async fn run_cycle(
     if run_cluster {
         outcomes.extend(checks::evaluate_nodes(&snapshots, config));
         maybe_refresh_sfdp(config, notifier, rt, now).await;
-        outcomes.extend(checks::evaluate_sfdp(&snapshots, config, rt.sfdp.as_ref()));
+        if config.checks.sfdp_version.base.enabled && config.watchtower.sfdp_cluster().is_some() {
+            let wanted: Vec<&str> = config.validators.iter().map(|v| v.identity.as_str()).collect();
+            let interval = config.checks.sfdp_version.poll_interval.max(Duration::from_secs(300));
+            rt.gossip.refresh(endpoints, &wanted, interval, now).await;
+        }
+        outcomes.extend(checks::evaluate_sfdp(&snapshots, config, rt.sfdp.as_ref(), rt.gossip.nodes()));
     }
     // Remember what each peer declared while we could still reach it.
     for p in &peer_statuses {
@@ -2070,7 +2078,7 @@ async fn maybe_refresh_sfdp(config: &Config, notifier: &Notifier, rt: &mut Runti
                 None => info!(
                     "SFDP schedule for {cluster}: {}",
                     fresh.entries.iter()
-                        .map(|r| format!("epoch {} >= {}", r.epoch, r.min))
+                        .map(|r| format!("epoch {} {} {}", r.epoch, r.client.name(), r.floor))
                         .collect::<Vec<_>>().join(", ")
                 ),
                 Some(old) => {

@@ -64,7 +64,7 @@ thresholds: Telegram at 5 minutes, a page at 20.
 | Cluster active stake | yes, opt-in ([L160–176](https://github.com/anza-xyz/agave/blob/v4.3.0/watchtower/src/main.rs#L160-L176)) | yes, opt-in, Telegram by default |
 | Your own RPC node lagging | no | yes (`node_behind`) |
 | Disks: free space, time-to-full, read-only, inodes | no | yes, via node_exporter |
-| Kernel advisories: exposed, fix available, mitigation left on | no | yes, a built-in list plus your own, via node_exporter |
+| Kernel advisories: exposed, fix available, mitigation left on | no | yes, a built-in list plus your own; reads only the kernel version |
 | Validator machine hard down | only as "delinquent", if the watchtower runs elsewhere | yes: a peer reports the machine, corroborated by the cluster |
 | The watchtower itself dying | silence | dead-man's switch (heartbeat), or a standby takes over |
 

@@ -131,7 +131,14 @@ pub async fn run(
         },
         _ => None,
     };
-    outcomes.extend(checks::evaluate_sfdp(&snapshots, config, sfdp.as_ref()));
+    let mut gossip = crate::sfdp::Gossip::default();
+    if sfdp.is_some() {
+        let wanted: Vec<&str> = config.validators.iter().map(|v| v.identity.as_str()).collect();
+        gossip
+            .refresh(endpoints, &wanted, std::time::Duration::ZERO, std::time::Instant::now())
+            .await;
+    }
+    outcomes.extend(checks::evaluate_sfdp(&snapshots, config, sfdp.as_ref(), gossip.nodes()));
     outcomes.extend(checks::evaluate_peers(
         &peer_statuses,
         &snapshots,

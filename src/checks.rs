@@ -1177,16 +1177,20 @@ pub fn evaluate_peers(
 /// running (stake at risk now, pages), `warn` for the floor that takes effect
 /// next epoch (roughly an epoch left, Telegram).
 ///
-/// The version comes from a local endpoint, so this only speaks about the
-/// validator the local node identifies as -- a hub listing five remote
-/// validators must not report its own build as theirs. `reqs` of `None` yields
-/// Unknown: an unreachable foundation API is not evidence about anyone.
+/// The version is the one the validator announces in gossip, which is what
+/// the foundation reads and what any endpoint can relay, so the check needs
+/// nothing from the validator's own RPC port. A local endpoint is the
+/// fallback, and it only speaks for the validator the local node identifies
+/// as -- a hub listing five remote validators must not report its own build
+/// as theirs. `reqs` of `None` yields Unknown: an unreachable foundation API
+/// is not evidence about anyone.
 pub fn evaluate_sfdp(
     snapshots: &[Snapshot],
     config: &Config,
     reqs: Option<&crate::sfdp::Requirements>,
+    gossip: &HashMap<String, crate::sfdp::GossipNode>,
 ) -> Vec<CheckOutcome> {
-    use crate::sfdp::Compliance;
+    use crate::sfdp::{Client, Compliance, Floor};
     let sc = &config.checks.sfdp_version;
     if !sc.base.enabled || config.validators.is_empty() {
         return Vec::new();
@@ -1202,25 +1206,44 @@ pub fn evaluate_sfdp(
 
     let mut out = Vec::new();
     for v in &config.validators {
-        if local_identity.is_some_and(|id| id != v.identity) {
+        let announced = gossip.get(&v.identity);
+        // Not in gossip, and the local node is some other validator: this box
+        // has no way to know what that one runs.
+        if announced.is_none() && local_identity.is_some_and(|id| id != v.identity) {
             continue;
         }
         let who = v.display().to_string();
-        let state = match (config.watchtower.sfdp_cluster(), reqs, local, epoch) {
+        // (version, client id): gossip first, then the local node if it is
+        // this validator.
+        let running: Option<(&str, Option<&str>)> = match announced {
+            Some(n) => Some((n.version.as_str(), n.client_id.as_deref())),
+            None if local_identity == Some(v.identity.as_str()) => {
+                local.map(|ver| (ver.solana_core.as_str(), None))
+            }
+            None => None,
+        };
+        let state = match (config.watchtower.sfdp_cluster(), reqs, running, epoch) {
             (None, _, _, _) => Err("cluster is not covered by the delegation program".to_string()),
             (_, None, _, _) => Err("SFDP required-version schedule not fetched yet".to_string()),
-            (_, _, None, _) => Err("no local endpoint reported a validator version".to_string()),
+            (_, _, None, _) => Err(
+                "the validator's version is not known: it is not in the gossip listing, and no \
+                 local endpoint reports it"
+                    .to_string(),
+            ),
             (_, _, _, None) => Err("epoch not observed".to_string()),
-            _ if local_identity.is_none() => {
-                Err("local node identity not observed, so the version cannot be attributed".into())
-            }
-            (Some(_), Some(r), Some(ver), Some(epoch)) => {
-                match semver::Version::parse(&ver.solana_core) {
-                    Err(e) => Err(format!("validator version {:?} is not semver: {e}", ver.solana_core)),
-                    Ok(parsed) => match crate::sfdp::compliance(&parsed, epoch, r) {
-                        None => Err("SFDP schedule is empty".to_string()),
-                        Some(c) => Ok((c, ver.solana_core.clone())),
-                    },
+            (Some(_), Some(r), Some((ver, client_id)), Some(epoch)) => {
+                match semver::Version::parse(ver) {
+                    Err(e) => Err(format!("validator version {ver:?} is not semver: {e}")),
+                    Ok(parsed) => {
+                        let client = Client::classify(client_id, &parsed);
+                        match crate::sfdp::compliance(client, &parsed, epoch, r) {
+                            None => Err(format!(
+                                "the SFDP schedule publishes no requirement for {}",
+                                client.name()
+                            )),
+                            Some(c) => Ok((c, format!("{} {ver}", client.name()))),
+                        }
+                    }
                 }
             }
         };
@@ -1236,24 +1259,38 @@ pub fn evaluate_sfdp(
             let verdict = match &state2 {
                 Err(why) => Verdict::unknown(why.clone()),
                 Ok((c, ver)) => match (suffix, c) {
-                    ("critical", Compliance::BelowCurrent { epoch, required }) => {
+                    ("critical", Compliance::BelowCurrent { epoch, required: Floor::Min(required) }) => {
                         Verdict::unhealthy(format!(
-                            "{who2} runs agave {ver} but the delegation program requires >= {required} \
+                            "{who2} runs {ver} but the delegation program requires >= {required} \
                              as of epoch {epoch}, which has already started. Foundation stake is at \
                              risk until it is upgraded."
                         ))
                     }
-                    ("warn", Compliance::BelowNext { epoch, required }) => {
+                    ("critical", Compliance::BelowCurrent { epoch, required: Floor::NotAllowed }) => {
                         Verdict::unhealthy(format!(
-                            "{who2} runs agave {ver}; the delegation program requires >= {required} \
+                            "{who2} runs {ver}, a client the delegation program does not allow as \
+                             of epoch {epoch}, which has already started. Foundation stake is at \
+                             risk until it runs an allowed client."
+                        ))
+                    }
+                    ("warn", Compliance::BelowNext { epoch, required: Floor::Min(required) }) => {
+                        Verdict::unhealthy(format!(
+                            "{who2} runs {ver}; the delegation program requires >= {required} \
                              from epoch {epoch}, the next one. Upgrade before it starts to keep \
                              foundation stake."
+                        ))
+                    }
+                    ("warn", Compliance::BelowNext { epoch, required: Floor::NotAllowed }) => {
+                        Verdict::unhealthy(format!(
+                            "{who2} runs {ver}; the delegation program stops allowing that client \
+                             from epoch {epoch}, the next one. Move to an allowed client before it \
+                             starts to keep foundation stake."
                         ))
                     }
                     _ => Verdict::Healthy,
                 },
             };
-            // The version is a fact about this box rather than something
+            // The version is one announced fact rather than something
             // endpoints corroborate, so every usable endpoint carries the same
             // verdict and quorum is met whenever the cluster is visible at all.
             out.push(outcome(
@@ -1384,18 +1421,30 @@ pub fn evaluate_advisories(
 
     let mut out = Vec::new();
     for snap in snapshots {
+        let mitigated = config
+            .hosts
+            .iter()
+            .find(|h| h.name == snap.host)
+            .map(|h| h.mitigated.as_slice())
+            .unwrap_or(&[]);
         for adv in &config.advisories {
             let label = adv.label();
             let subject = format!("{} {}", snap.host, adv.id);
             let a = match &snap.error {
-                // The kernel and sysctl collectors are independent of the
-                // filesystem one, so "no mountpoint matched" still has facts.
-                Some(err) if err != crate::node_exporter::NOTHING_MATCHED => crate::advisory::Assessment {
-                    exposed: Verdict::unknown(format!("node_exporter unreachable: {err}")),
-                    upgrade: None,
-                    restore: None,
-                },
-                _ => crate::advisory::assess(&snap.host, adv, &snap.facts, tracked),
+                // A dead exporter only matters if it was the source of the
+                // kernel: for the machine perch is on, that is read directly.
+                // "No mountpoint matched" is a filesystem complaint and says
+                // nothing about the kernel facts.
+                Some(err)
+                    if err != crate::node_exporter::NOTHING_MATCHED && snap.facts.kernel_release.is_none() =>
+                {
+                    crate::advisory::Assessment {
+                        exposed: Verdict::unknown(format!("node_exporter unreachable: {err}")),
+                        upgrade: None,
+                        restore: None,
+                    }
+                }
+                _ => crate::advisory::assess(&snap.host, adv, &snap.facts, tracked, mitigated.contains(&adv.id)),
             };
             out.push(single(
                 format!("advisory_exposed:{subject}"),
@@ -1416,7 +1465,7 @@ pub fn evaluate_advisories(
             if let Some(v) = a.restore {
                 out.push(single(
                     format!("advisory_restore:{subject}"),
-                    format!("{} still has the {label} mitigation applied", snap.host),
+                    format!("{} is still marked mitigated for {label}", snap.host),
                     follow_up.clone(),
                     v,
                     None,
@@ -1579,16 +1628,11 @@ pub fn still_configured(id: &str, config: &Config) -> bool {
                     config.hosts.iter().any(|x| x.name == h && x.mountpoints.iter().any(|p| p == m))
                 })
         }
-        // Subjects are "<host> <advisory id>". The follow-ups only exist for an
-        // advisory that declares a mitigation.
+        // Subjects are "<host> <advisory id>".
         "advisory_exposed" | "advisory_upgrade" | "advisory_restore" => {
             c.host_advisory.base.enabled
                 && subject.and_then(|s| s.split_once(' ')).is_some_and(|(h, id)| {
-                    config.hosts.iter().any(|x| x.name == h)
-                        && config
-                            .advisories
-                            .iter()
-                            .any(|a| a.id == id && (kind == "advisory_exposed" || a.mitigation.is_some()))
+                    config.hosts.iter().any(|x| x.name == h) && config.advisories.iter().any(|a| a.id == id)
                 })
         }
         "node_behind" => {
@@ -2075,6 +2119,157 @@ mod tests {
         assert!(matches!(v, Verdict::Unknown(_)));
     }
 
+    mod sfdp_version {
+        use super::*;
+        use crate::sfdp::{Client, Floor, GossipNode, Requirement, Requirements};
+        use crate::snapshot::NodeVersion;
+
+        const ID: &str = "GdnSLrSSVBmCSxCC6Vy3KwkRRLAXhsFpqNHnHHTHHHvv";
+        const OTHER: &str = "2AKKnirWVZMhnzuwqpizw9SwfZjGpRFLx2zCCNtPWpbc";
+
+        fn config() -> Config {
+            Config::parse(&format!(
+                "[watchtower]\ncluster = \"mainnet-beta\"\n\
+                 [[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+                 [[endpoints]]\nname = \"b\"\nurl = \"https://b.example\"\n\
+                 [[validators]]\nidentity = \"{ID}\"\nlabel = \"fox\"\n"
+            ))
+            .unwrap()
+        }
+
+        /// Two remote endpoints and nothing local: a validator whose own RPC
+        /// port is off. bare_snapshot puts both at epoch 10.
+        fn remote_only() -> Vec<Snapshot> {
+            vec![bare_snapshot("a", Some(4_320_100)), bare_snapshot("b", Some(4_320_100))]
+        }
+
+        /// Floors in force at epoch 10, with Firedancer's raised at epoch 11.
+        fn schedule() -> Requirements {
+            let floor = |epoch, client, floor| Requirement { epoch, client, floor, inherited: true };
+            let min = |s: &str| Floor::Min(semver::Version::parse(s).unwrap());
+            Requirements {
+                cluster: "mainnet-beta".into(),
+                entries: vec![
+                    floor(10, Client::Agave, min("4.4.0")),
+                    floor(10, Client::Frankendancer, Floor::NotAllowed),
+                    floor(10, Client::Firedancer, min("26.10.6")),
+                    floor(11, Client::Firedancer, min("26.10.8")),
+                ],
+            }
+        }
+
+        fn gossip(identity: &str, version: &str, client_id: &str) -> HashMap<String, GossipNode> {
+            HashMap::from([(
+                identity.to_string(),
+                GossipNode { version: version.into(), client_id: Some(client_id.into()) },
+            )])
+        }
+
+        fn verdict(out: &[CheckOutcome], id: &str) -> Verdict {
+            out.iter().find(|o| o.id == id).unwrap_or_else(|| panic!("no {id}")).verdict.clone()
+        }
+
+        fn message(v: Verdict) -> String {
+            match v {
+                Verdict::Unhealthy(m) | Verdict::Unknown(m) => m,
+                Verdict::Healthy => panic!("healthy has no message"),
+            }
+        }
+
+        /// The case this exists for: Firedancer with RPC off. The version comes
+        /// from gossip and is held to Firedancer's floor, not Agave's.
+        #[test]
+        fn a_validator_with_no_local_rpc_is_judged_from_gossip() {
+            let out = evaluate_sfdp(
+                &remote_only(), &config(), Some(&schedule()), &gossip(ID, "26.10.8", "Firedancer"),
+            );
+            assert!(matches!(verdict(&out, "sfdp_version_critical:fox"), Verdict::Healthy));
+            assert!(matches!(verdict(&out, "sfdp_version_warn:fox"), Verdict::Healthy));
+        }
+
+        #[test]
+        fn firedancer_below_its_own_floor_pages() {
+            let out = evaluate_sfdp(
+                &remote_only(), &config(), Some(&schedule()), &gossip(ID, "26.10.5", "Firedancer"),
+            );
+            let m = message(verdict(&out, "sfdp_version_critical:fox"));
+            assert!(m.contains("firedancer 26.10.5") && m.contains(">= 26.10.6"), "{m}");
+            assert!(matches!(verdict(&out, "sfdp_version_warn:fox"), Verdict::Healthy));
+        }
+
+        /// 26.10.6 would pass any Agave floor; against Firedancer's it warns.
+        #[test]
+        fn firedancer_below_next_epochs_floor_warns() {
+            let out = evaluate_sfdp(
+                &remote_only(), &config(), Some(&schedule()), &gossip(ID, "26.10.6", "Firedancer"),
+            );
+            assert!(matches!(verdict(&out, "sfdp_version_critical:fox"), Verdict::Healthy));
+            let m = message(verdict(&out, "sfdp_version_warn:fox"));
+            assert!(m.contains("firedancer 26.10.6") && m.contains(">= 26.10.8"), "{m}");
+        }
+
+        #[test]
+        fn a_client_the_program_does_not_allow_pages() {
+            let out = evaluate_sfdp(
+                &remote_only(), &config(), Some(&schedule()), &gossip(ID, "0.101.40300", "Frankendancer"),
+            );
+            let m = message(verdict(&out, "sfdp_version_critical:fox"));
+            assert!(m.contains("frankendancer 0.101.40300") && m.contains("does not allow"), "{m}");
+        }
+
+        #[test]
+        fn an_agave_fork_is_held_to_the_agave_floor() {
+            let out = evaluate_sfdp(
+                &remote_only(), &config(), Some(&schedule()), &gossip(ID, "4.3.0", "JitoLabs"),
+            );
+            let m = message(verdict(&out, "sfdp_version_critical:fox"));
+            assert!(m.contains("agave 4.3.0") && m.contains(">= 4.4.0"), "{m}");
+        }
+
+        /// Neither gossip nor a local node knows: Unknown, never a guess.
+        #[test]
+        fn a_validator_nobody_reports_is_unknown() {
+            let out = evaluate_sfdp(&remote_only(), &config(), Some(&schedule()), &HashMap::new());
+            let v = verdict(&out, "sfdp_version_critical:fox");
+            assert!(matches!(v, Verdict::Unknown(_)), "{v:?}");
+            assert!(message(v).contains("gossip"));
+        }
+
+        /// Gossip can be empty for a while; the local node still answers for
+        /// itself, read as Agave or Firedancer by the shape of its version.
+        #[test]
+        fn the_local_node_is_the_fallback() {
+            let mut snaps = remote_only();
+            snaps[0].identity = Some(ID.into());
+            snaps[0].version = Some(NodeVersion { solana_core: "4.3.0".into(), feature_set: 0 });
+            let out = evaluate_sfdp(&snaps, &config(), Some(&schedule()), &HashMap::new());
+            let m = message(verdict(&out, "sfdp_version_critical:fox"));
+            assert!(m.contains("agave 4.3.0"), "{m}");
+        }
+
+        /// What gossip announces outranks the local node: after a failover the
+        /// identity is running somewhere else.
+        #[test]
+        fn gossip_outranks_the_local_node() {
+            let mut snaps = remote_only();
+            snaps[0].identity = Some(ID.into());
+            snaps[0].version = Some(NodeVersion { solana_core: "4.3.0".into(), feature_set: 0 });
+            let out = evaluate_sfdp(&snaps, &config(), Some(&schedule()), &gossip(ID, "4.4.0", "Agave"));
+            assert!(matches!(verdict(&out, "sfdp_version_critical:fox"), Verdict::Healthy));
+        }
+
+        /// A local node that is some other validator says nothing about this
+        /// one, and its build must not be reported as this one's.
+        #[test]
+        fn another_validators_local_node_is_not_evidence() {
+            let mut snaps = remote_only();
+            snaps[0].identity = Some(OTHER.into());
+            snaps[0].version = Some(NodeVersion { solana_core: "4.3.0".into(), feature_set: 0 });
+            let out = evaluate_sfdp(&snaps, &config(), Some(&schedule()), &HashMap::new());
+            assert!(out.is_empty(), "{:?}", out.iter().map(|o| &o.id).collect::<Vec<_>>());
+        }
+    }
+
     mod orphans {
         use super::*;
 
@@ -2101,7 +2296,7 @@ mod tests {
             let snaps = vec![bare_snapshot("a", Some(4_320_100)), bare_snapshot("localhost", Some(4_320_100))];
             let mut out = evaluate(&snaps, &c, &mut Progress::default());
             out.extend(evaluate_nodes(&snaps, &c));
-            out.extend(evaluate_sfdp(&snaps, &c, None));
+            out.extend(evaluate_sfdp(&snaps, &c, None, &HashMap::new()));
             out.extend(evaluate_peers(&[peer_status("hub", false, None)], &snaps, &c, Duration::from_secs(300), &HashMap::new(), 0));
             // Exact on purpose: a new check kind changes this count, and whoever
             // adds it must also teach still_configured about it.
@@ -2232,22 +2427,86 @@ mod tests {
             assert!(firing(snap("6.8.0-151-generic", 1.0, None)).is_empty());
         }
 
-        /// An exporter that cannot be reached must not read as exposed, and
-        /// must not read as fine; one that answered with no matching
-        /// mountpoint still told us the kernel.
+        /// An exporter that cannot be reached, on a host whose kernel perch
+        /// has no other way to learn, must not read as exposed or as fine.
         #[test]
-        fn an_unreachable_exporter_is_unknown() {
+        fn an_unreachable_remote_exporter_is_unknown() {
             let c = config(ADVISORY);
-            let out = verdicts(snap("6.8.0-54-generic", 1.0, Some("connection refused")), &c);
-            // One check per advisory, so a dead exporter is one "cannot be
-            // evaluated" note for each rather than three.
+            let mut down = snap("6.8.0-54-generic", 1.0, Some("connection refused"));
+            down.facts = HostFacts::default();
+            let out = verdicts(down, &c);
+            // One check per advisory, so it is one "cannot be evaluated" note
+            // for each rather than three.
             assert_eq!(out.len(), c.advisories.len());
             assert!(out.iter().all(|(id, v, _)| id.starts_with("advisory_exposed:")
                 && matches!(v, Verdict::Unknown(m) if m.contains("unreachable"))));
+        }
 
-            let out = verdicts(snap("6.8.0-54-generic", 1.0, Some(NOTHING_MATCHED)), &c);
-            let noisy = out.iter().find(|(id, _, _)| id == "advisory_exposed:hw CVE-2026-99288").unwrap();
-            assert!(matches!(&noisy.1, Verdict::Unhealthy(_)));
+        /// On the machine perch runs on, the kernel is read directly, so a
+        /// dead exporter (or one that matched no mountpoint) changes nothing.
+        #[test]
+        fn the_local_kernel_is_judged_even_with_the_exporter_down() {
+            let c = config(ADVISORY);
+            for err in ["connection refused", NOTHING_MATCHED] {
+                let out = verdicts(snap("6.8.0-54-generic", 1.0, Some(err)), &c);
+                let noisy = out.iter().find(|(id, _, _)| id == "advisory_exposed:hw CVE-2026-99288").unwrap();
+                assert!(matches!(&noisy.1, Verdict::Unhealthy(_)), "{err}");
+            }
+        }
+
+        /// The fleet's layout: nothing exported but the kernel, the operator
+        /// applies the stopgap as root and then says so in the config.
+        #[test]
+        fn the_hosts_mitigated_list_is_what_clears_exposure() {
+            let blind = |release: &str| {
+                let mut s = snap(release, 1.0, None);
+                s.facts.sysctls.clear();
+                s
+            };
+            let firing = |c: &Config, s: HostSnapshot| -> Vec<String> {
+                verdicts(s, c)
+                    .into_iter()
+                    .filter(|(id, v, _)| id.ends_with("CVE-2026-99288") && matches!(v, Verdict::Unhealthy(_)))
+                    .map(|(id, _, _)| id)
+                    .collect()
+            };
+            let plain = config(ADVISORY);
+            let declared = Config::parse(&format!(
+                "[[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+                 [[endpoints]]\nname = \"b\"\nurl = \"https://b.example\"\n\
+                 [[validators]]\nidentity = \"2AKKnirWVZMhnzuwqpizw9SwfZjGpRFLx2zCCNtPWpbc\"\nlabel = \"v\"\n\
+                 [[hosts]]\nname = \"hw\"\nurl = \"http://127.0.0.1:9100/metrics\"\n\
+                 mitigated = [\"CVE-2026-99288\"]\n{ADVISORY}"
+            ))
+            .unwrap();
+
+            assert_eq!(firing(&plain, blind("6.8.0-54-generic")), ["advisory_exposed:hw CVE-2026-99288"]);
+            assert_eq!(firing(&declared, blind("6.8.0-54-generic")), ["advisory_upgrade:hw CVE-2026-99288"]);
+            assert_eq!(firing(&declared, blind("6.8.0-151-generic")), ["advisory_restore:hw CVE-2026-99288"]);
+            assert!(firing(&plain, blind("6.8.0-151-generic")).is_empty());
+        }
+
+        #[test]
+        fn a_loopback_host_is_this_machine_unless_told_otherwise() {
+            let host = |url: &str, local: &str| {
+                Config::parse(&format!(
+                    "[[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+                     [[endpoints]]\nname = \"b\"\nurl = \"https://b.example\"\n\
+                     [[validators]]\nidentity = \"2AKKnirWVZMhnzuwqpizw9SwfZjGpRFLx2zCCNtPWpbc\"\n\
+                     [[hosts]]\nname = \"hw\"\nurl = \"{url}\"\n{local}"
+                ))
+                .unwrap()
+                .hosts[0]
+                    .is_local()
+            };
+            assert!(host("http://127.0.0.1:9100/metrics", ""));
+            assert!(host("http://localhost:9100/metrics", ""));
+            assert!(host("http://[::1]:9100/metrics", ""));
+            assert!(!host("http://10.0.0.5:9100/metrics", ""));
+            assert!(!host("http://validator.internal:9100/metrics", ""));
+            // A tunnel to another machine's exporter terminates on loopback.
+            assert!(!host("http://127.0.0.1:19100/metrics", "local = false\n"));
+            assert!(host("http://10.0.0.5:9100/metrics", "local = true\n"));
         }
 
         #[test]
@@ -2319,10 +2578,6 @@ mod tests {
                 assert!(!still_configured(&id, &without), "{id}");
                 assert!(!still_configured(&format!("{kind}:gone CVE-2026-99288"), &with));
             }
-            // Dropping only the mitigation leaves exposure and retires the follow-ups.
-            let bare = config(&format!("[[advisories]]\nid = \"CVE-2026-99288\"\nfixed_in = [\"6.8.0-151\"]\n{NO_BUILTIN}"));
-            assert!(still_configured("advisory_exposed:hw CVE-2026-99288", &bare));
-            assert!(!still_configured("advisory_restore:hw CVE-2026-99288", &bare));
         }
 
         #[test]

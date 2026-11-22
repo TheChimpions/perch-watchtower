@@ -36,9 +36,9 @@ everything, only one alerts, the other takes over if it goes quiet.
 You are not missing much, and you should know exactly what:
 
 - Every validator, disk, balance and cluster check works identically.
-- With `[[hosts]]` configured, the built-in kernel advisories are tracked too;
-  see [kernel advisories](../docs/deployment.md#kernel-advisories) for the
-  node_exporter flags they need.
+- With `[[hosts]]` configured, the built-in kernel advisories are tracked too,
+  with no extra setup; see
+  [kernel advisories](../docs/deployment.md#kernel-advisories).
 - What you lose is detection of a machine going **hard down** — the watchtower
   dies with it and cannot report its own death.
 - Cover that with `[heartbeat]` instead. It pings Healthchecks.io, Better

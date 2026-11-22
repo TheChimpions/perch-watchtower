@@ -149,7 +149,7 @@ pub fn render(
             lines.push(format!("  vote account {}{runway}", sol(b)));
         }
         if let Some(ver) = &t.version {
-            lines.push(format!("  agave {ver}"));
+            lines.push(format!("  version {ver}"));
         }
     }
     if lines.is_empty() {
@@ -187,7 +187,7 @@ mod tests {
         assert!(body.contains("chimps"), "{body}");
         assert!(body.contains("leader slots 40, produced 38, skipped 2 (5.0%)"), "{body}");
         assert!(!body.contains("identity"), "{body}");
-        assert!(body.contains("agave 4.2.2"), "{body}");
+        assert!(body.contains("version 4.2.2"), "{body}");
         // No Alpenglow state observed: the balance, but no VAT runway claim.
         assert!(body.contains("vote account 6.48 SOL\n"), "{body}");
 

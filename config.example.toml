@@ -108,12 +108,10 @@ attempts = 3
 #
 #   ExecStart=/usr/local/bin/node_exporter \
 #     --web.listen-address=10.0.0.5:9100 \
-#     --collector.filesystem \
-#     --collector.uname --collector.os \
-#     --collector.sysctl --collector.sysctl.include=net.ipv4.tcp_syncookies
+#     --collector.filesystem
 #
-# The last two lines are for the kernel advisories below; the disk checks need
-# only --collector.filesystem.
+# A perch watching this host from another machine also wants --collector.uname
+# and --collector.os, for the kernel advisories below.
 #
 # Then reach it from the monitoring host over WireGuard/Tailscale, the same
 # private path you use for the validator's local RPC.
@@ -132,33 +130,45 @@ mountpoints = ["/", "/mnt/ledger", "/mnt/accounts"]
 validator = "chimps-1"
 timeout = "10s"
 attempts = 2
+# Kernel advisories whose stopgap you have applied on this host; see "Kernel
+# advisories" below. perch stops calling the host exposed, and tells you when
+# a fixed kernel makes the entry obsolete.
+mitigated = []
+# Whether this is the machine perch runs on, so the kernel can be read
+# directly. Unset, a loopback url means yes; set false for a tunnel to another
+# machine's exporter.
+# local = true
 
 
 # --- Kernel advisories ---------------------------------------------------------
 #
 # For the kernel bug that needs every operator to act the same day: apply a
-# sysctl as a stopgap, boot a patched kernel once your distribution ships one,
-# then undo the stopgap. Declare it here and every [[hosts]] entry is tracked
-# through those three steps, one Telegram note each:
+# stopgap, boot a patched kernel once your distribution ships one, then undo
+# the stopgap. Every [[hosts]] entry is tracked through those three steps, one
+# Telegram note each:
 #
-#   exposed   the running kernel lacks the fix and the mitigation is not applied
-#   upgrade   mitigated, and a fixed kernel now exists that is not the one running
-#   restore   the fix is running and the mitigation is still applied
+#   exposed   the running kernel lacks the fix and the host is not marked mitigated
+#   upgrade   marked mitigated, and a fixed kernel exists that is not the one running
+#   restore   the fix is running and the host is still marked mitigated
 #
-# perch ships with a short list of these (advisories.toml in the repository:
-# the kernel bugs every validator operator was asked to act on), compiled into
-# the binary, so upgrading perch is all it takes to be tracked against a new
-# one. [[advisories]] here adds your own. Declaring an id that is built in
-# replaces that entry; `ignore` under [checks.host_advisory] drops one.
+# There is nothing to set up. For the machine perch runs on (a host with a
+# loopback url) it reads the kernel with uname(2) and the distribution from
+# /etc/os-release, which any unprivileged process can do. It does not run as
+# root, and nothing is installed on the host.
 #
-# Nothing is discovered or downloaded to build the list, and nothing new runs
-# on the host: perch reads the kernel and the sysctl from the node_exporter
-# scrape it already makes, so node_exporter needs three more collectors:
+# What it cannot see, you tell it. A stopgap is a sysctl or a firewall rule,
+# and perch is not given the access to read either. Apply it as the advisory
+# says, then list the advisory under `mitigated` on the host (see [[hosts]]
+# above):
 #
-#   --collector.uname --collector.os \
-#   --collector.sysctl --collector.sysctl.include=net.ipv4.tcp_syncookies
+#   mitigated = ["CVE-2026-99288"]
 #
-# A collector that is missing reads as unknown and names the flag, never as fine.
+# perch ships with a short list of advisories (advisories.toml in the
+# repository: the kernel bugs every validator operator was asked to act on),
+# compiled into the binary, so upgrading perch is all it takes to be tracked
+# against a new one. [[advisories]] here adds your own. Declaring an id that
+# is built in replaces that entry; `ignore` under [checks.host_advisory] drops
+# one.
 #
 # [[advisories]]
 # id = "CVE-2026-99288"
@@ -177,7 +187,8 @@ attempts = 2
 # # A stopgap perch cannot check, such as a firewall rule: a sentence appended
 # # to the alert while the host is unpatched.
 # note = "Until then, block X at the firewall."
-# # The temporary measure. Omit it and only `exposed` is reported.
+# # The stopgap, when it is a sysctl: named in the alert, and checked against
+# # the live value on a host whose node_exporter happens to export it.
 # [advisories.mitigation]
 # sysctl = "net.ipv4.tcp_syncookies"
 # value = 0
@@ -391,14 +402,17 @@ severity = "page"
 renotify_after = "0s"
 warn_epochs = 3
 
+# The validator's version and client (Agave, Frankendancer, Firedancer) are read
+# from gossip through any endpoint, so this works with the validator's own RPC
+# port closed, and each client is held to its own floor in the schedule.
 [checks.sfdp_version]
 enabled = true
 pending_for = "0s"
 clear_after = 1
 severity = "page"
 renotify_after = "6h"
-# Re-fetch this often; once per epoch would notice a mid-epoch announcement up
-# to two days late. Floored at 5m.
+# Re-fetch the schedule and the gossip listing this often; once per epoch would
+# notice a mid-epoch announcement up to two days late. Floored at 5m.
 poll_interval = "1h"
 # Telegram note whenever the schedule changes at all. Every box on a cluster
 # sees the same schedule, so enable this on ONE box per cluster.
@@ -570,8 +584,8 @@ clear_after = 2
 severity = "page"
 renotify_after = "30m"
 
-# A host exposed to one of the [[advisories]] above. `severity` applies to a box
-# that is neither patched nor mitigated; set it to "page" for a bug you would
+# A host exposed to one of the advisories above. `severity` applies to a box
+# that is neither patched nor marked mitigated; set it to "page" for a bug you would
 # get out of bed for. The upgrade and restore follow-ups are always "notify".
 [checks.host_advisory]
 enabled = true

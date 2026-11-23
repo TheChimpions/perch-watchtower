@@ -232,7 +232,8 @@ impl Peer {
         status
     }
 
-    async fn fetch(&self) -> Result<String, String> {
+    /// The peer's metrics page, as text.
+    pub async fn fetch(&self) -> Result<String, String> {
         let resp = self
             .client
             .get(&self.url)

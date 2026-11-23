@@ -59,6 +59,9 @@ enum Command {
     ///   perch maint 30m            plain timed silence
     ///   perch maint off            resume paging now
     ///   perch maint                show current state
+    ///
+    /// With `[[peers]]` configured, declaring a window waits (up to 3m) until
+    /// they have recorded it, so the machine can then be taken down unpaged.
     Maint {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -193,7 +196,11 @@ async fn main() -> Result<()> {
     // maintenance usually cannot read the env file -- nor should they need to.
     if let Some(Command::Maint { args: maint_args }) = &args.command {
         let silence = perch::maint::silence_file_from(&config_path)?;
-        return perch::maint::run(silence.as_deref(), maint_args);
+        let Some(deadline) = perch::maint::run(silence.as_deref(), maint_args)? else {
+            return Ok(());
+        };
+        let watchers = perch::maint::watchers_from(&config_path)?;
+        return perch::maint::confirm_with_peers(&watchers, deadline, perch::maint::CONFIRM_WITHIN).await;
     }
 
     let config = Config::load(&config_path)?;
@@ -918,6 +925,7 @@ async fn run_cycle(
         snapshots: &snapshots,
         host_snapshots: &host_snapshots,
         peers: &peer_statuses,
+        peer_maintenance: &rt.peer_maintenance,
         is_owner,
         disk: &rt.disk,
         outcomes: &outcomes,

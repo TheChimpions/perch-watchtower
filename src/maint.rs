@@ -101,7 +101,9 @@ pub fn describe(silence: &Silence) -> String {
     }
 }
 
-pub fn run(silence_file: Option<&str>, args: &[String]) -> Result<()> {
+/// Declares or clears the window and prints the result. Returns the deadline
+/// of a window this call opened, for `confirm_with_peers`.
+pub fn run(silence_file: Option<&str>, args: &[String]) -> Result<Option<DateTime<Utc>>> {
     let action = parse(args)?;
     let Some(path) = silence_file else {
         bail!(
@@ -143,7 +145,179 @@ pub fn run(silence_file: Option<&str>, args: &[String]) -> Result<()> {
              deadline, which is extended while the validator waits if [diagnose] log is set."
         );
     }
-    Ok(())
+    Ok(match action {
+        Action::Restart(_) | Action::For(_) | Action::ClusterRestart(_) => state.deadline(),
+        Action::Show | Action::Off => None,
+    })
+}
+
+/// The other instances this one is configured to watch, and the name they
+/// know it by: `[peering] name` and each `[[peers]]` name and url. Like
+/// `silence_file_from`, read without resolving a single secret.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Watchers {
+    pub name: Option<String>,
+    pub peers: Vec<(String, String)>,
+}
+
+pub fn watchers_from(config: &std::path::Path) -> Result<Watchers> {
+    let raw = std::fs::read_to_string(config)
+        .with_context(|| format!("reading config {}", config.display()))?;
+    let doc: toml::Table =
+        toml::from_str(&raw).with_context(|| format!("parsing config {}", config.display()))?;
+    let text = |t: &toml::Value, key: &str| t.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    Ok(Watchers {
+        name: doc.get("peering").and_then(|p| text(p, "name")),
+        peers: doc
+            .get("peers")
+            .and_then(|p| p.as_array())
+            .map(|peers| {
+                peers
+                    .iter()
+                    .filter_map(|p| Some((text(p, "name")?, text(p, "url")?)))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+/// What a peer's metrics page says about a window this instance declared.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PeerView {
+    /// It holds the window, so this machine going silent will not page there.
+    Recorded,
+    /// It would say so, and has not yet.
+    NotYet,
+    /// It does not report the windows it holds: a perch from before 1.5.3,
+    /// or one that watches no peers at all.
+    CannotSay,
+    /// It watches other instances, and none by this one's name.
+    NotWatching,
+}
+
+/// Read a peer's exposition for the window ending at `deadline` (unix).
+///
+/// A peer files the window under its own `[[peers]] name` for this instance,
+/// which is `[peering] name` here when both are set as documented. A series
+/// carrying exactly this deadline is accepted whatever its label, so a name
+/// that differs between the two configs does not turn into a wait that can
+/// never end. A later deadline under this name also counts: a cluster-restart
+/// window is extended while the validator waits.
+pub fn peer_view(exposition: &str, me: Option<&str>, deadline: u64) -> PeerView {
+    use crate::node_exporter::parse_line;
+    let mut declared = exposition.contains("# TYPE perch_peer_maintenance_until_seconds ");
+    let mut watched: Vec<String> = Vec::new();
+    for line in exposition.lines() {
+        let Some((name, labels, value)) = parse_line(line) else { continue };
+        let peer = labels.get("peer").map(String::as_str);
+        match name.as_str() {
+            "perch_peer_maintenance_until_seconds" => {
+                declared = true;
+                let until = value as u64;
+                if until == deadline || (me.is_some() && peer == me && until > deadline) {
+                    return PeerView::Recorded;
+                }
+            }
+            "perch_peer_reachable" => watched.extend(peer.map(str::to_string)),
+            _ => {}
+        }
+    }
+    if !declared {
+        return PeerView::CannotSay;
+    }
+    match me {
+        Some(me) if !watched.is_empty() && !watched.iter().any(|w| w == me) => PeerView::NotWatching,
+        _ => PeerView::NotYet,
+    }
+}
+
+/// A window travels from the silence file to this machine's perch (its next
+/// cycle), and from there to each peer (that peer's next cycle). Two default
+/// 60-second cycles and their run time fit in this with room to spare.
+pub const CONFIRM_WITHIN: Duration = Duration::from_secs(180);
+const CONFIRM_POLL: Duration = Duration::from_secs(3);
+
+/// Wait until every peer that watches this instance holds the window.
+///
+/// On 2026-11-23 refi-main was rebooted seconds after `perch maint restart`.
+/// The silence file was written, but the box went down before its perch ran
+/// another cycle, so the hub never heard of the window and paged a dead
+/// machine. Declaring a window and it being known where it matters are two
+/// events; this closes the gap by not returning until the second has happened,
+/// and fails when it does not, so `perch maint restart && sudo reboot` stops.
+pub async fn confirm_with_peers(watchers: &Watchers, deadline: DateTime<Utc>, within: Duration) -> Result<()> {
+    if watchers.peers.is_empty() {
+        return Ok(());
+    }
+    let deadline = deadline.timestamp().max(0) as u64;
+    let me = watchers.name.as_deref();
+    let mut waiting: Vec<crate::peer::Peer> = watchers
+        .peers
+        .iter()
+        .map(|(name, url)| crate::peer::Peer::new(name.clone(), url.clone(), 0, None, Duration::from_secs(5)))
+        .collect::<Result<_>>()?;
+    println!(
+        "Waiting for {} to record this window, so that this machine going down is not \
+         reported as a dead one (up to {}). Ctrl-C stops the wait; the window stays.",
+        waiting.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "),
+        humantime::format_duration(within),
+    );
+
+    let started = std::time::Instant::now();
+    let mut last_seen: std::collections::HashMap<String, String> = Default::default();
+    let (mut recorded, mut unconfirmed) = (0, false);
+    loop {
+        let mut still = Vec::new();
+        for p in waiting {
+            match p.fetch().await.map(|text| peer_view(&text, me, deadline)) {
+                Ok(PeerView::Recorded) => {
+                    recorded += 1;
+                    println!("{} has recorded it.", p.name);
+                }
+                Ok(PeerView::CannotSay) => {
+                    unconfirmed = true;
+                    println!(
+                        "{} does not report the windows it holds (a perch older than 1.5.3?), so \
+                         it cannot confirm. Give it two minutes before taking this machine down.",
+                        p.name
+                    );
+                }
+                Ok(PeerView::NotWatching) => println!(
+                    "{} does not watch this instance ({}), so it has nothing to record.",
+                    p.name,
+                    me.unwrap_or("?")
+                ),
+                Ok(PeerView::NotYet) => {
+                    last_seen.insert(p.name.clone(), "answers, but has not recorded the window".into());
+                    still.push(p);
+                }
+                Err(e) => {
+                    last_seen.insert(p.name.clone(), format!("unreachable: {e}"));
+                    still.push(p);
+                }
+            }
+        }
+        waiting = still;
+        if waiting.is_empty() {
+            if recorded > 0 && !unconfirmed {
+                println!("Safe to take this machine down.");
+            }
+            return Ok(());
+        }
+        if started.elapsed() >= within {
+            let why: Vec<String> = waiting
+                .iter()
+                .map(|p| format!("{} ({})", p.name, last_seen.get(&p.name).map(String::as_str).unwrap_or("no answer")))
+                .collect();
+            bail!(
+                "the window is set here, but after {} it is not recorded by: {}. If this machine \
+                 goes down now, that instance may page for it. Is perch running on this machine?",
+                humantime::format_duration(within),
+                why.join(", ")
+            );
+        }
+        tokio::time::sleep(CONFIRM_POLL).await;
+    }
 }
 
 /// Write the silence file without following a symlink at its path.
@@ -351,6 +525,107 @@ mod tests {
             }
         );
         std::fs::remove_file(p).unwrap();
+    }
+
+    const HUB: &str = "\
+# HELP perch_peer_reachable 1 when the peer's metrics endpoint answered
+# TYPE perch_peer_reachable gauge
+perch_peer_reachable{peer=\"refi-main\"} 1
+perch_peer_reachable{peer=\"fox-main\"} 1
+# HELP perch_peer_maintenance_until_seconds Unix deadline
+# TYPE perch_peer_maintenance_until_seconds gauge
+";
+
+    /// The 2026-11-23 page: the hub answered, and had not heard of the window.
+    #[test]
+    fn a_peer_that_has_not_heard_of_the_window_is_not_yet() {
+        assert_eq!(peer_view(HUB, Some("refi-main"), 1_795_455_396), PeerView::NotYet);
+        // Another peer's window is not ours.
+        let other = format!("{HUB}perch_peer_maintenance_until_seconds{{peer=\"fox-main\"}} 1795459999\n");
+        assert_eq!(peer_view(&other, Some("refi-main"), 1_795_455_396), PeerView::NotYet);
+        // Nor is an older window of our own that the peer still remembers.
+        let stale = format!("{HUB}perch_peer_maintenance_until_seconds{{peer=\"refi-main\"}} 1795450000\n");
+        assert_eq!(peer_view(&stale, Some("refi-main"), 1_795_455_396), PeerView::NotYet);
+    }
+
+    #[test]
+    fn a_peer_holding_the_window_has_recorded_it() {
+        let held = format!("{HUB}perch_peer_maintenance_until_seconds{{peer=\"refi-main\"}} 1795455396\n");
+        assert_eq!(peer_view(&held, Some("refi-main"), 1_795_455_396), PeerView::Recorded);
+        // A cluster-restart window the validator's wait has extended.
+        let extended = format!("{HUB}perch_peer_maintenance_until_seconds{{peer=\"refi-main\"}} 1795459000\n");
+        assert_eq!(peer_view(&extended, Some("refi-main"), 1_795_455_396), PeerView::Recorded);
+    }
+
+    /// The hub calls this box something else, or `[peering] name` is unset:
+    /// the exact deadline still identifies the window.
+    #[test]
+    fn the_exact_deadline_is_recognised_under_any_name() {
+        let held = format!("{HUB}perch_peer_maintenance_until_seconds{{peer=\"refi-main\"}} 1795455396\n");
+        assert_eq!(peer_view(&held, Some("refi"), 1_795_455_396), PeerView::Recorded);
+        assert_eq!(peer_view(&held, None, 1_795_455_396), PeerView::Recorded);
+        // A later deadline under someone else's name is someone else's window.
+        let later = format!("{HUB}perch_peer_maintenance_until_seconds{{peer=\"refi-main\"}} 1795459000\n");
+        assert_eq!(peer_view(&later, None, 1_795_455_396), PeerView::NotYet);
+    }
+
+    /// A 1.5.2 hub would never confirm; waiting three minutes for it on every
+    /// restart, and then failing, would teach operators to ignore the wait.
+    #[test]
+    fn a_peer_that_cannot_report_windows_is_told_apart() {
+        let old = "perch_peer_reachable{peer=\"refi-main\"} 1\nperch_maintenance_until_seconds 0\n";
+        assert_eq!(peer_view(old, Some("refi-main"), 1_795_455_396), PeerView::CannotSay);
+    }
+
+    #[test]
+    fn a_peer_that_watches_others_but_not_this_instance_has_nothing_to_record() {
+        assert_eq!(peer_view(HUB, Some("salmon-main"), 1_795_455_396), PeerView::NotWatching);
+        // Without a name of our own there is no telling, so it is waited for.
+        assert_eq!(peer_view(HUB, None, 1_795_455_396), PeerView::NotYet);
+        // A peer that watches nobody declares no peer metrics at all.
+        assert_eq!(peer_view("perch_visible 1\n", Some("salmon-main"), 1), PeerView::CannotSay);
+    }
+
+    #[test]
+    fn the_peers_to_ask_come_from_the_config_without_its_secrets() {
+        let d = tmpdir();
+        let cfg = d.join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[peering]\nname = \"refi-main\"\npriority = 2\n\n\
+             [[peers]]\nname = \"failover-hub\"\nurl = \"http://127.0.0.1:19469/metrics\"\npriority = 1\n\n\
+             [notify.telegram]\nbot_token = \"env:NOT_SET_ANYWHERE\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            watchers_from(&cfg).unwrap(),
+            Watchers {
+                name: Some("refi-main".into()),
+                peers: vec![("failover-hub".into(), "http://127.0.0.1:19469/metrics".into())],
+            }
+        );
+        std::fs::write(&cfg, "[watchtower]\nname = \"solo\"\n").unwrap();
+        assert_eq!(watchers_from(&cfg).unwrap(), Watchers::default());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn with_no_peers_there_is_nothing_to_wait_for() {
+        confirm_with_peers(&Watchers::default(), Utc::now(), Duration::from_secs(60)).await.unwrap();
+    }
+
+    /// A peer that never confirms fails the command, naming the peer and what
+    /// it last said, so `perch maint restart && sudo reboot` does not go on.
+    #[tokio::test]
+    async fn a_peer_that_never_confirms_fails_the_command() {
+        let watchers = Watchers {
+            name: Some("refi-main".into()),
+            // Nothing listens on port 1.
+            peers: vec![("failover-hub".into(), "http://127.0.0.1:1/metrics".into())],
+        };
+        let err = confirm_with_peers(&watchers, Utc::now(), Duration::ZERO).await.unwrap_err().to_string();
+        assert!(err.contains("not recorded by: failover-hub (unreachable"), "{err}");
+        assert!(err.contains("the window is set here"), "{err}");
     }
 
     #[test]

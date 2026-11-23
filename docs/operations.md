@@ -22,6 +22,25 @@ reads, and prints what it wrote as the daemon's own parser reads it back, so it
 cannot report "suppressed" for a file perch never looks at. It reads only
 `[silence] file`, not the secrets, so any user in the `perch` group can run it.
 
+On a box with `[[peers]]`, the command then waits until each of them has the
+window, and only then says the machine can go down:
+
+```
+Waiting for failover-hub to record this window, so that this machine going down
+is not reported as a dead one (up to 3m). Ctrl-C stops the wait; the window stays.
+failover-hub has recorded it.
+Safe to take this machine down.
+```
+
+A window reaches a peer in two steps: this box's perch reads the silence file
+on its next cycle and publishes it, and the peer reads that on its own next
+cycle. Rebooting between the two leaves the peer looking at a dead machine it
+was never told about, and it pages. The wait is usually one to two minutes. If
+a peer has not recorded the window after three, the command exits non-zero and
+names it, so `perch maint restart && sudo reboot` stops there. A peer running a
+perch older than 1.5.3 cannot confirm; the command says so and does not wait
+for it.
+
 Arm it **before** you start. The window waits for the work to actually begin --
 it will not resume while the validator is still healthy, so there is no race
 between arming it and touching the box. Once something does go wrong, it starts
@@ -171,7 +190,9 @@ cluster confirms the validator stopped voting, and the hub pages for a dead
 machine — with the maintenance flag sitting on the box that just went away.
 
 So the hub caches each peer's last-seen declaration, and honours it even after
-the peer disappears. An undeclared disappearance still pages; suppression
+the peer disappears. It exports what it holds as
+`perch_peer_maintenance_until_seconds{peer="..."}`, which is what `perch maint`
+on the spoke waits to see before it reports the machine safe to take down. An undeclared disappearance still pages; suppression
 requires a declaration. The cache is persisted, because a hub restarting
 mid-window would otherwise forget and page for a box that is deliberately down.
 
@@ -618,6 +639,7 @@ perch_start_timestamp_seconds
 perch_peer_reachable{peer="..."}
 perch_peer_last_cycle_age_seconds{peer="..."}
 perch_peer_visible{peer="..."}
+perch_peer_maintenance_until_seconds{peer="..."}   a peer's window, as recorded here
 perch_host_scrape_ok{host="..."}
 perch_filesystem_avail_bytes{host="...",mountpoint="...",device="..."}
 perch_filesystem_size_bytes{host="...",mountpoint="...",device="..."}

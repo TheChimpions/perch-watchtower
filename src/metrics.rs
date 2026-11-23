@@ -197,6 +197,9 @@ pub struct CycleReport<'a> {
     pub snapshots: &'a [Snapshot],
     pub host_snapshots: &'a [HostSnapshot],
     pub peers: &'a [PeerStatus],
+    /// Peer name -> unix deadline of the maintenance window it declared, as
+    /// this instance remembers it.
+    pub peer_maintenance: &'a HashMap<String, u64>,
     pub is_owner: bool,
     pub disk: &'a DiskHistory,
     pub outcomes: &'a [CheckOutcome],
@@ -938,6 +941,19 @@ pub fn render(r: &CycleReport<'_>) -> String {
                 e.value("perch_peer_visible", &labels, v as u8 as f64);
             }
         }
+        // The header is written even with no window open: it is how `perch
+        // maint` on a peer tells an instance that would confirm a window from
+        // one too old to.
+        e.metric(
+            "perch_peer_maintenance_until_seconds",
+            "Unix deadline of the maintenance window this instance has recorded for a peer. `perch maint` on that peer waits for this before reporting the machine safe to take down.",
+            "gauge",
+        );
+        let mut windows: Vec<(&String, &u64)> = r.peer_maintenance.iter().collect();
+        windows.sort();
+        for (peer, until) in windows {
+            e.value("perch_peer_maintenance_until_seconds", &[("peer", peer.as_str())], *until as f64);
+        }
     }
 
     if !r.disk.projections().is_empty() {
@@ -987,6 +1003,8 @@ pub fn render(r: &CycleReport<'_>) -> String {
 #[cfg(test)]
 static NO_GOSSIP: std::sync::LazyLock<HashMap<String, crate::sfdp::GossipNode>> =
     std::sync::LazyLock::new(HashMap::new);
+#[cfg(test)]
+static NO_WINDOWS: std::sync::LazyLock<HashMap<String, u64>> = std::sync::LazyLock::new(HashMap::new);
 #[cfg(test)]
 static NO_LABELS: std::sync::LazyLock<HashMap<String, String>> =
     std::sync::LazyLock::new(HashMap::new);
@@ -1047,6 +1065,7 @@ mod notify_metrics {
             snapshots: &[],
             host_snapshots: &[],
             peers: &[],
+            peer_maintenance: &NO_WINDOWS,
             is_owner: true,
             disk: &disk,
             outcomes: &[],
@@ -1118,6 +1137,7 @@ mod version_metric {
             snapshots: snaps,
             host_snapshots: &[],
             peers: &[],
+            peer_maintenance: &NO_WINDOWS,
             is_owner: true,
             disk: &disk,
             outcomes: &[],
@@ -1211,6 +1231,72 @@ mod version_metric {
 }
 
 #[cfg(test)]
+mod peer_windows {
+    use super::*;
+    use crate::notify::NotifyCounts;
+
+    fn peer(name: &str) -> PeerStatus {
+        PeerStatus {
+            name: name.into(),
+            priority: 2,
+            validator: None,
+            reachable: true,
+            last_cycle_age: Some(Duration::from_secs(5)),
+            visible: Some(true),
+            version: None,
+            uptime: None,
+            maintenance_until: None,
+            cluster: None,
+            error: None,
+        }
+    }
+
+    fn render_hub(peers: &[PeerStatus], windows: &HashMap<String, u64>) -> String {
+        let disk = DiskHistory::default();
+        let (states, health, suppressed) = (HashMap::new(), HashMap::new(), HashMap::new());
+        render(&CycleReport {
+            snapshots: &[], host_snapshots: &[], peers, peer_maintenance: windows, is_owner: true, disk: &disk,
+            outcomes: &[], states: &states, endpoint_health: &health, suppressed: &suppressed,
+            visible: true, silenced: false, cycle_duration: Duration::from_secs(1),
+            unix_time: 1_700_000_000, maintenance_until: 0, restart_gossip_percent: None, start_time: 1_699_000_000,
+            notify: NotifyCounts::default(), maintenance_streak: 0, maintenance_awaiting_work: false,
+            watchtower_name: "hub", solana_cluster: "unpinned", validator_labels: &HashMap::new(), gossip: &HashMap::new(), alerting: crate::config::Alerting::Peers,
+            jpool_security_sol_per_1000: 0.5,
+        })
+    }
+
+    /// On 2026-11-23 refi-main was rebooted seconds after `perch maint
+    /// restart`, before its window reached the hub, and the hub paged a dead
+    /// machine. The hub now says which windows it holds, so `perch maint` can
+    /// wait for that before the operator takes the box down.
+    #[test]
+    fn a_recorded_peer_window_is_exported() {
+        let windows = HashMap::from([("refi-main".to_string(), 1_795_455_396u64)]);
+        let out = render_hub(&[peer("refi-main"), peer("fox-main")], &windows);
+        assert!(
+            out.contains("perch_peer_maintenance_until_seconds{peer=\"refi-main\"} 1795455396\n"),
+            "got:\n{out}"
+        );
+        assert!(!out.contains("perch_peer_maintenance_until_seconds{peer=\"fox-main\"}"), "got:\n{out}");
+    }
+
+    /// With no window open the metric is still declared: its absence is how
+    /// `perch maint` recognises a peer too old to confirm anything.
+    #[test]
+    fn the_metric_is_declared_with_no_window_open() {
+        let out = render_hub(&[peer("refi-main")], &HashMap::new());
+        assert!(out.contains("# TYPE perch_peer_maintenance_until_seconds gauge"), "got:\n{out}");
+        assert!(!out.contains("perch_peer_maintenance_until_seconds{"), "got:\n{out}");
+    }
+
+    #[test]
+    fn an_instance_with_no_peers_declares_nothing_about_them() {
+        let out = render_hub(&[], &HashMap::new());
+        assert!(!out.contains("perch_peer_maintenance_until_seconds"), "got:\n{out}");
+    }
+}
+
+#[cfg(test)]
 mod build_identity {
     use super::*;
     use crate::notify::NotifyCounts;
@@ -1222,7 +1308,7 @@ mod build_identity {
         let disk = DiskHistory::default();
         let (states, health, suppressed) = (HashMap::new(), HashMap::new(), HashMap::new());
         let out = render(&CycleReport {
-            snapshots: &[], host_snapshots: &[], peers: &[], is_owner: true, disk: &disk,
+            snapshots: &[], host_snapshots: &[], peers: &[], peer_maintenance: &NO_WINDOWS, is_owner: true, disk: &disk,
             outcomes: &[], states: &states, endpoint_health: &health, suppressed: &suppressed,
             visible: true, silenced: false, cycle_duration: Duration::from_secs(1),
             unix_time: 1_700_000_000, maintenance_until: 0, restart_gossip_percent: None, start_time: 1_699_000_000,
@@ -1258,6 +1344,7 @@ mod alpenglow_metrics {
             snapshots: snaps,
             host_snapshots: &[],
             peers: &[],
+            peer_maintenance: &NO_WINDOWS,
             is_owner: true,
             disk: &disk,
             outcomes: &[],

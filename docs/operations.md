@@ -576,6 +576,10 @@ Both are tested against a live Grafana and Prometheus.
   is behind the most advanced one.
 - **Disks**: projected time to full, free space, space and inode use, and
   read-only remounts.
+- **Firedancer**: the state Firedancer reports for voting, replay and turbine,
+  whether its metrics port answered and replay has caught up, how full the
+  accounts index and accounts database file are, and uptime per host. Empty
+  unless a host has `firedancer_url`.
 - **Watchtowers**: cycle age and duration, which instance owns alerting, and
   peers as each instance sees them.
 - **Notifications**: what was delivered and lost, when, and how long since each

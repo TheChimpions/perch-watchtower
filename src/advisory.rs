@@ -118,8 +118,8 @@ pub struct Kernel {
     flavour: String,
     /// `uname -v` says this is an Ubuntu build.
     ubuntu: bool,
-    /// An Ubuntu backport ("#14~22.04.1-Ubuntu"): built from a differently
-    /// named source package that cannot be inferred from the flavour alone.
+    /// An Ubuntu backport ("#14~22.04.1-Ubuntu"): a newer series built for an
+    /// older release, from a source package named after that series.
     backport: bool,
 }
 
@@ -164,15 +164,27 @@ impl Kernel {
     }
 
     /// The Ubuntu source package this kernel was built from, where the
-    /// flavour says so unambiguously.
+    /// flavour and series say so.
+    ///
+    /// A release's own kernel comes from `linux` or `linux-<flavour>`. A
+    /// backport comes from a package named for its series: 24.04 running 7.0
+    /// ("#43~24.04.1-Ubuntu") is `linux-hwe-7.0`, which Ubuntu tracks on its
+    /// own row. Only the generic and lowlatency backports follow that one
+    /// pattern; the cloud flavours do not, and are left to `fixed_in`. A wrong
+    /// guess here costs nothing worse than that: the tracker has no such
+    /// package for the release, and says so.
     fn ubuntu_package(&self) -> Option<String> {
-        if !self.ubuntu || self.backport || self.flavour.is_empty() {
+        if !self.ubuntu || self.flavour.is_empty() {
             return None;
         }
-        Some(match self.flavour.as_str() {
-            "generic" => "linux".to_string(),
-            f => format!("linux-{f}"),
-        })
+        let (major, minor) = self.series();
+        match (self.backport, self.flavour.as_str()) {
+            (false, "generic") => Some("linux".to_string()),
+            (false, f) => Some(format!("linux-{f}")),
+            (true, "generic") => Some(format!("linux-hwe-{major}.{minor}")),
+            (true, "lowlatency") => Some(format!("linux-lowlatency-hwe-{major}.{minor}")),
+            (true, _) => None,
+        }
     }
 }
 
@@ -282,6 +294,12 @@ impl UbuntuCve {
                 }
             }
             "not-affected" => Patch::NotAffected,
+            // "Does not exist": the release never carried this package, so the
+            // kernel was not built from the one perch took it for.
+            "DNE" => Patch::Unknown(format!(
+                "Ubuntu publishes no {package} for {codename}, so the tracker cannot place this kernel; \
+                 add its fixed version to fixed_in"
+            )),
             // Acknowledged or not yet looked at; either way nothing to boot.
             "needed" | "needs-triage" | "pending" | "deferred" | "in-progress" => Patch::Unpatched { fix: None },
             other => Patch::Unknown(format!(
@@ -691,10 +709,15 @@ mod tests {
         let aws = Kernel::parse("6.8.0-1021-aws", Some("#23-Ubuntu SMP Mon Dec  9 2024")).unwrap();
         assert_eq!(aws.ubuntu_package().as_deref(), Some("linux-aws"));
 
-        // A backport is built from linux-hwe-<series>, which the flavour does
-        // not say. Guessing "linux" would read the wrong row.
+        // A backport is built from linux-hwe-<series>; "linux" would be the
+        // release's own, older kernel, and the wrong row.
         let hwe = Kernel::parse("6.8.0-60-generic", Some("#63~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC")).unwrap();
-        assert_eq!(hwe.ubuntu_package(), None);
+        assert_eq!(hwe.ubuntu_package().as_deref(), Some("linux-hwe-6.8"));
+        let low = Kernel::parse("6.8.0-60-lowlatency", Some("#63~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC")).unwrap();
+        assert_eq!(low.ubuntu_package().as_deref(), Some("linux-lowlatency-hwe-6.8"));
+        // The cloud backports are named less regularly; none is guessed.
+        let aws = Kernel::parse("6.8.0-1021-aws", Some("#23~22.04.1-Ubuntu SMP")).unwrap();
+        assert_eq!(aws.ubuntu_package(), None);
 
         let debian = Kernel::parse("6.12.48+deb13-amd64", Some("#1 SMP PREEMPT_DYNAMIC Debian 6.12.48-1")).unwrap();
         assert!(!debian.ubuntu);
@@ -836,9 +859,58 @@ mod tests {
         let a = assess("fox", &noisytcp(), &blind(NOBLE_54), &Tracked::new(), false);
         assert!(unknown(&a.exposed).contains("not been fetched"));
 
-        // A backport kernel the tracker row cannot be chosen for.
+        // A backport whose package the release does not carry (the fixture
+        // lists linux-hwe-6.8 on noble as DNE), and one that is never guessed.
         let hwe = ("6.8.0-60-generic", "#63~22.04.1-Ubuntu SMP");
-        assert!(unknown(&assess("fox", &noisytcp(), &blind(hwe), &untriaged(), false).exposed).contains("fixed_in"));
+        let why = assess("fox", &noisytcp(), &blind(hwe), &untriaged(), false).exposed;
+        assert!(unknown(&why).contains("no linux-hwe-6.8 for noble"), "{why:?}");
+        assert!(unknown(&why).contains("fixed_in"), "{why:?}");
+        let aws = ("6.8.0-1021-aws", "#23~22.04.1-Ubuntu SMP");
+        assert!(unknown(&assess("fox", &noisytcp(), &blind(aws), &untriaged(), false).exposed).contains("fixed_in"));
+    }
+
+    /// fox-main's replacement on 2026-11-24: Ubuntu 24.04 on the 7.0 HWE
+    /// kernel. perch could not place it and left both advisories unknown,
+    /// though Ubuntu tracks linux-hwe-7.0 on its own rows, as below.
+    fn hwe_7_0(id: &str, status: &str, description: &str) -> Tracked {
+        let body = format!(
+            r#"{{"id":"{id}","packages":[
+                {{"name":"linux","statuses":[
+                    {{"release_codename":"noble","status":"released","description":"6.8.0-149.149"}},
+                    {{"release_codename":"resolute","status":"released","description":"7.0.0-43.43"}}]}},
+                {{"name":"linux-hwe-7.0","statuses":[
+                    {{"release_codename":"resolute","status":"DNE","description":""}},
+                    {{"release_codename":"noble","status":"{status}","description":"{description}"}}]}}]}}"#
+        );
+        HashMap::from([(id.to_string(), UbuntuCve::parse(&body).unwrap())])
+    }
+
+    const NOBLE_HWE_43: (&str, &str) = ("7.0.0-43-generic", "#43~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Sat Oct 31 06:52:47 UTC 2026");
+
+    #[test]
+    fn an_hwe_kernel_is_judged_on_its_own_tracker_row() {
+        let adv = AdvisoryConfig { id: "CVE-2026-98432".into(), fixed_in: vec![], mitigation: None, ..noisytcp() };
+        let fixed = hwe_7_0("CVE-2026-98432", "released", "7.0.0-43.43~24.04.1");
+        let a = assess("fox", &adv, &blind(NOBLE_HWE_43), &fixed, false);
+        assert_eq!(a.exposed, Verdict::Healthy);
+
+        // One upload short of the fix: exposed, and told what to boot. Read
+        // against noble's own `linux` row (6.8.0-149), 7.0.0-42 would pass.
+        let older = ("7.0.0-42-generic", "#42~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC");
+        let a = assess("fox", &adv, &blind(older), &fixed, false);
+        assert!(unhealthy(&a.exposed).contains("linux-hwe-7.0 7.0.0-43.43~24.04.1"), "{:?}", a.exposed);
+    }
+
+    /// No fix yet for the HWE series: exposed until the operator declares the
+    /// mitigation, like any other kernel.
+    #[test]
+    fn an_hwe_kernel_with_no_fix_yet_follows_the_mitigation() {
+        let adv = AdvisoryConfig { fixed_in: vec![], ..noisytcp() };
+        let needed = hwe_7_0("CVE-2026-99288", "needed", "");
+        let a = assess("fox", &adv, &blind(NOBLE_HWE_43), &needed, false);
+        assert!(unhealthy(&a.exposed).contains("No patched kernel is listed"), "{:?}", a.exposed);
+        let a = assess("fox", &adv, &blind(NOBLE_HWE_43), &needed, true);
+        assert_eq!(a.exposed, Verdict::Healthy);
     }
 
     #[test]

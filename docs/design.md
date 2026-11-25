@@ -229,6 +229,44 @@ Six checks suppressed, one page, naming the cause rather than the symptom.
 Without the link, disk problems inhibit nothing — there is nothing to say whose
 disk it is, so suppressing a delinquency would be a guess.
 
+### Firedancer says what state it is in
+
+Firedancer is usually run with its RPC port off, so there is no local node to
+compare against the cluster, and a validator that falls behind is first noticed
+when the cluster calls it delinquent. But its metric tile serves a page in
+which it reports its own verdict on voting, replay and turbine
+(`diag_vote_state` and friends), a heartbeat for every tile, and how full its
+accounts index is. perch reads that page for any host that sets
+`firedancer_url`. It is a plain HTTP GET, so it fits the rule that perch holds
+no keys and needs no privilege.
+
+It is one source, so nothing corroborates it, and the tri-state rule does the
+work instead:
+
+- **Silence is only evidence where the machine is known to be up.** A port
+  that does not answer pages as `firedancer_down` when perch is on that
+  machine, or when the machine's node_exporter answered in the same cycle.
+  From anywhere else it is Unknown: the path could be what broke.
+- **A start-up is not an incident.** Until replay first reaches the tip
+  (`replay_is_caught_up`), "behind" and "delinquent" are held as warming up.
+  They neither fire nor count toward "this check cannot be evaluated".
+- **An absent metric is no opinion.** The names are Firedancer's, and they
+  differ between versions and forks. A metric the build does not export
+  produces no check; a state value perch does not know reads Unknown.
+- **A stalled tile is measured against the page, not perch's clock.** A tile
+  marked running is stalled when its heartbeat trails the freshest tile's by
+  more than `stale_after`. The two machines need not agree on the time, and
+  the tiles that exit after boot (the snapshot loaders) are not running, so
+  their old heartbeats mean nothing.
+
+The accounts index is the one capacity here that a disk check cannot see: it is
+sized when Firedancer starts, so it fills up inside a file with plenty of room
+left. It gets the same two bands as inodes, at 90% and 97%.
+
+With `validator` set on the host, whatever Firedancer reports explains the
+delinquency it causes, widest cause first: turbine stalled explains replay
+behind, which explains not voting, which explains the cluster's view.
+
 ### Validator health is strict; RPC trouble is patient
 
 Delinquency fires in 60

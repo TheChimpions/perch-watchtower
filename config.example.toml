@@ -138,6 +138,10 @@ mitigated = []
 # directly. Unset, a loopback url means yes; set false for a tunnel to another
 # machine's exporter.
 # local = true
+# Where the Firedancer on this host serves its metrics: the address and port
+# under [tiles.metric] in its config. Setting it turns on the Firedancer checks
+# below for this host. Leave it out on an Agave box.
+# firedancer_url = "http://10.0.0.5:7999/metrics"
 
 
 # --- Kernel advisories ---------------------------------------------------------
@@ -521,6 +525,57 @@ renotify_after = "2h"
 [checks.machine_down]
 enabled = true
 pending_for = "3m"
+clear_after = 2
+severity = "page"
+renotify_after = "30m"
+
+
+# --- Firedancer checks ---------------------------------------------------------
+#
+# Only run for a [[hosts]] entry that sets firedancer_url. They read what
+# Firedancer says about itself on its metrics port, which is the only local
+# view of a validator run with its RPC port off. A metric your build does not
+# export produces no check rather than an alert.
+
+# The metrics port stopped answering while the machine is up: perch is on that
+# machine, or its node_exporter answered in the same cycle. Unreachable from
+# somewhere that cannot tell is Unknown, as everywhere else.
+[checks.firedancer_down]
+enabled = true
+pending_for = "2m"
+clear_after = 2
+severity = "page"
+renotify_after = "30m"
+
+# Three checks sharing these settings: firedancer_vote (Firedancer calls its
+# own voting delinquent, or its vote account inadmissible), firedancer_replay
+# (behind) and firedancer_turbine (stalled). Held as "warming up" from a start
+# until replay first reaches the cluster tip.
+[checks.firedancer_state]
+enabled = true
+pending_for = "3m"
+clear_after = 2
+severity = "page"
+renotify_after = "30m"
+
+# A tile marked running whose heartbeat trails the freshest tile's by more than
+# stale_after. Names the tile that hung; the damage it does pages above.
+[checks.firedancer_tile]
+enabled = true
+stale_after = "30s"
+pending_for = "2m"
+clear_after = 2
+severity = "notify"
+renotify_after = "30m"
+
+# How full the accounts index is. Its capacity is fixed when Firedancer starts,
+# so running out is fixed by a config change and a restart, which you want to
+# plan. Telegram from warn_percent, PagerDuty from page_percent.
+[checks.firedancer_accounts]
+enabled = true
+warn_percent = 90.0
+page_percent = 97.0
+pending_for = "10m"
 clear_after = 2
 severity = "page"
 renotify_after = "30m"

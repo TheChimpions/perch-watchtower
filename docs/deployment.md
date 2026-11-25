@@ -148,6 +148,46 @@ What a local endpoint adds on an Agave box, and is absent here: `node_behind`
 (the local node's slot against the cluster's) and the version line in the epoch
 digest. A validator that stops voting is still caught as delinquent.
 
+The local view comes from Firedancer's metrics port instead. Give the host the
+URL its `[tiles.metric]` section serves:
+
+```toml
+[[hosts]]
+name = "fox-hw"
+url = "http://127.0.0.1:9100/metrics"
+validator = "fox"
+firedancer_url = "http://10.0.0.5:7999/metrics"
+```
+
+That is one unauthenticated HTTP GET per cycle. perch needs no key, no group
+and no change to its sandbox for it, and Firedancer needs no change at all.
+Firedancer binds the port to the address you configure, so use that address,
+and keep the port firewalled from the internet as you would node_exporter's.
+
+| check | fires when |
+| --- | --- |
+| `firedancer_down` | the port stopped answering while the machine is up |
+| `firedancer_vote` | Firedancer reports its own voting as delinquent, or its vote account as inadmissible |
+| `firedancer_replay` | it reports replay as behind |
+| `firedancer_turbine` | it reports turbine as stalled |
+| `firedancer_tile` | a tile marked running has stopped heartbeating |
+| `firedancer_accounts` | the accounts index is over 90% (Telegram) or 97% (page) of its capacity |
+
+"The machine is up" means perch runs on it, or its node_exporter answered in
+the same cycle. A perch that only cannot reach the port from elsewhere reads
+Unknown and pages nobody.
+
+From a start until replay first reaches the cluster tip, the three state checks
+are held as warming up: a catch-up reads "behind" and "delinquent" for as long
+as it takes, and the cluster-side delinquency check is already watching. Use
+`perch maint` for a planned restart as you would with Agave.
+
+When one of these fires for a host with `validator` set, the delinquency it
+causes is folded into it, so the page you get says what Firedancer says is
+wrong. The metric names are Firedancer's and vary between versions and forks.
+One your build does not export produces no check, and a state value perch does
+not recognise reads Unknown; neither can alert.
+
 If the RPC port is on, it can be listed. Firedancer answers HTTP 501 for the
 methods it has not implemented (`getVoteAccounts`, `getBlockProduction` and
 `getInflationReward` in v26.10.8). perch learns that once, logs it once, and

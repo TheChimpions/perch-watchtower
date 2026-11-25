@@ -75,6 +75,7 @@ pub async fn run(
     config: &Config,
     endpoints: &[Endpoint],
     hosts: &[Host],
+    firedancers: &[crate::firedancer::Scraper],
     peers: &[Peer],
     no_color: bool,
 ) -> Result<()> {
@@ -97,6 +98,8 @@ pub async fn run(
 
     let host_snapshots: Vec<HostSnapshot> =
         futures::future::join_all(hosts.iter().map(|h| h.scrape())).await;
+    let firedancer_snapshots: Vec<crate::firedancer::Snapshot> =
+        futures::future::join_all(firedancers.iter().map(|f| f.scrape())).await;
     let peer_statuses: Vec<PeerStatus> =
         futures::future::join_all(peers.iter().map(|p| p.poll())).await;
 
@@ -121,6 +124,7 @@ pub async fn run(
         tracker.refresh(&config.advisories, &facts, std::time::Instant::now()).await;
         outcomes.extend(checks::evaluate_advisories(&host_snapshots, config, tracker.tracked()));
     }
+    outcomes.extend(checks::evaluate_firedancer(&firedancer_snapshots, &host_snapshots, config, now_unix));
     outcomes.extend(checks::evaluate_nodes(&snapshots, config));
     // One-shot, so a fresh fetch is what the daemon would have cached.
     // Unreachable means the check reads Unknown here too, never absent.
@@ -184,6 +188,10 @@ pub async fn run(
     if !host_snapshots.is_empty() {
         println!();
         print_hosts(&s, &host_snapshots, config);
+    }
+    if !firedancer_snapshots.is_empty() {
+        println!();
+        print_firedancers(&s, &firedancer_snapshots, config, now_unix);
     }
     if !peer_statuses.is_empty() {
         println!();
@@ -393,6 +401,96 @@ fn print_hosts(s: &Style, snapshots: &[HostSnapshot], config: &Config) {
                 detail.push_str("  READ-ONLY");
             }
             println!("  {} {:width$}  {}", marker, label, s.dim(&detail), width = width);
+        }
+    }
+}
+
+fn print_firedancers(s: &Style, snapshots: &[crate::firedancer::Snapshot], config: &Config, now_unix: u64) {
+    use crate::firedancer::{replay, turbine, vote, Scrape};
+    println!("{}", s.bold("FIREDANCER"));
+
+    for snap in snapshots {
+        let m = match &snap.scrape {
+            Scrape::Ok(m) => m,
+            Scrape::Unreachable(err) => {
+                let err: String = err.chars().take(60).collect();
+                println!("  {} {}  {}", s.red("DOWN"), snap.host, s.dim(&err));
+                continue;
+            }
+            Scrape::Unrecognised => {
+                println!("  {} {}  {}", s.yellow("??  "), snap.host, s.dim("no Firedancer metrics at firedancer_url"));
+                continue;
+            }
+        };
+
+        let word = |v: Option<u64>, names: &[(u64, &'static str)]| match v {
+            None => "not reported".to_string(),
+            Some(v) => names
+                .iter()
+                .find(|(n, _)| *n == v)
+                .map(|(_, name)| name.to_string())
+                .unwrap_or_else(|| format!("state {v}")),
+        };
+        let voting = word(
+            m.vote_state,
+            &[
+                (vote::DISABLED, "off"),
+                (vote::NOT_STARTED, "not started"),
+                (vote::DELINQUENT, "DELINQUENT"),
+                (vote::VOTING, "voting"),
+                (vote::INADMISSIBLE, "INADMISSIBLE"),
+            ],
+        );
+        let replaying = word(
+            m.replay_state,
+            &[
+                (replay::DISABLED, "off"),
+                (replay::NOT_STARTED, "not started"),
+                (replay::BEHIND, "BEHIND"),
+                (replay::RUNNING, "running"),
+            ],
+        );
+        let receiving = word(
+            m.turbine_state,
+            &[
+                (turbine::DISABLED, "off"),
+                (turbine::NOT_STARTED, "not started"),
+                (turbine::STALLED, "STALLED"),
+                (turbine::REPAIR_OUTPACING, "repair outpacing"),
+                (turbine::RUNNING, "running"),
+            ],
+        );
+        let stalled = m.stalled_tiles(config.checks.firedancer_tile.stale_after);
+        let bad = m.vote_state.is_some_and(|v| v == vote::DELINQUENT || v == vote::INADMISSIBLE)
+            || m.replay_state == Some(replay::BEHIND)
+            || m.turbine_state == Some(turbine::STALLED);
+        let a = &config.checks.firedancer_accounts;
+        let used = m.accounts_used_percent();
+        let marker = if bad || used.is_some_and(|u| u >= a.page_percent) {
+            s.red("BAD ")
+        } else if m.caught_up == Some(false) {
+            s.yellow("BOOT")
+        } else if !stalled.is_empty() || used.is_some_and(|u| u >= a.warn_percent) {
+            s.yellow("WARN")
+        } else {
+            s.green("ok  ")
+        };
+
+        let mut detail = format!("vote {voting}, replay {replaying}, turbine {receiving}");
+        if m.caught_up == Some(false) {
+            detail.push_str(", catching up");
+        }
+        if let Some(boot) = m.boot_time_unix.filter(|b| *b <= now_unix) {
+            let up = std::time::Duration::from_secs((now_unix - boot) / 60 * 60);
+            detail.push_str(&format!(", up {}", humantime::format_duration(up)));
+        }
+        println!("  {} {}  {}", marker, snap.host, s.dim(&detail));
+        if let Some(used) = used {
+            println!("       {}", s.dim(&format!("accounts index {used:.1}% used")));
+        }
+        if !stalled.is_empty() {
+            let names: Vec<&str> = stalled.iter().map(|(n, _)| n.as_str()).collect();
+            println!("       {}", s.dim(&format!("stalled tiles: {}", names.join(", "))));
         }
     }
 }

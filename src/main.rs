@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use perch::{
-    advisory, checks, config, diagnose, digest, enrich, heartbeat, inhibit, metrics, node_exporter, notify, peer, persist,
+    advisory, checks, config, diagnose, digest, enrich, firedancer, heartbeat, inhibit, metrics, node_exporter, notify, peer, persist,
     pools, rpc, selfcheck, sfdp, snapshot, state, status, verdict, web,
 };
 use clap::{Parser, Subcommand};
@@ -144,6 +144,19 @@ fn build_hosts(config: &Config) -> Result<Vec<node_exporter::Host>> {
         .collect()
 }
 
+/// One scraper per host that says where its Firedancer serves metrics.
+fn build_firedancers(config: &Config) -> Result<Vec<firedancer::Scraper>> {
+    config
+        .hosts
+        .iter()
+        .filter_map(|h| h.firedancer_url.as_ref().map(|url| (h, url)))
+        .map(|(h, url)| {
+            firedancer::Scraper::new(h.name.clone(), url.clone(), h.timeout, h.attempts)
+                .with_context(|| format!("building Firedancer scraper for host {:?}", h.name))
+        })
+        .collect()
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -259,7 +272,8 @@ async fn main() -> Result<()> {
         let endpoints = build_endpoints(&config)?;
         let hosts = build_hosts(&config)?;
         let peers = build_peers(&config)?;
-        return status::run(&config, &endpoints, &hosts, &peers, no_color).await;
+        let firedancers = build_firedancers(&config)?;
+        return status::run(&config, &endpoints, &hosts, &firedancers, &peers, no_color).await;
     }
 
     info!(
@@ -341,6 +355,10 @@ async fn main() -> Result<()> {
     if !hosts.is_empty() {
         info!("scraping {} node_exporter host(s) for disk state", hosts.len());
     }
+    let firedancers = build_firedancers(&config)?;
+    if !firedancers.is_empty() {
+        info!("scraping {} Firedancer metrics endpoint(s)", firedancers.len());
+    }
 
     let state_path = PathBuf::from(&config.state.file);
     let mut progress = checks::Progress::default();
@@ -412,6 +430,7 @@ async fn main() -> Result<()> {
             &config,
             &endpoints,
             &hosts,
+            &firedancers,
             &peers,
             &notifier,
             heartbeat.as_ref(),
@@ -431,6 +450,7 @@ async fn main() -> Result<()> {
                 &config,
                 &endpoints,
                 &hosts,
+            &firedancers,
                 &peers,
                 &notifier,
                 heartbeat.as_ref(),
@@ -611,6 +631,7 @@ async fn run_cycle(
     config: &Config,
     endpoints: &[rpc::Endpoint],
     hosts: &[node_exporter::Host],
+    firedancers: &[firedancer::Scraper],
     peers: &[peer::Peer],
     notifier: &Notifier,
     heartbeat: Option<&heartbeat::Heartbeat>,
@@ -659,7 +680,11 @@ async fn run_cycle(
 
     // RPC and node_exporter are independent; a slow validator host must not
     // delay the cluster probe.
-    let (snapshots, host_snapshots): (Vec<Snapshot>, Vec<node_exporter::HostSnapshot>) = tokio::join!(
+    let (snapshots, host_snapshots, firedancer_snapshots): (
+        Vec<Snapshot>,
+        Vec<node_exporter::HostSnapshot>,
+        Vec<firedancer::Snapshot>,
+    ) = tokio::join!(
         futures::future::join_all(
             endpoints
                 .iter()
@@ -667,11 +692,23 @@ async fn run_cycle(
                 .map(|e| snapshot::probe(e, config, &rt.known_vote_accounts)),
         ),
         futures::future::join_all(hosts.iter().map(|h| h.scrape())),
+        futures::future::join_all(firedancers.iter().map(|f| f.scrape())),
     );
 
     for hs in &host_snapshots {
         if let Some(err) = &hs.error {
             warn!(host = %hs.host, "node_exporter scrape failed: {err}");
+        }
+    }
+    for fs in &firedancer_snapshots {
+        match &fs.scrape {
+            firedancer::Scrape::Ok(_) => {}
+            firedancer::Scrape::Unreachable(err) => {
+                warn!(host = %fs.host, "Firedancer metrics scrape failed: {err}");
+            }
+            firedancer::Scrape::Unrecognised => {
+                warn!(host = %fs.host, "firedancer_url answered with no Firedancer metrics; check the URL");
+            }
         }
     }
 
@@ -717,6 +754,12 @@ async fn run_cycle(
         &host_snapshots,
         config,
         &mut rt.disk,
+        unix_now(),
+    ));
+    outcomes.extend(checks::evaluate_firedancer(
+        &firedancer_snapshots,
+        &host_snapshots,
+        config,
         unix_now(),
     ));
     if !config.advisories.is_empty() && config.checks.host_advisory.base.enabled && !hosts.is_empty() {
@@ -924,6 +967,7 @@ async fn run_cycle(
         jpool_security_sol_per_1000: config.checks.jpool_bond.security_sol_per_1000,
         snapshots: &snapshots,
         host_snapshots: &host_snapshots,
+        firedancer_snapshots: &firedancer_snapshots,
         peers: &peer_statuses,
         peer_maintenance: &rt.peer_maintenance,
         is_owner,

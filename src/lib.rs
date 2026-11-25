@@ -9,6 +9,7 @@ pub mod config;
 pub mod diagnose;
 pub mod enrich;
 pub mod fillrate;
+pub mod firedancer;
 pub mod heartbeat;
 pub mod inhibit;
 pub mod maint;

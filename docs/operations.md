@@ -512,6 +512,14 @@ DISKS
   RO   chimps-1-box /mnt/accounts  480.0 GB free of    500 GB    4.0% used  READ-ONLY
 ```
 
+And for a host that sets `firedancer_url`, what its Firedancer reports:
+
+```
+FIREDANCER
+  ok   fox-hw  vote voting, replay running, turbine running, up 19h 8m
+       accounts index 71.4% used
+```
+
 Read-only by construction: one probe, writes nothing, cannot perturb a live
 incident. Works over SSH, which is how you reach that host anyway.
 
@@ -643,6 +651,18 @@ perch_peer_maintenance_until_seconds{peer="..."}   a peer's window, as recorded 
 perch_host_scrape_ok{host="..."}
 perch_filesystem_avail_bytes{host="...",mountpoint="...",device="..."}
 perch_filesystem_size_bytes{host="...",mountpoint="...",device="..."}
+perch_firedancer_scrape_ok{host="..."}      hosts that set firedancer_url
+perch_firedancer_state{host="...",subsystem="vote|replay|turbine"}
+                                           Firedancer's own numbering. vote: 2
+                                           delinquent, 3 voting, 4 inadmissible.
+                                           replay: 2 behind, 3 running. turbine:
+                                           2 stalled, 3 repair outpacing, 4
+                                           running. 0 disabled, 1 not started.
+perch_firedancer_caught_up{host="..."}      1 once replay reached the tip
+perch_firedancer_boot_time_seconds{host="..."}   a change is a restart
+perch_firedancer_accounts_used_percent{host="..."}
+perch_firedancer_accounts_disk_used_bytes{host="..."}
+perch_firedancer_accounts_disk_allocated_bytes{host="..."}
 
 perch_build_info{version="...",commit="..."}  which perch
 perch_watchtower_info{name="...",solana_cluster="..."}

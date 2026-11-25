@@ -1476,6 +1476,216 @@ pub fn evaluate_advisories(
     out
 }
 
+/// What each Firedancer says about itself, for hosts that set `firedancer_url`.
+///
+/// One source per host, so nothing is corroborated, and the tri-state rule
+/// carries the weight instead. A metric this build does not export produces
+/// no check at all. A page that could not be fetched produces only
+/// `firedancer_down`, which is Unhealthy when something else shows the machine
+/// is up and Unknown when nothing does -- so a watchtower that merely cannot
+/// reach the box never pages for it, and an outage is one alert, not six.
+pub fn evaluate_firedancer(
+    snapshots: &[crate::firedancer::Snapshot],
+    hosts: &[HostSnapshot],
+    config: &Config,
+    now_unix: u64,
+) -> Vec<CheckOutcome> {
+    use crate::firedancer::{replay, turbine, vote, Scrape};
+
+    let c = &config.checks;
+    let mut out = Vec::new();
+
+    for snap in snapshots {
+        let host = &snap.host;
+        let host_cfg = config.hosts.iter().find(|h| &h.name == host);
+        let owner = host_cfg.and_then(|h| h.validator.clone());
+
+        // The machine is known to be up when perch is on it, or when its
+        // node_exporter answered in this same cycle. Only then does a silent
+        // metrics port say anything about Firedancer.
+        let machine_up = host_cfg.is_some_and(|h| h.is_local())
+            || hosts.iter().any(|h| {
+                &h.host == host
+                    && h.error.as_deref().is_none_or(|e| e == crate::node_exporter::NOTHING_MATCHED)
+            });
+
+        if c.firedancer_down.enabled {
+            let verdict = match &snap.scrape {
+                Scrape::Ok(_) => Verdict::Healthy,
+                Scrape::Unreachable(err) if machine_up => Verdict::unhealthy(format!(
+                    "Firedancer on {host} is not answering on its metrics port while the machine is up: \
+                     {err}. The validator process has exited or is hung"
+                )),
+                Scrape::Unreachable(err) => Verdict::unknown(format!("firedancer metrics unreachable: {err}")),
+                Scrape::Unrecognised => Verdict::unknown(
+                    "the firedancer_url answered with no Firedancer metrics; check that it points at \
+                     the [tiles.metric] port",
+                ),
+            };
+            out.push(single(
+                format!("firedancer_down:{host}"),
+                format!("Firedancer on {host} is not answering"),
+                c.firedancer_down.clone(),
+                verdict,
+                owner.clone(),
+            ));
+        }
+
+        let Scrape::Ok(m) = &snap.scrape else { continue };
+
+        if c.firedancer_state.enabled {
+            // Until replay first reaches the tip, "behind" and "not voting"
+            // describe a start-up, which ends on its own.
+            let catching_up = (m.caught_up == Some(false)).then(|| {
+                match m.boot_time_unix.filter(|b| *b <= now_unix) {
+                    Some(boot) => format!(
+                        "still catching up, {} after it started",
+                        humantime::format_duration(Duration::from_secs((now_unix - boot) / 60 * 60))
+                    ),
+                    None => "still catching up after a start".to_string(),
+                }
+            });
+            let not_started = || (Verdict::unknown("not started yet"), true);
+            let unrecognised = |name: &str, v: u64| {
+                (Verdict::unknown(format!("{name} is {v}, a state this version of perch does not know")), false)
+            };
+
+            // `None` for a subsystem this node does not run: nothing to judge.
+            let vote_verdict = m.vote_state.and_then(|v| match v {
+                vote::DISABLED => None,
+                vote::VOTING => Some((Verdict::Healthy, false)),
+                vote::NOT_STARTED => Some(not_started()),
+                vote::DELINQUENT => Some((
+                    Verdict::unhealthy(format!(
+                        "Firedancer on {host} reports its own voting as delinquent: its votes trail the \
+                         cluster by more than its threshold, or have stopped"
+                    )),
+                    false,
+                )),
+                vote::INADMISSIBLE => Some((
+                    Verdict::unhealthy(format!(
+                        "Firedancer on {host} is voting, but reports that its vote account fails the \
+                         validator admission filter, so the votes do not count"
+                    )),
+                    false,
+                )),
+                other => Some(unrecognised("diag_vote_state", other)),
+            });
+            let replay_verdict = m.replay_state.and_then(|v| match v {
+                replay::DISABLED => None,
+                replay::RUNNING => Some((Verdict::Healthy, false)),
+                replay::NOT_STARTED => Some(not_started()),
+                replay::BEHIND => Some((
+                    Verdict::unhealthy(format!(
+                        "Firedancer on {host} reports replay as behind: it is lagging the blocks it \
+                         receives, or has stopped advancing"
+                    )),
+                    false,
+                )),
+                other => Some(unrecognised("diag_replay_state", other)),
+            });
+            let turbine_verdict = m.turbine_state.and_then(|v| match v {
+                turbine::DISABLED => None,
+                // Repair carrying more than turbine is slow, not stopped, and
+                // is how every catch-up looks.
+                turbine::RUNNING | turbine::REPAIR_OUTPACING => Some((Verdict::Healthy, false)),
+                turbine::NOT_STARTED => Some(not_started()),
+                turbine::STALLED => Some((
+                    Verdict::unhealthy(format!(
+                        "Firedancer on {host} reports turbine as stalled: no new slots are arriving \
+                         from the cluster"
+                    )),
+                    false,
+                )),
+                other => Some(unrecognised("diag_turbine_state", other)),
+            });
+
+            for (kind, title, verdict) in [
+                ("firedancer_vote", "is not voting normally", vote_verdict),
+                ("firedancer_replay", "has fallen behind", replay_verdict),
+                ("firedancer_turbine", "is receiving no blocks", turbine_verdict),
+            ] {
+                let Some((verdict, warming)) = verdict else { continue };
+                let (verdict, warming) = match (&catching_up, &verdict) {
+                    (Some(why), Verdict::Unhealthy(_) | Verdict::Unknown(_)) => (Verdict::unknown(why.clone()), true),
+                    _ => (verdict, warming),
+                };
+                let mut o = single(
+                    format!("{kind}:{host}"),
+                    format!("Firedancer on {host} {title}"),
+                    c.firedancer_state.clone(),
+                    verdict,
+                    owner.clone(),
+                );
+                o.warming_up = warming;
+                out.push(o);
+            }
+        }
+
+        if c.firedancer_tile.base.enabled && m.has_heartbeats() {
+            let stalled = m.stalled_tiles(c.firedancer_tile.stale_after);
+            let verdict = if stalled.is_empty() {
+                Verdict::Healthy
+            } else {
+                let shown: Vec<String> = stalled
+                    .iter()
+                    .take(5)
+                    .map(|(name, behind)| {
+                        format!("{name} ({})", humantime::format_duration(Duration::from_secs(behind.as_secs())))
+                    })
+                    .collect();
+                let more = match stalled.len() - shown.len() {
+                    0 => String::new(),
+                    n => format!(" and {n} more"),
+                };
+                Verdict::unhealthy(format!(
+                    "{} tile(s) of Firedancer on {host} are marked running but have stopped \
+                     heartbeating: {}{more}",
+                    stalled.len(),
+                    shown.join(", ")
+                ))
+            };
+            out.push(single(
+                format!("firedancer_tile:{host}"),
+                format!("Firedancer on {host} has a stalled tile"),
+                c.firedancer_tile.base.clone(),
+                verdict,
+                owner.clone(),
+            ));
+        }
+
+        if let (true, Some(used)) = (c.firedancer_accounts.base.enabled, m.accounts_used_percent()) {
+            let a = &c.firedancer_accounts;
+            for (suffix, floor, ceiling, severity) in [
+                ("critical", a.page_percent, None, a.base.severity),
+                ("warn", a.warn_percent, Some(a.page_percent), Severity::Notify),
+            ] {
+                let mut cfg = a.base.clone();
+                cfg.severity = severity;
+                let inside = used >= floor && ceiling.is_none_or(|x| used < x);
+                out.push(single(
+                    format!("firedancer_accounts_{suffix}:{host}"),
+                    format!("Firedancer on {host} is running out of accounts index"),
+                    cfg,
+                    if inside {
+                        Verdict::unhealthy(format!(
+                            "Firedancer on {host} has used {used:.1}% of its accounts index ({} of {} \
+                             entries, limit {floor:.0}%); the capacity is fixed when it starts, so \
+                             raising it means a config change and a restart",
+                            m.accounts_used.unwrap_or(0),
+                            m.accounts_capacity.unwrap_or(0)
+                        ))
+                    } else {
+                        Verdict::Healthy
+                    },
+                    owner.clone(),
+                ));
+            }
+        }
+    }
+    out
+}
+
 fn disk_check_kinds(c: &crate::config::Checks) -> Vec<(&'static str, CheckConfig)> {
     let mut v = Vec::new();
     if c.disk_readonly.enabled {
@@ -1588,6 +1798,9 @@ pub fn still_configured(id: &str, config: &Config) -> bool {
     let host = |s: Option<&str>| {
         s.and_then(|s| s.split_once(' ')).is_some_and(|(h, _)| config.hosts.iter().any(|x| x.name == h))
     };
+    let firedancer = |s: Option<&str>| {
+        s.is_some_and(|s| config.hosts.iter().any(|x| x.name == s && x.firedancer_url.is_some()))
+    };
     match kind {
         "vote_delinquent" => c.vote_delinquent.enabled && validator(subject),
         "vote_account_missing" => c.vote_account_missing.enabled && validator(subject),
@@ -1638,6 +1851,15 @@ pub fn still_configured(id: &str, config: &Config) -> bool {
         "node_behind" => {
             c.node_behind.base.enabled
                 && subject.is_some_and(|s| config.endpoints.iter().any(|e| e.name == s && e.monitor))
+        }
+        // Subjects are the host name alone.
+        "firedancer_down" => c.firedancer_down.enabled && firedancer(subject),
+        "firedancer_vote" | "firedancer_replay" | "firedancer_turbine" => {
+            c.firedancer_state.enabled && firedancer(subject)
+        }
+        "firedancer_tile" => c.firedancer_tile.base.enabled && firedancer(subject),
+        "firedancer_accounts_critical" | "firedancer_accounts_warn" => {
+            c.firedancer_accounts.base.enabled && firedancer(subject)
         }
         "peer_down" => c.peer_down.enabled && peer(subject),
         "machine_down" => c.machine_down.enabled && peer(subject),
@@ -2600,6 +2822,371 @@ mod tests {
             assert!(bad(&format!("{ADVISORY}{ADVISORY}")).contains("duplicate advisory"));
             assert!(bad("[[advisories]]\nid = \"x\"\n[advisories.mitigation]\nsysctl = \"a b\"\nvalue = 0\n")
                 .contains("not a sysctl name"));
+        }
+    }
+
+    mod firedancer_checks {
+        use super::*;
+        use crate::firedancer::{replay, turbine, vote, Metrics, Scrape, Snapshot as FdSnapshot, Tile};
+        use crate::node_exporter::{HostFacts, HostSnapshot};
+
+        const NOW: u64 = 1_795_640_848;
+
+        /// fox-main's layout: no local RPC, a loopback node_exporter, and
+        /// Firedancer's metrics on the machine's public address.
+        fn config_with(node_exporter: &str, extra: &str) -> Config {
+            Config::parse(&format!(
+                "[[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+                 [[endpoints]]\nname = \"b\"\nurl = \"https://b.example\"\n\
+                 [[validators]]\nidentity = \"2AKKnirWVZMhnzuwqpizw9SwfZjGpRFLx2zCCNtPWpbc\"\nlabel = \"fox\"\n\
+                 [[hosts]]\nname = \"hw\"\nurl = \"{node_exporter}\"\nvalidator = \"fox\"\n\
+                 firedancer_url = \"http://203.0.113.7:7999/metrics\"\n{extra}"
+            ))
+            .unwrap()
+        }
+
+        fn config() -> Config {
+            config_with("http://127.0.0.1:9100/metrics", "")
+        }
+
+        fn tile(kind: &str, running: bool, heartbeat_s: u64) -> Tile {
+            Tile {
+                kind: kind.into(),
+                id: "0".into(),
+                running,
+                heartbeat_ns: Some(heartbeat_s * 1_000_000_000),
+            }
+        }
+
+        /// As fox-main read on 2026-11-25, with the index at a comfortable level.
+        fn healthy() -> Metrics {
+            Metrics {
+                vote_state: Some(vote::VOTING),
+                replay_state: Some(replay::RUNNING),
+                turbine_state: Some(turbine::RUNNING),
+                caught_up: Some(true),
+                boot_time_unix: Some(NOW - 68_910),
+                tiles: vec![
+                    tile("snapin", false, NOW - 68_800),
+                    tile("replay", true, NOW),
+                    tile("votor", true, NOW),
+                ],
+                accounts_used: Some(1_000_000_000),
+                accounts_capacity: Some(1_300_000_000),
+                accounts_disk_used_bytes: Some(447_228_086_798),
+                accounts_disk_allocated_bytes: Some(584_115_552_256),
+            }
+        }
+
+        fn run_with(scrape: Scrape, hosts: &[HostSnapshot], c: &Config) -> Vec<CheckOutcome> {
+            evaluate_firedancer(&[FdSnapshot { host: "hw".into(), scrape }], hosts, c, NOW)
+        }
+
+        fn run(m: Metrics) -> Vec<CheckOutcome> {
+            run_with(Scrape::Ok(m), &[], &config())
+        }
+
+        fn get<'a>(out: &'a [CheckOutcome], id: &str) -> &'a CheckOutcome {
+            out.iter().find(|o| o.id == id).unwrap_or_else(|| {
+                panic!("no {id} among {:?}", out.iter().map(|o| &o.id).collect::<Vec<_>>())
+            })
+        }
+
+        fn unhealthy(out: &[CheckOutcome]) -> Vec<&str> {
+            out.iter()
+                .filter(|o| matches!(o.verdict, Verdict::Unhealthy(_)))
+                .map(|o| o.id.as_str())
+                .collect()
+        }
+
+        fn exporter(error: Option<&str>) -> HostSnapshot {
+            HostSnapshot {
+                host: "hw".into(),
+                filesystems: HashMap::new(),
+                error: error.map(str::to_string),
+                facts: HostFacts::default(),
+            }
+        }
+
+        #[test]
+        fn a_healthy_firedancer_is_healthy_on_every_check() {
+            let out = run(healthy());
+            let ids: Vec<&str> = out.iter().map(|o| o.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                [
+                    "firedancer_down:hw",
+                    "firedancer_vote:hw",
+                    "firedancer_replay:hw",
+                    "firedancer_turbine:hw",
+                    "firedancer_tile:hw",
+                    "firedancer_accounts_critical:hw",
+                    "firedancer_accounts_warn:hw",
+                ]
+            );
+            for o in &out {
+                assert_eq!(o.verdict, Verdict::Healthy, "{}", o.id);
+                assert_eq!(o.owner.as_deref(), Some("fox"), "{}", o.id);
+            }
+        }
+
+        #[test]
+        fn each_bad_state_fires_its_own_check() {
+            for (id, m) in [
+                ("firedancer_vote:hw", Metrics { vote_state: Some(vote::DELINQUENT), ..healthy() }),
+                ("firedancer_vote:hw", Metrics { vote_state: Some(vote::INADMISSIBLE), ..healthy() }),
+                ("firedancer_replay:hw", Metrics { replay_state: Some(replay::BEHIND), ..healthy() }),
+                ("firedancer_turbine:hw", Metrics { turbine_state: Some(turbine::STALLED), ..healthy() }),
+            ] {
+                let out = run(m);
+                assert_eq!(unhealthy(&out), [id]);
+                assert_eq!(get(&out, id).cfg.severity, Severity::Page);
+            }
+        }
+
+        /// Repair carrying more than turbine is slow, not broken.
+        #[test]
+        fn repair_outpacing_turbine_is_not_an_alert() {
+            let out = run(Metrics { turbine_state: Some(turbine::REPAIR_OUTPACING), ..healthy() });
+            assert!(unhealthy(&out).is_empty());
+        }
+
+        /// A restart reads "behind" and "delinquent" for as long as the
+        /// catch-up takes. That is a start-up, and it must neither page nor
+        /// count toward "this check cannot be evaluated".
+        #[test]
+        fn a_firedancer_still_catching_up_is_warming_up() {
+            let out = run(Metrics {
+                caught_up: Some(false),
+                boot_time_unix: Some(NOW - 12 * 60 - 7),
+                vote_state: Some(vote::DELINQUENT),
+                replay_state: Some(replay::BEHIND),
+                turbine_state: Some(turbine::REPAIR_OUTPACING),
+                ..healthy()
+            });
+            assert!(unhealthy(&out).is_empty());
+            for id in ["firedancer_vote:hw", "firedancer_replay:hw"] {
+                let o = get(&out, id);
+                assert_eq!(o.verdict, Verdict::unknown("still catching up, 12m after it started"), "{id}");
+                assert!(o.warming_up, "{id}");
+            }
+            // What is already fine is still reported as fine.
+            assert_eq!(get(&out, "firedancer_turbine:hw").verdict, Verdict::Healthy);
+        }
+
+        #[test]
+        fn a_subsystem_that_has_not_started_is_warming_up() {
+            let out = run(Metrics { vote_state: Some(vote::NOT_STARTED), ..healthy() });
+            let o = get(&out, "firedancer_vote:hw");
+            assert!(matches!(o.verdict, Verdict::Unknown(_)), "{:?}", o.verdict);
+            assert!(o.warming_up);
+        }
+
+        /// A node that does not vote has nothing to be judged on, and a build
+        /// that does not export a metric has given no opinion. Neither is a
+        /// check that reads Unknown for ever.
+        #[test]
+        fn a_disabled_or_absent_subsystem_produces_no_check() {
+            let out = run(Metrics {
+                vote_state: Some(vote::DISABLED),
+                replay_state: None,
+                accounts_capacity: None,
+                tiles: Vec::new(),
+                ..healthy()
+            });
+            let ids: Vec<&str> = out.iter().map(|o| o.id.as_str()).collect();
+            assert_eq!(ids, ["firedancer_down:hw", "firedancer_turbine:hw"]);
+        }
+
+        /// A value a later Firedancer adds must not be guessed at.
+        #[test]
+        fn a_state_perch_does_not_know_is_unknown() {
+            let out = run(Metrics { replay_state: Some(9), ..healthy() });
+            let o = get(&out, "firedancer_replay:hw");
+            assert!(matches!(o.verdict, Verdict::Unknown(_)), "{:?}", o.verdict);
+            assert!(!o.warming_up);
+        }
+
+        #[test]
+        fn a_running_tile_that_stopped_heartbeating_notifies() {
+            let mut m = healthy();
+            m.tiles.push(tile("execrp", true, NOW - 95));
+            let out = run(m);
+            assert_eq!(unhealthy(&out), ["firedancer_tile:hw"]);
+            let o = get(&out, "firedancer_tile:hw");
+            assert_eq!(o.cfg.severity, Severity::Notify);
+            let detail = o.verdict.detail().unwrap();
+            assert!(detail.contains("execrp:0 (1m 35s)"), "{detail}");
+            // The snapshot loader exited a day ago and is not part of it.
+            assert!(!detail.contains("snapin"), "{detail}");
+        }
+
+        /// fox-main on 2026-11-25: 1,237,922,396 of 1,300,000,000.
+        #[test]
+        fn the_accounts_index_has_two_bands_that_never_overlap() {
+            let at = |used: u64| {
+                let out = run(Metrics { accounts_used: Some(used), ..healthy() });
+                unhealthy(&out).into_iter().map(str::to_string).collect::<Vec<_>>()
+            };
+            assert!(at(1_100_000_000).is_empty());
+            assert_eq!(at(1_237_922_396), ["firedancer_accounts_warn:hw"]);
+            assert_eq!(at(1_270_000_000), ["firedancer_accounts_critical:hw"]);
+
+            let out = run(Metrics { accounts_used: Some(1_237_922_396), ..healthy() });
+            let o = get(&out, "firedancer_accounts_warn:hw");
+            assert_eq!(o.cfg.severity, Severity::Notify);
+            let detail = o.verdict.detail().unwrap();
+            assert!(detail.contains("95.2%") && detail.contains("1237922396 of 1300000000"), "{detail}");
+            assert_eq!(get(&out, "firedancer_accounts_critical:hw").cfg.severity, Severity::Page);
+        }
+
+        /// perch is on the box, so a metrics port that does not answer is the
+        /// validator process, not the network in between.
+        #[test]
+        fn a_silent_firedancer_on_perchs_own_machine_is_down() {
+            let out = run_with(Scrape::Unreachable("connection refused".into()), &[], &config());
+            // One check, not one Unknown for each of the others.
+            assert_eq!(out.len(), 1);
+            let o = get(&out, "firedancer_down:hw");
+            assert_eq!(o.cfg.severity, Severity::Page);
+            let detail = o.verdict.detail().expect("unhealthy");
+            assert!(detail.contains("connection refused"), "{detail}");
+        }
+
+        /// From another machine, silence alone could be the path. It must not
+        /// be able to page.
+        #[test]
+        fn a_silent_firedancer_on_an_unreachable_remote_machine_is_unknown() {
+            let c = config_with("http://10.0.0.5:9100/metrics", "");
+            for hosts in [vec![], vec![exporter(Some("operation timed out"))]] {
+                let out = run_with(Scrape::Unreachable("operation timed out".into()), &hosts, &c);
+                assert_eq!(out.len(), 1);
+                assert!(matches!(out[0].verdict, Verdict::Unknown(_)), "{:?}", out[0].verdict);
+            }
+        }
+
+        /// The same machine's node_exporter answering in the same cycle is the
+        /// second source: the box and the path are fine, Firedancer is not.
+        #[test]
+        fn a_silent_firedancer_beside_an_answering_exporter_is_down() {
+            let c = config_with("http://10.0.0.5:9100/metrics", "");
+            for hosts in [
+                vec![exporter(None)],
+                vec![exporter(Some(crate::node_exporter::NOTHING_MATCHED))],
+            ] {
+                let out = run_with(Scrape::Unreachable("connection refused".into()), &hosts, &c);
+                assert_eq!(unhealthy(&out), ["firedancer_down:hw"]);
+            }
+        }
+
+        /// A URL pointed at node_exporter, say. A mistake in the config is
+        /// never a page about the validator.
+        #[test]
+        fn a_page_with_no_firedancer_metrics_is_unknown() {
+            let out = run_with(Scrape::Unrecognised, &[], &config());
+            assert_eq!(out.len(), 1);
+            assert!(matches!(out[0].verdict, Verdict::Unknown(_)), "{:?}", out[0].verdict);
+        }
+
+        #[test]
+        fn disabled_checks_are_not_produced() {
+            let c = config_with(
+                "http://127.0.0.1:9100/metrics",
+                "[checks.firedancer_state]\nenabled = false\npending_for = \"3m\"\nseverity = \"page\"\n\
+                 [checks.firedancer_tile]\nenabled = false\npending_for = \"2m\"\nseverity = \"notify\"\n\
+                 stale_after = \"30s\"\n",
+            );
+            let out = run_with(Scrape::Ok(healthy()), &[], &c);
+            let ids: Vec<&str> = out.iter().map(|o| o.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                ["firedancer_down:hw", "firedancer_accounts_critical:hw", "firedancer_accounts_warn:hw"]
+            );
+        }
+
+        /// The local view arrives before the cluster agrees, and names the
+        /// reason. One page, and it is Firedancer's.
+        #[test]
+        fn firedancers_own_account_explains_the_delinquency_it_causes() {
+            let mut out = run(Metrics {
+                turbine_state: Some(turbine::STALLED),
+                replay_state: Some(replay::BEHIND),
+                vote_state: Some(vote::DELINQUENT),
+                ..healthy()
+            });
+            for kind in ["vote_delinquent", "vote_lag", "vote_stalled"] {
+                out.push(single(
+                    format!("{kind}:fox"),
+                    String::new(),
+                    config().checks.vote_delinquent.clone(),
+                    Verdict::unhealthy("x"),
+                    None,
+                ));
+            }
+            let suppressed = crate::inhibit::compute(&out);
+            for id in [
+                "firedancer_replay:hw",
+                "firedancer_vote:hw",
+                "vote_delinquent:fox",
+                "vote_lag:fox",
+                "vote_stalled:fox",
+            ] {
+                assert_eq!(suppressed.get(id).map(String::as_str), Some("firedancer_turbine:hw"), "{id}");
+            }
+            assert!(!suppressed.contains_key("firedancer_turbine:hw"));
+        }
+
+        #[test]
+        fn a_firedancer_that_is_down_explains_the_delinquency() {
+            let mut out = run_with(Scrape::Unreachable("connection refused".into()), &[], &config());
+            out.push(single(
+                "vote_delinquent:fox".into(),
+                String::new(),
+                config().checks.vote_delinquent.clone(),
+                Verdict::unhealthy("x"),
+                None,
+            ));
+            let suppressed = crate::inhibit::compute(&out);
+            assert_eq!(suppressed.get("vote_delinquent:fox").map(String::as_str), Some("firedancer_down:hw"));
+        }
+
+        #[test]
+        fn states_outlive_the_cycle_but_not_the_config() {
+            let c = config();
+            for id in [
+                "firedancer_down:hw",
+                "firedancer_vote:hw",
+                "firedancer_replay:hw",
+                "firedancer_turbine:hw",
+                "firedancer_tile:hw",
+                "firedancer_accounts_critical:hw",
+                "firedancer_accounts_warn:hw",
+            ] {
+                assert!(still_configured(id, &c), "{id}");
+                // A host that no longer names a Firedancer.
+                assert!(!still_configured(&id.replace(":hw", ":other"), &c), "{id}");
+            }
+        }
+
+        #[test]
+        fn thresholds_that_cannot_work_are_refused() {
+            let bad = |extra: &str| {
+                Config::parse(&format!(
+                    "[[endpoints]]\nname = \"a\"\nurl = \"https://a.example\"\n\
+                     [[validators]]\nidentity = \"2AKKnirWVZMhnzuwqpizw9SwfZjGpRFLx2zCCNtPWpbc\"\n{extra}"
+                ))
+                .is_err()
+            };
+            assert!(bad(
+                "[checks.firedancer_accounts]\npending_for = \"10m\"\nseverity = \"page\"\n\
+                 warn_percent = 98.0\npage_percent = 97.0\n"
+            ));
+            assert!(bad(
+                "[checks.firedancer_tile]\npending_for = \"2m\"\nseverity = \"notify\"\nstale_after = \"0s\"\n"
+            ));
+            assert!(bad(
+                "[[hosts]]\nname = \"hw\"\nurl = \"http://127.0.0.1:9100/metrics\"\nfiredancer_url = \"127.0.0.1:7999\"\n"
+            ));
         }
     }
 

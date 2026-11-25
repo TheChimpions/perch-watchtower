@@ -108,6 +108,9 @@ Report vulnerabilities privately through the repository's Security tab.
 | `vault_invoices`                    | notify / page | 15m            | unpaid Vault invoices: 6 notify, 9 page, removal at 10                     |
 | `jpool_bond`                        | notify / page | 15m            | below JPool's security requirement, or under a week of runway              |
 | `node_behind`                       | page          | 15m            | a node _you operate_ lagging or unreachable                                |
+| `firedancer_down`                   | page          | 2m             | Firedancer's metrics port silent on a machine that is up                   |
+| `firedancer_vote` / `_replay` / `_turbine` | page   | 3m             | Firedancer's own verdict: delinquent, behind, no blocks arriving           |
+| `firedancer_tile` / `firedancer_accounts` | notify / page | 2m / 10m | a hung tile; the accounts index nearing its fixed capacity                 |
 | `disk_space` / `disk_fill`          | notify / page | 10m / 15m      | free-space floor and projected time-to-full                                |
 | `disk_readonly` / `disk_missing`    | page          | immediate / 2m | how disks fail under a validator                                           |
 | `advisory_exposed`                  | notify / page | 10m            | a listed kernel CVE (built in, or yours): unpatched and not marked mitigated |

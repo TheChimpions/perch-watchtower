@@ -196,6 +196,7 @@ impl Exposition {
 pub struct CycleReport<'a> {
     pub snapshots: &'a [Snapshot],
     pub host_snapshots: &'a [HostSnapshot],
+    pub firedancer_snapshots: &'a [crate::firedancer::Snapshot],
     pub peers: &'a [PeerStatus],
     /// Peer name -> unix deadline of the maintenance window it declared, as
     /// this instance remembers it.
@@ -907,6 +908,87 @@ pub fn render(r: &CycleReport<'_>) -> String {
         }
     }
 
+    // --- Firedancer ---
+    if !r.firedancer_snapshots.is_empty() {
+        e.metric(
+            "perch_firedancer_scrape_ok",
+            "1 when the host's Firedancer metrics endpoint answered in the last cycle",
+            "gauge",
+        );
+        for f in r.firedancer_snapshots {
+            e.value(
+                "perch_firedancer_scrape_ok",
+                &[("host", &f.host)],
+                f.metrics().is_some() as u8 as f64,
+            );
+        }
+
+        e.metric(
+            "perch_firedancer_state",
+            "Firedancer's own diag_<subsystem>_state, as it numbers them. vote: 2 delinquent, 3 voting, \
+             4 inadmissible. replay: 2 behind, 3 running. turbine: 2 stalled, 3 repair outpacing, 4 running. \
+             0 is disabled and 1 not started in all three",
+            "gauge",
+        );
+        e.metric(
+            "perch_firedancer_caught_up",
+            "1 once replay has reached the cluster tip since Firedancer started",
+            "gauge",
+        );
+        e.metric(
+            "perch_firedancer_boot_time_seconds",
+            "Unix time Firedancer started; a change is a restart",
+            "gauge",
+        );
+        e.metric(
+            "perch_firedancer_accounts_used_percent",
+            "Percentage of the accounts index in use; its capacity is fixed at startup",
+            "gauge",
+        );
+        e.metric(
+            "perch_firedancer_accounts_disk_used_bytes",
+            "Bytes of the accounts database file holding live data",
+            "gauge",
+        );
+        e.metric(
+            "perch_firedancer_accounts_disk_allocated_bytes",
+            "Allocated size of the accounts database file",
+            "gauge",
+        );
+        for f in r.firedancer_snapshots {
+            let Some(m) = f.metrics() else { continue };
+            let host = [("host", f.host.as_str())];
+            for (subsystem, state) in [
+                ("vote", m.vote_state),
+                ("replay", m.replay_state),
+                ("turbine", m.turbine_state),
+            ] {
+                if let Some(v) = state {
+                    e.value(
+                        "perch_firedancer_state",
+                        &[("host", f.host.as_str()), ("subsystem", subsystem)],
+                        v as f64,
+                    );
+                }
+            }
+            if let Some(v) = m.caught_up {
+                e.value("perch_firedancer_caught_up", &host, v as u8 as f64);
+            }
+            if let Some(v) = m.boot_time_unix {
+                e.value("perch_firedancer_boot_time_seconds", &host, v as f64);
+            }
+            if let Some(v) = m.accounts_used_percent() {
+                e.value("perch_firedancer_accounts_used_percent", &host, v);
+            }
+            if let Some(v) = m.accounts_disk_used_bytes {
+                e.value("perch_firedancer_accounts_disk_used_bytes", &host, v as f64);
+            }
+            if let Some(v) = m.accounts_disk_allocated_bytes {
+                e.value("perch_firedancer_accounts_disk_allocated_bytes", &host, v as f64);
+            }
+        }
+    }
+
     if !r.peers.is_empty() {
         e.metric(
             "perch_peer_reachable",
@@ -1063,7 +1145,7 @@ mod notify_metrics {
         let suppressed = HashMap::new();
         render(&CycleReport {
             snapshots: &[],
-            host_snapshots: &[],
+            host_snapshots: &[], firedancer_snapshots: &[],
             peers: &[],
             peer_maintenance: &NO_WINDOWS,
             is_owner: true,
@@ -1135,7 +1217,7 @@ mod version_metric {
         let (states, health, suppressed) = (HashMap::new(), HashMap::new(), HashMap::new());
         render(&CycleReport {
             snapshots: snaps,
-            host_snapshots: &[],
+            host_snapshots: &[], firedancer_snapshots: &[],
             peers: &[],
             peer_maintenance: &NO_WINDOWS,
             is_owner: true,
@@ -1255,7 +1337,7 @@ mod peer_windows {
         let disk = DiskHistory::default();
         let (states, health, suppressed) = (HashMap::new(), HashMap::new(), HashMap::new());
         render(&CycleReport {
-            snapshots: &[], host_snapshots: &[], peers, peer_maintenance: windows, is_owner: true, disk: &disk,
+            snapshots: &[], host_snapshots: &[], firedancer_snapshots: &[], peers, peer_maintenance: windows, is_owner: true, disk: &disk,
             outcomes: &[], states: &states, endpoint_health: &health, suppressed: &suppressed,
             visible: true, silenced: false, cycle_duration: Duration::from_secs(1),
             unix_time: 1_700_000_000, maintenance_until: 0, restart_gossip_percent: None, start_time: 1_699_000_000,
@@ -1308,7 +1390,7 @@ mod build_identity {
         let disk = DiskHistory::default();
         let (states, health, suppressed) = (HashMap::new(), HashMap::new(), HashMap::new());
         let out = render(&CycleReport {
-            snapshots: &[], host_snapshots: &[], peers: &[], peer_maintenance: &NO_WINDOWS, is_owner: true, disk: &disk,
+            snapshots: &[], host_snapshots: &[], firedancer_snapshots: &[], peers: &[], peer_maintenance: &NO_WINDOWS, is_owner: true, disk: &disk,
             outcomes: &[], states: &states, endpoint_health: &health, suppressed: &suppressed,
             visible: true, silenced: false, cycle_duration: Duration::from_secs(1),
             unix_time: 1_700_000_000, maintenance_until: 0, restart_gossip_percent: None, start_time: 1_699_000_000,
@@ -1342,7 +1424,7 @@ mod alpenglow_metrics {
         let (states, health, suppressed) = (HashMap::new(), HashMap::new(), HashMap::new());
         render(&CycleReport {
             snapshots: snaps,
-            host_snapshots: &[],
+            host_snapshots: &[], firedancer_snapshots: &[],
             peers: &[],
             peer_maintenance: &NO_WINDOWS,
             is_owner: true,

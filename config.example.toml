@@ -179,8 +179,8 @@ mitigated = []
 # fixed_in = ["6.12.117", "6.18.63", "7.3.4"]
 # # Ask Ubuntu's tracker (ubuntu.com/security/cves/<id>.json, hourly) where the
 # # fix landed for the release each Ubuntu host runs, so the `upgrade` note
-# # arrives when the patched kernel ships. Needs a CVE id. Stock kernels only:
-# # for an HWE or other backport kernel, put its fixed version in fixed_in.
+# # arrives when the patched kernel ships. Needs a CVE id. Covers stock and
+# # HWE kernels; for a cloud backport kernel, put its fixed version in fixed_in.
 # tracker = "ubuntu"
 # # Appended to the alert.
 # url = "https://example.com/operator-instructions"

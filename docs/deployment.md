@@ -340,8 +340,10 @@ does not. With `tracker = "ubuntu"`, and only while one of the hosts is an
 Ubuntu box, perch also reads Ubuntu's record for the CVE once an hour and uses
 the fixed package version for the release each host runs, which is what makes
 `advisory_upgrade` arrive on the day the kernel ships. That lookup covers
-Ubuntu's stock kernels (`generic`, `aws`, `lowlatency` and the like); for an
-HWE or other backport kernel, add its fixed version to `fixed_in`, which takes
+Ubuntu's stock kernels (`generic`, `aws`, `lowlatency` and the like) and the
+HWE backports of the generic and lowlatency kernels, which Ubuntu tracks as
+`linux-hwe-<series>` (24.04 on the 7.0 kernel is `linux-hwe-7.0`). For any
+other backport kernel, add its fixed version to `fixed_in`, which takes
 precedence for its series.
 
 ### Hosts on another machine

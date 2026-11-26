@@ -28,6 +28,7 @@ ENDPOINT_LAG_SLOTS = 300
 SKIP_WARN, SKIP_PAGE = 20, 45
 FILL_WARN_S, FILL_PAGE_S = 24 * 3600, 6 * 3600
 INODE_WARN, INODE_PAGE = 85, 95
+FD_ACCOUNTS_WARN, FD_ACCOUNTS_PAGE = 90, 97
 
 GREEN, YELLOW, ORANGE, RED, GRAY, BLUE = "green", "yellow", "orange", "red", "#808080", "blue"
 
@@ -498,6 +499,89 @@ L.add(table(
     sort="Host",
 ), 6, 8, empty="No [[hosts]] configured")
 
+# --- Firedancer -----------------------------------------------------------------
+# Firedancer numbers each subsystem's states its own way, so one mapping cannot
+# serve all three: each query gets the mapping for the subsystem it selects.
+FD_STATES = {
+    "vote": {0: ("disabled", GRAY), 1: ("not started", BLUE), 2: ("delinquent", RED), 3: ("voting", GREEN),
+             4: ("inadmissible", RED)},
+    "replay": {0: ("disabled", GRAY), 1: ("not started", BLUE), 2: ("behind", RED), 3: ("running", GREEN)},
+    "turbine": {0: ("disabled", GRAY), 1: ("not started", BLUE), 2: ("stalled", RED),
+                3: ("repair outpacing", YELLOW), 4: ("running", GREEN)},
+}
+
+
+def per_query(ref, states):
+    """A state mapping for one query of a state timeline. The thresholds repeat
+    the colors for the reason state_timeline() gives."""
+    ordered = sorted(states.items())
+    return {"matcher": {"id": "byFrameRefID", "options": ref},
+            "properties": [{"id": "mappings", "value": mapping(states)},
+                           {"id": "thresholds", "value": steps(
+                               *[(None if i == 0 else v - 0.5, c) for i, (v, (_, c)) in enumerate(ordered)])}]}
+
+
+L.row("Firedancer")
+fd = state_timeline(
+    "Subsystem state",
+    "What Firedancer itself reports for voting, replay and turbine on each host. Turbine is where blocks arrive, "
+    "replay executes them and voting follows, so the bar that turns red first is where an incident began. Blue "
+    "is a subsystem that has not started yet, as after a restart.",
+    [target(f'max by (host) (perch_firedancer_state{{{I}, subsystem="{name}"}})', f"{{{{host}}}} {name}", ref)
+     for ref, name in zip("ABC", FD_STATES)],
+    FD_STATES["vote"],
+)
+fd["fieldConfig"]["overrides"] = [per_query(ref, FD_STATES[name]) for ref, name in zip("ABC", FD_STATES)]
+L.add(fd, 12, 8, empty="No firedancer_url configured")
+fd = state_timeline(
+    "Metrics port and catch-up",
+    "Whether each host's Firedancer answered perch's scrape, and whether replay has reached the cluster tip since "
+    "it started. A silent port on a machine that is up is what firedancer_down pages for. While Firedancer is "
+    "still catching up, its state checks wait rather than alert.",
+    [target(f'max by (host) (perch_firedancer_scrape_ok{{{I}}})', "{{host}} metrics port", "A"),
+     target(f'max by (host) (perch_firedancer_caught_up{{{I}}})', "{{host}} caught up", "B")],
+    {1: ("answering", GREEN), 0: ("silent", RED)},
+)
+fd["fieldConfig"]["overrides"] = [per_query("B", {1: ("caught up", GREEN), 0: ("catching up", YELLOW)})]
+L.add(fd, 12, 8, empty="No firedancer_url configured")
+L.add(timeseries(
+    "Accounts index used",
+    f"Share of the accounts index in use: accounts held against the number Firedancer has room for. Default "
+    f"limits: {FD_ACCOUNTS_WARN}% notifies, {FD_ACCOUNTS_PAGE}% pages.",
+    [target(f'max by (host) (perch_firedancer_accounts_used_percent{{{I}}})', "{{host}}")],
+    unit="percent", min_=0, max_=100, decimals=1,
+    thresholds=steps((None, GREEN), (FD_ACCOUNTS_WARN, ORANGE), (FD_ACCOUNTS_PAGE, RED)), threshold_style="dashed",
+), 8, 8, empty="No firedancer_url configured")
+L.add(timeseries(
+    "Accounts database file",
+    "Live data in the accounts database file against the size allocated for it.",
+    [target(f'max by (host) (perch_firedancer_accounts_disk_used_bytes{{{I}}})', "{{host}} used", "A"),
+     target(f'max by (host) (perch_firedancer_accounts_disk_allocated_bytes{{{I}}})', "{{host}} allocated", "B")],
+    unit="bytes", min_=0,
+), 8, 8, empty="No firedancer_url configured")
+L.panels[-1]["fieldConfig"]["overrides"] = [{
+    "matcher": {"id": "byFrameRefID", "options": "B"},
+    "properties": [{"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [10, 10]}},
+                   {"id": "custom.fillOpacity", "value": 0}]}]
+L.add(table(
+    "Firedancer hosts",
+    "Each host right now. Uptime restarting from zero is a Firedancer restart.",
+    [target(f'max by (host) (perch_firedancer_scrape_ok{{{I}}})', ref="A", instant=True, fmt="table"),
+     target(f'max by (host) (perch_firedancer_caught_up{{{I}}})', ref="B", instant=True, fmt="table"),
+     target(f'time() - max by (host) (perch_firedancer_boot_time_seconds{{{I}}})', ref="C", instant=True, fmt="table"),
+     target(f'max by (host) (perch_firedancer_accounts_used_percent{{{I}}})', ref="D", instant=True, fmt="table")],
+    join_on="host",
+    keep=["host", "Value #A", "Value #B", "Value #C", "Value #D"],
+    rename={"host": "Host", "Value #A": "Metrics port", "Value #B": "Caught up", "Value #C": "Uptime",
+            "Value #D": "Accounts index"},
+    overrides=[colored("Metrics port", mappings=mapping({1: ("ok", GREEN), 0: ("SILENT", RED)})),
+               colored("Caught up", mappings=mapping({1: ("yes", GREEN), 0: ("catching up", YELLOW)})),
+               plain("Uptime", unit="s", decimals=0),
+               colored("Accounts index", thresholds=steps((None, GREEN), (FD_ACCOUNTS_WARN, ORANGE),
+                                                          (FD_ACCOUNTS_PAGE, RED)), unit="percent", decimals=1)],
+    sort="Host",
+), 8, 8, empty="No firedancer_url configured")
+
 # --- Watchtowers ----------------------------------------------------------------
 L.row("Watchtowers")
 L.add(timeseries(
@@ -605,7 +689,7 @@ dashboard = {
         {"type": "panel", "id": "state-timeline", "name": "State timeline", "version": ""},
     ],
     "title": "perch",
-    "description": "Solana validator watchtower: validators, checks, RPC endpoints, disks, peers and notifications. "
+    "description": "Solana validator watchtower: validators, checks, RPC endpoints, disks, Firedancer, peers and notifications. "
                    "https://github.com/TheChimpions/perch-watchtower",
     "uid": "perch",
     "tags": ["perch", "solana", "validator"],

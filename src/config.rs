@@ -410,6 +410,13 @@ pub struct HostConfig {
     /// another machine reached through a tunnel on localhost.
     #[serde(default)]
     pub local: Option<bool>,
+    /// The metrics URL of the Firedancer running on this host, as set under
+    /// `[tiles.metric]` in its config: "http://10.0.0.5:7999/metrics". Setting
+    /// it turns on the `firedancer_*` checks for this host. Firedancer says
+    /// there what state it believes it is in, which is the only local view of
+    /// a validator run with its RPC port off.
+    #[serde(default)]
+    pub firedancer_url: Option<String>,
 }
 
 impl HostConfig {
@@ -1051,6 +1058,21 @@ pub struct Checks {
     pub host_advisory: HostAdvisoryCheckConfig,
     #[serde(default = "default_node_behind")]
     pub node_behind: LagCheckConfig,
+    /// Firedancer's metrics port has stopped answering on a machine that is
+    /// otherwise up. Only for hosts that set `firedancer_url`, as are the
+    /// three below.
+    #[serde(default = "default_firedancer_down")]
+    pub firedancer_down: CheckConfig,
+    /// What Firedancer says of its own voting, replay and turbine: three
+    /// checks per host, sharing these settings.
+    #[serde(default = "default_firedancer_state")]
+    pub firedancer_state: CheckConfig,
+    /// A tile still marked running whose heartbeat has stopped.
+    #[serde(default = "default_firedancer_tile")]
+    pub firedancer_tile: FiredancerTileCheckConfig,
+    /// How full the accounts index is. Two bands, like the disk checks.
+    #[serde(default = "default_firedancer_accounts")]
+    pub firedancer_accounts: FiredancerAccountsCheckConfig,
     #[serde(default = "default_skip_rate")]
     pub skip_rate: SkipRateCheckConfig,
     #[serde(default = "default_peer_down")]
@@ -1077,6 +1099,55 @@ fn default_node_behind() -> LagCheckConfig {
         // node genuinely stuck behind will still be stuck in fifteen minutes.
         base: CheckConfig::new(d(15 * 60), Severity::Page),
         max_slots: 300,
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct FiredancerTileCheckConfig {
+    #[serde(flatten)]
+    pub base: CheckConfig,
+    /// How far a running tile's heartbeat may trail the freshest one on the
+    /// same page before the tile counts as stalled.
+    #[serde(with = "humantime_serde")]
+    pub stale_after: Duration,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct FiredancerAccountsCheckConfig {
+    #[serde(flatten)]
+    pub base: CheckConfig,
+    pub warn_percent: f64,
+    pub page_percent: f64,
+}
+
+fn default_firedancer_down() -> CheckConfig {
+    // The metric tile comes up within seconds of a start, so two minutes is
+    // long enough for a restart to bring the port back and short enough to
+    // beat the cluster calling the validator delinquent.
+    CheckConfig::new(d(2 * 60), Severity::Page)
+}
+fn default_firedancer_state() -> CheckConfig {
+    // Firedancer already applies its own thresholds before it calls itself
+    // delinquent, behind or stalled; this only has to outlast a blip.
+    CheckConfig::new(d(3 * 60), Severity::Page)
+}
+fn default_firedancer_tile() -> FiredancerTileCheckConfig {
+    FiredancerTileCheckConfig {
+        // The cause, not the damage: a tile that matters takes voting or
+        // replay with it, and those page. This names which one hung.
+        base: CheckConfig::new(d(2 * 60), Severity::Notify),
+        stale_after: d(30),
+    }
+}
+fn default_firedancer_accounts() -> FiredancerAccountsCheckConfig {
+    FiredancerAccountsCheckConfig {
+        // The index is sized at startup (`accdb_account_capacity`) and grows
+        // with the chain, not by the minute.
+        base: CheckConfig::new(d(10 * 60), Severity::Page),
+        warn_percent: 90.0,
+        page_percent: 97.0,
     }
 }
 
@@ -1417,6 +1488,10 @@ impl Default for Checks {
             disk_inodes: default_disk_inodes(),
             host_advisory: default_host_advisory(),
             node_behind: default_node_behind(),
+            firedancer_down: default_firedancer_down(),
+            firedancer_state: default_firedancer_state(),
+            firedancer_tile: default_firedancer_tile(),
+            firedancer_accounts: default_firedancer_accounts(),
             skip_rate: default_skip_rate(),
             peer_down: default_peer_down(),
             machine_down: default_machine_down(),
@@ -1763,6 +1838,11 @@ impl Config {
             if !h.url.starts_with("http://") && !h.url.starts_with("https://") {
                 bail!("host {:?} url must be http(s): {}", h.name, h.url);
             }
+            if let Some(u) = &h.firedancer_url {
+                if !u.starts_with("http://") && !u.starts_with("https://") {
+                    bail!("host {:?} firedancer_url must be http(s): {u}", h.name);
+                }
+            }
             if let Some(v) = &h.validator {
                 if !self.validators.iter().any(|x| x.display() == v) {
                     bail!(
@@ -1859,6 +1939,16 @@ impl Config {
         }
         if !(0.0..=100.0).contains(&ds.max_floor_percent) {
             bail!("checks.disk_space.max_floor_percent must be between 0 and 100");
+        }
+        let fa = &self.checks.firedancer_accounts;
+        if fa.page_percent < fa.warn_percent
+            || !(0.0..=100.0).contains(&fa.warn_percent)
+            || !(0.0..=100.0).contains(&fa.page_percent)
+        {
+            bail!("checks.firedancer_accounts needs 0 <= warn_percent <= page_percent <= 100");
+        }
+        if self.checks.firedancer_tile.stale_after.is_zero() {
+            bail!("checks.firedancer_tile.stale_after must be greater than zero");
         }
         let df = &self.checks.disk_fill;
         if df.page_within > df.warn_within {

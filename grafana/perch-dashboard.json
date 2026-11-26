@@ -39,7 +39,7 @@
     }
   ],
   "title": "perch",
-  "description": "Solana validator watchtower: validators, checks, RPC endpoints, disks, peers and notifications. https://github.com/TheChimpions/perch-watchtower",
+  "description": "Solana validator watchtower: validators, checks, RPC endpoints, disks, Firedancer, peers and notifications. https://github.com/TheChimpions/perch-watchtower",
   "uid": "perch",
   "tags": [
     "perch",
@@ -3639,7 +3639,7 @@
     },
     {
       "type": "row",
-      "title": "Watchtowers",
+      "title": "Firedancer",
       "collapsed": false,
       "panels": [],
       "id": 36,
@@ -3648,6 +3648,1005 @@
         "w": 24,
         "x": 0,
         "y": 103
+      }
+    },
+    {
+      "type": "state-timeline",
+      "title": "Subsystem state",
+      "description": "What Firedancer itself reports for voting, replay and turbine on each host. Turbine is where blocks arrive, replay executes them and voting follows, so the bar that turns red first is where an incident began. Blue is a subsystem that has not started yet, as after a restart.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (host) (perch_firedancer_state{job=~\"$job\", instance=~\"$instance\", subsystem=\"vote\"})",
+          "legendFormat": "{{host}} vote",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (host) (perch_firedancer_state{job=~\"$job\", instance=~\"$instance\", subsystem=\"replay\"})",
+          "legendFormat": "{{host}} replay",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (host) (perch_firedancer_state{job=~\"$job\", instance=~\"$instance\", subsystem=\"turbine\"})",
+          "legendFormat": "{{host}} turbine",
+          "refId": "C",
+          "editorMode": "code",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "disabled",
+                  "color": "#808080",
+                  "index": 0
+                },
+                "1": {
+                  "text": "not started",
+                  "color": "blue",
+                  "index": 1
+                },
+                "2": {
+                  "text": "delinquent",
+                  "color": "red",
+                  "index": 2
+                },
+                "3": {
+                  "text": "voting",
+                  "color": "green",
+                  "index": 3
+                },
+                "4": {
+                  "text": "inadmissible",
+                  "color": "red",
+                  "index": 4
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#808080",
+                "value": null
+              },
+              {
+                "color": "blue",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 1.5
+              },
+              {
+                "color": "green",
+                "value": 2.5
+              },
+              {
+                "color": "red",
+                "value": 3.5
+              }
+            ]
+          },
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0
+          },
+          "noValue": "No firedancer_url configured"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "disabled",
+                        "color": "#808080",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "not started",
+                        "color": "blue",
+                        "index": 1
+                      },
+                      "2": {
+                        "text": "delinquent",
+                        "color": "red",
+                        "index": 2
+                      },
+                      "3": {
+                        "text": "voting",
+                        "color": "green",
+                        "index": 3
+                      },
+                      "4": {
+                        "text": "inadmissible",
+                        "color": "red",
+                        "index": 4
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#808080",
+                      "value": null
+                    },
+                    {
+                      "color": "blue",
+                      "value": 0.5
+                    },
+                    {
+                      "color": "red",
+                      "value": 1.5
+                    },
+                    {
+                      "color": "green",
+                      "value": 2.5
+                    },
+                    {
+                      "color": "red",
+                      "value": 3.5
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "disabled",
+                        "color": "#808080",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "not started",
+                        "color": "blue",
+                        "index": 1
+                      },
+                      "2": {
+                        "text": "behind",
+                        "color": "red",
+                        "index": 2
+                      },
+                      "3": {
+                        "text": "running",
+                        "color": "green",
+                        "index": 3
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#808080",
+                      "value": null
+                    },
+                    {
+                      "color": "blue",
+                      "value": 0.5
+                    },
+                    {
+                      "color": "red",
+                      "value": 1.5
+                    },
+                    {
+                      "color": "green",
+                      "value": 2.5
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "disabled",
+                        "color": "#808080",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "not started",
+                        "color": "blue",
+                        "index": 1
+                      },
+                      "2": {
+                        "text": "stalled",
+                        "color": "red",
+                        "index": 2
+                      },
+                      "3": {
+                        "text": "repair outpacing",
+                        "color": "yellow",
+                        "index": 3
+                      },
+                      "4": {
+                        "text": "running",
+                        "color": "green",
+                        "index": 4
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#808080",
+                      "value": null
+                    },
+                    {
+                      "color": "blue",
+                      "value": 0.5
+                    },
+                    {
+                      "color": "red",
+                      "value": 1.5
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 2.5
+                    },
+                    {
+                      "color": "green",
+                      "value": 3.5
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "alignValue": "left",
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "id": 37,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 104
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "state-timeline",
+      "title": "Metrics port and catch-up",
+      "description": "Whether each host's Firedancer answered perch's scrape, and whether replay has reached the cluster tip since it started. A silent port on a machine that is up is what firedancer_down pages for. While Firedancer is still catching up, its state checks wait rather than alert.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (host) (perch_firedancer_scrape_ok{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{host}} metrics port",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (host) (perch_firedancer_caught_up{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{host}} caught up",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "answering",
+                  "color": "green",
+                  "index": 0
+                },
+                "0": {
+                  "text": "silent",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.5
+              }
+            ]
+          },
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0
+          },
+          "noValue": "No firedancer_url configured"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "caught up",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "catching up",
+                        "color": "yellow",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "yellow",
+                      "value": null
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.5
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "alignValue": "left",
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "id": 38,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 104
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Accounts index used",
+      "description": "Share of the accounts index in use: accounts held against the number Firedancer has room for. Default limits: 90% notifies, 97% pages.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (host) (perch_firedancer_accounts_used_percent{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{host}}",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineInterpolation": "stepAfter",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "thresholdsStyle": {
+              "mode": "dashed"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 90
+              },
+              {
+                "color": "red",
+                "value": 97
+              }
+            ]
+          },
+          "min": 0,
+          "max": 100,
+          "decimals": 1,
+          "noValue": "No firedancer_url configured"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 39,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 112
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Accounts database file",
+      "description": "Live data in the accounts database file against the size allocated for it.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (host) (perch_firedancer_accounts_disk_used_bytes{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{host}} used",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (host) (perch_firedancer_accounts_disk_allocated_bytes{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "{{host}} allocated",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineInterpolation": "stepAfter",
+            "spanNulls": false,
+            "axisSoftMin": 0,
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0,
+          "noValue": "No firedancer_url configured"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 40,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 112
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "table",
+      "title": "Firedancer hosts",
+      "description": "Each host right now. Uptime restarting from zero is a Firedancer restart.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (host) (perch_firedancer_scrape_ok{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "",
+          "refId": "A",
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (host) (perch_firedancer_caught_up{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "",
+          "refId": "B",
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "time() - max by (host) (perch_firedancer_boot_time_seconds{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "",
+          "refId": "C",
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (host) (perch_firedancer_accounts_used_percent{job=~\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "",
+          "refId": "D",
+          "editorMode": "code",
+          "range": false,
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "host",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "pattern": "^(host|Value #A|Value #B|Value #C|Value #D)$"
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "host": 0,
+              "Value #A": 1,
+              "Value #B": 2,
+              "Value #C": 3,
+              "Value #D": 4
+            },
+            "renameByName": {
+              "host": "Host",
+              "Value #A": "Metrics port",
+              "Value #B": "Caught up",
+              "Value #C": "Uptime",
+              "Value #D": "Accounts index"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "Host"
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "No firedancer_url configured"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "number"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byType",
+              "options": "string"
+            },
+            "properties": [
+              {
+                "id": "noValue",
+                "value": "\u2014"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Metrics port"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "ok",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "SILENT",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Caught up"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "yes",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "catching up",
+                        "color": "yellow",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Uptime"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Accounts index"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 90
+                    },
+                    {
+                      "color": "red",
+                      "value": 97
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        }
+      },
+      "id": 41,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 112
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Watchtowers",
+      "collapsed": false,
+      "panels": [],
+      "id": 42,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 120
       }
     },
     {
@@ -3721,12 +4720,12 @@
           "sort": "desc"
         }
       },
-      "id": 37,
+      "id": 43,
       "gridPos": {
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 104
+        "y": 121
       },
       "datasource": {
         "type": "prometheus",
@@ -3800,12 +4799,12 @@
           "sort": "desc"
         }
       },
-      "id": 38,
+      "id": 44,
       "gridPos": {
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 104
+        "y": 121
       },
       "datasource": {
         "type": "prometheus",
@@ -3884,12 +4883,12 @@
           "mode": "single"
         }
       },
-      "id": 39,
+      "id": 45,
       "gridPos": {
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 104
+        "y": 121
       },
       "datasource": {
         "type": "prometheus",
@@ -4092,12 +5091,12 @@
           "show": false
         }
       },
-      "id": 40,
+      "id": 46,
       "gridPos": {
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 111
+        "y": 128
       },
       "datasource": {
         "type": "prometheus",
@@ -4172,12 +5171,12 @@
           "sort": "desc"
         }
       },
-      "id": 41,
+      "id": 47,
       "gridPos": {
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 111
+        "y": 128
       },
       "datasource": {
         "type": "prometheus",
@@ -4189,12 +5188,12 @@
       "title": "Notifications",
       "collapsed": false,
       "panels": [],
-      "id": 42,
+      "id": 48,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 118
+        "y": 135
       }
     },
     {
@@ -4370,12 +5369,12 @@
           "show": false
         }
       },
-      "id": 43,
+      "id": 49,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 119
+        "y": 136
       },
       "datasource": {
         "type": "prometheus",
@@ -4479,12 +5478,12 @@
         }
       },
       "interval": "5m",
-      "id": 44,
+      "id": 50,
       "gridPos": {
         "h": 8,
         "w": 16,
         "x": 8,
-        "y": 119
+        "y": 136
       },
       "datasource": {
         "type": "prometheus",
@@ -4563,12 +5562,12 @@
           "sort": "desc"
         }
       },
-      "id": 45,
+      "id": 51,
       "gridPos": {
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 127
+        "y": 144
       },
       "datasource": {
         "type": "prometheus",

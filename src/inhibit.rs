@@ -61,6 +61,15 @@ const RULES: &[(&str, &[&str])] = &[
         "disk_space_critical",
         &["disk_fill_critical", "disk_fill_warn"],
     ),
+    // Firedancer's own account of itself, on one host, widest first: with no
+    // blocks arriving replay has nothing to replay, and a node that is behind
+    // cannot vote on the tip.
+    (
+        "firedancer_turbine",
+        &["firedancer_replay", "firedancer_vote"],
+    ),
+    ("firedancer_replay", &["firedancer_vote"]),
+    ("firedancer_accounts_critical", &["firedancer_accounts_warn"]),
 ];
 
 /// Rules that cross from a host to the validator running on it.
@@ -86,6 +95,25 @@ const CROSS_RULES: &[(&str, &[&str])] = &[
     // the wrong filesystem, or failing to start. The disk is the page to read.
     (
         "disk_missing",
+        &["vote_delinquent", "vote_lag", "vote_stalled"],
+    ),
+    // Firedancer has exited, or says itself why it is not voting. Any of
+    // these is the reason the cluster sees the validator fall delinquent, and
+    // it arrives first: the local view does not wait for the cluster to agree.
+    (
+        "firedancer_down",
+        &["vote_delinquent", "vote_lag", "vote_stalled"],
+    ),
+    (
+        "firedancer_turbine",
+        &["vote_delinquent", "vote_lag", "vote_stalled"],
+    ),
+    (
+        "firedancer_replay",
+        &["vote_delinquent", "vote_lag", "vote_stalled"],
+    ),
+    (
+        "firedancer_vote",
         &["vote_delinquent", "vote_lag", "vote_stalled"],
     ),
     // The machine is gone. "chimps-1's machine is hard down" is the page worth
